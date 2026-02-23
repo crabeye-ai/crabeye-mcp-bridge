@@ -1,0 +1,34 @@
+{
+  "name": "kokuai-bridge",
+  "version": "0.1.0",
+  "description": "Aggregates multiple MCP servers behind a single STDIO interface",
+  "type": "module",
+  "bin": {
+    "kokuai-bridge": "./bin/kokuai-bridge"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "commander": "^13.1.0",
+    "fastify": "^5.2.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "eslint": "^9.21.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.24.1",
+    "vitest": "^3.0.7"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
