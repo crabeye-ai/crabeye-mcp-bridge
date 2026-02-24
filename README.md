@@ -1,6 +1,6 @@
 # kokuai-bridge
 
-A local CLI tool that aggregates multiple MCP (Model Context Protocol) servers behind a single STDIO interface. Works fully standalone, with optional connectivity to the Mike Charlie Papa service.
+A local CLI tool that aggregates multiple MCP (Model Context Protocol) servers behind a single STDIO interface. Works fully standalone on your local machine.
 
 ## Install
 
