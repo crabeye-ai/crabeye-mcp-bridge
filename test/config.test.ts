@@ -9,7 +9,9 @@ import {
   GlobalBridgeConfigSchema,
   isHttpServer,
   isStdioServer,
+  resolveUpstreams,
   type ServerConfig,
+  type BridgeConfig,
 } from "../src/config/schema.js";
 import {
   resolveConfigPath,
@@ -207,6 +209,134 @@ describe("type guards", () => {
     const config: ServerConfig = { command: "node" };
     expect(isStdioServer(config)).toBe(true);
     expect(isHttpServer(config)).toBe(false);
+  });
+});
+
+// --- Flexible upstream config keys ---
+
+describe("flexible upstream config keys", () => {
+  it("accepts config with only mcpUpstreams", () => {
+    const input = {
+      mcpUpstreams: { s: { command: "node" } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts config with only servers", () => {
+    const input = {
+      servers: { s: { command: "node" } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts config with both mcpUpstreams and mcpServers", () => {
+    const input = {
+      mcpUpstreams: { a: { command: "node" } },
+      mcpServers: { b: { command: "python" } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts config with none of the server keys (empty upstreams)", () => {
+    const input = {};
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.mcpServers).toEqual({});
+    }
+  });
+});
+
+// --- resolveUpstreams ---
+
+describe("resolveUpstreams", () => {
+  function parsed(input: Record<string, unknown>): BridgeConfig {
+    const result = BridgeConfigSchema.parse(input);
+    return result;
+  }
+
+  it("merges all three sources into a union", () => {
+    const config = parsed({
+      mcpUpstreams: { a: { command: "node" } },
+      servers: { b: { command: "python" } },
+      mcpServers: { c: { command: "ruby" } },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams).sort()).toEqual(["a", "b", "c"]);
+  });
+
+  it("mcpUpstreams wins over servers and mcpServers on duplicate names", () => {
+    const config = parsed({
+      mcpUpstreams: { s: { command: "from-upstreams" } },
+      servers: { s: { command: "from-servers" } },
+      mcpServers: { s: { command: "from-mcp" } },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect((upstreams.s as { command: string }).command).toBe("from-upstreams");
+  });
+
+  it("servers wins over mcpServers on duplicate names", () => {
+    const config = parsed({
+      servers: { s: { command: "from-servers" } },
+      mcpServers: { s: { command: "from-mcp" } },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect((upstreams.s as { command: string }).command).toBe("from-servers");
+  });
+
+  it("reads from mcpServers when it is the only source", () => {
+    const config = parsed({
+      mcpServers: { s: { command: "node" } },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams)).toEqual(["s"]);
+  });
+
+  it("excludes entries with kokuai-bridge in command from mcpServers", () => {
+    const config = parsed({
+      mcpServers: {
+        bridge: { command: "npx kokuai-bridge", args: ["--config", "c.json"] },
+        real: { command: "node", args: ["server.js"] },
+        httpServer: { type: "streamable-http", url: "https://example.com/mcp" },
+      },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams).sort()).toEqual(["httpServer", "real"]);
+  });
+
+  it("excludes entries with kokuai-bridge in args from mcpServers", () => {
+    const config = parsed({
+      mcpServers: {
+        bridge: { command: "npx", args: ["-y", "kokuai-bridge", "--config", "c.json"] },
+        real: { command: "node", args: ["server.js"] },
+      },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams)).toEqual(["real"]);
+  });
+
+  it("does not apply self-exclusion to mcpUpstreams or servers", () => {
+    const config = parsed({
+      mcpUpstreams: { bridge1: { command: "npx kokuai-bridge" } },
+      servers: { bridge2: { command: "npx", args: ["kokuai-bridge"] } },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams).sort()).toEqual(["bridge1", "bridge2"]);
+  });
+
+  it("returns empty object when no server keys are provided", () => {
+    const config = parsed({});
+    const upstreams = resolveUpstreams(config);
+    expect(upstreams).toEqual({});
+  });
+
+  it("returns empty object when no server keys are provided", () => {
+    const config = parsed({});
+    const upstreams = resolveUpstreams(config);
+    expect(upstreams).toEqual({});
   });
 });
 
