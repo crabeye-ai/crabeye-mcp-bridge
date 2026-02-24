@@ -96,6 +96,37 @@ describe("schema validation", () => {
     expect(result.success).toBe(true);
   });
 
+  it("accepts a bare-URL HTTP server (Cursor-style)", () => {
+    const input = {
+      mcpServers: { h: { url: "https://example.com/mcp" } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.mcpServers.h).toMatchObject({
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+      });
+    }
+  });
+
+  it("accepts a STDIO server with type: stdio (Cursor-style)", () => {
+    const input = {
+      mcpServers: {
+        s: { type: "stdio", command: "node", args: ["server.js"], env: {} },
+      },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.mcpServers.s).toEqual({
+        command: "node",
+        args: ["server.js"],
+        env: {},
+      });
+    }
+  });
+
   it("applies defaults when _bridge is omitted", () => {
     const input = { mcpServers: { s: { command: "node" } } };
     const result = BridgeConfigSchema.safeParse(input);
