@@ -1,5 +1,5 @@
 import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
-import { isStdioServer } from "../config/schema.js";
+import { isStdioServer, resolveUpstreams } from "../config/schema.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { namespaceTool } from "../server/tool-namespacing.js";
 import { HttpUpstreamClient } from "./http-client.js";
@@ -40,7 +40,7 @@ export class UpstreamManager {
   }
 
   async connectAll(): Promise<void> {
-    const entries = Object.entries(this._config.mcpServers);
+    const entries = Object.entries(resolveUpstreams(this._config));
     const connectPromises: Promise<void>[] = [];
 
     for (const [name, serverConfig] of entries) {

@@ -57,7 +57,9 @@ export const GlobalBridgeConfigSchema = z
 // --- Top-level config ---
 
 export const BridgeConfigSchema = z.object({
-  mcpServers: z.record(z.string(), ServerConfigSchema),
+  mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
+  mcpUpstreams: z.record(z.string(), ServerConfigSchema).optional(),
+  servers: z.record(z.string(), ServerConfigSchema).optional(),
   _bridge: GlobalBridgeConfigSchema.default({}),
 });
 
@@ -70,6 +72,46 @@ export type HttpServerConfig = z.infer<typeof HttpServerConfigSchema>;
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 export type GlobalBridgeConfig = z.infer<typeof GlobalBridgeConfigSchema>;
 export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
+
+// --- Upstream resolution ---
+
+/**
+ * Resolves which servers to use as upstreams.
+ *
+ * Returns the union of all present config keys. On duplicate names,
+ * earlier sources win: `mcpUpstreams` > `servers` > `mcpServers`.
+ *
+ * Self-exclusion: entries from `mcpServers` whose `command` or `args`
+ * contain "kokuai-bridge" are filtered out.
+ */
+export function resolveUpstreams(
+  config: BridgeConfig,
+): Record<string, ServerConfig> {
+  const result: Record<string, ServerConfig> = {};
+
+  // mcpServers (lowest priority, with self-exclusion)
+  for (const [name, server] of Object.entries(config.mcpServers)) {
+    if (isStdioServer(server)) {
+      const tokens = [server.command, ...(server.args ?? [])];
+      if (tokens.some((t) => t.includes("kokuai-bridge"))) {
+        continue;
+      }
+    }
+    result[name] = server;
+  }
+
+  // servers (middle priority)
+  if (config.servers) {
+    Object.assign(result, config.servers);
+  }
+
+  // mcpUpstreams (highest priority)
+  if (config.mcpUpstreams) {
+    Object.assign(result, config.mcpUpstreams);
+  }
+
+  return result;
+}
 
 // --- Type guards ---
 

@@ -7,7 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { BridgeConfig } from "../src/config/schema.js";
+import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
 import { StdioUpstreamClient } from "../src/upstream/stdio-client.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
@@ -702,6 +702,74 @@ describe("UpstreamManager", () => {
     const statusB = statuses.find((s) => s.name === "srv-b")!;
     expect(statusB.status).toBe("connected");
     expect(statusB.toolCount).toBe(1);
+
+    await manager.closeAll();
+    await serverA.server.close();
+    await serverB.server.close();
+  });
+
+  it("merges mcpUpstreams and mcpServers into a union", async () => {
+    const serverA = createMockServer([makeTool("tool")]);
+    const serverB = createMockServer([makeTool("tool")]);
+    const servers: Record<string, ReturnType<typeof createMockServer>> = {
+      "from-upstreams": serverA,
+      "from-mcp": serverB,
+    };
+
+    const config = BridgeConfigSchema.parse({
+      mcpUpstreams: {
+        "from-upstreams": { type: "streamable-http", url: "http://localhost:9999" },
+      },
+      mcpServers: {
+        "from-mcp": { command: "node", args: ["other.js"] },
+      },
+    });
+
+    const manager = new UpstreamManager({
+      config,
+      toolRegistry,
+      _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
+    });
+
+    await manager.connectAll();
+
+    expect(toolRegistry.listTools()).toHaveLength(2);
+    expect(toolRegistry.getTool("from-upstreams__tool")).toBeDefined();
+    expect(toolRegistry.getTool("from-mcp__tool")).toBeDefined();
+
+    await manager.closeAll();
+    await serverA.server.close();
+    await serverB.server.close();
+  });
+
+  it("merges servers and mcpServers into a union", async () => {
+    const serverA = createMockServer([makeTool("tool")]);
+    const serverB = createMockServer([makeTool("tool")]);
+    const servers: Record<string, ReturnType<typeof createMockServer>> = {
+      "vscode-server": serverA,
+      "mcp-server": serverB,
+    };
+
+    const config = BridgeConfigSchema.parse({
+      servers: {
+        "vscode-server": { type: "streamable-http", url: "http://localhost:9999" },
+      },
+      mcpServers: {
+        "mcp-server": { command: "node", args: ["other.js"] },
+      },
+    });
+
+    const manager = new UpstreamManager({
+      config,
+      toolRegistry,
+      _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
+    });
+
+    await manager.connectAll();
+
+    expect(toolRegistry.listTools()).toHaveLength(2);
+    expect(toolRegistry.getTool("vscode-server__tool")).toBeDefined();
+    expect(toolRegistry.getTool("mcp-server__tool")).toBeDefined();
 
     await manager.closeAll();
     await serverA.server.close();
