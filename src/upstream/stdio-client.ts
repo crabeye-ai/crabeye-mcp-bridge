@@ -164,12 +164,24 @@ export class StdioUpstreamClient implements UpstreamClient {
       return this._transportFactory();
     }
 
-    return new StdioClientTransport({
+    const transport = new StdioClientTransport({
       command: this._config.command,
       args: this._config.args,
       env: { ...process.env, ...this._config.env } as Record<string, string>,
       stderr: "pipe",
     });
+
+    // Forward subprocess stderr to bridge stderr with server name prefix
+    transport.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString().trimEnd();
+      if (text) {
+        for (const line of text.split("\n")) {
+          process.stderr.write(`[${this.name}] ${line}\n`);
+        }
+      }
+    });
+
+    return transport;
   }
 
   private _setStatus(next: ConnectionStatus, error?: Error): void {
