@@ -1,15 +1,16 @@
-import type { BridgeConfig, HttpServerConfig } from "../config/schema.js";
-import { isHttpServer } from "../config/schema.js";
+import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
+import { isStdioServer } from "../config/schema.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { namespaceTool } from "../server/tool-namespacing.js";
 import { HttpUpstreamClient } from "./http-client.js";
+import { StdioUpstreamClient } from "./stdio-client.js";
 import type { UpstreamClient, ConnectionStatus } from "./types.js";
 
 export interface UpstreamManagerOptions {
   config: BridgeConfig;
   toolRegistry: ToolRegistry;
   /** Injectable client factory for testing. */
-  _clientFactory?: (name: string, config: HttpServerConfig) => UpstreamClient;
+  _clientFactory?: (name: string, config: ServerConfig) => UpstreamClient;
 }
 
 export interface UpstreamStatus {
@@ -21,7 +22,7 @@ export interface UpstreamStatus {
 export class UpstreamManager {
   private _config: BridgeConfig;
   private _toolRegistry: ToolRegistry;
-  private _clientFactory: (name: string, config: HttpServerConfig) => UpstreamClient;
+  private _clientFactory: (name: string, config: ServerConfig) => UpstreamClient;
   private _clients = new Map<string, UpstreamClient>();
   private _unsubscribers: Array<() => void> = [];
 
@@ -30,7 +31,12 @@ export class UpstreamManager {
     this._toolRegistry = options.toolRegistry;
     this._clientFactory =
       options._clientFactory ??
-      ((name, config) => new HttpUpstreamClient({ name, config }));
+      ((name, config) => {
+        if (isStdioServer(config)) {
+          return new StdioUpstreamClient({ name, config });
+        }
+        return new HttpUpstreamClient({ name, config: config as HttpServerConfig });
+      });
   }
 
   async connectAll(): Promise<void> {
@@ -38,11 +44,6 @@ export class UpstreamManager {
     const connectPromises: Promise<void>[] = [];
 
     for (const [name, serverConfig] of entries) {
-      if (!isHttpServer(serverConfig)) {
-        // STDIO servers will be handled by MCP-111/112
-        continue;
-      }
-
       const client = this._clientFactory(name, serverConfig);
       this._clients.set(name, client);
 
