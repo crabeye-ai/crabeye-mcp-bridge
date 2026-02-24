@@ -1,6 +1,8 @@
 import { Command } from "commander";
 import { loadConfig, ConfigError } from "./config/index.js";
 import { BridgeServer } from "./server/index.js";
+import { ToolRegistry } from "./server/tool-registry.js";
+import { UpstreamManager } from "./upstream/index.js";
 
 const program = new Command();
 
@@ -15,6 +17,7 @@ program
   .option("-t, --token <string>", "authentication token")
   .action(async (options) => {
     let server: BridgeServer | undefined;
+    let upstreamManager: UpstreamManager | undefined;
 
     try {
       const config = await loadConfig({ configPath: options.config });
@@ -23,10 +26,20 @@ program
         config._bridge.port = options.port;
       }
 
-      console.error("kokuai-bridge starting with config:", config);
+      const toolRegistry = new ToolRegistry();
+      upstreamManager = new UpstreamManager({ config, toolRegistry });
 
-      server = new BridgeServer();
+      await upstreamManager.connectAll();
+
+      server = new BridgeServer({
+        toolRegistry,
+        getUpstreamClient: (name) => upstreamManager!.getClient(name),
+      });
       await server.start();
+
+      console.error(
+        `kokuai-bridge running — ${toolRegistry.listTools().length} tools from ${upstreamManager.getStatuses().length} servers`,
+      );
     } catch (err) {
       if (err instanceof ConfigError) {
         console.error(`Error: ${err.message}`);
@@ -45,6 +58,9 @@ program
       if (shuttingDown) return;
       shuttingDown = true;
       try {
+        if (upstreamManager) {
+          await upstreamManager.closeAll();
+        }
         if (server) {
           await server.close();
         }
