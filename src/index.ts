@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { loadConfig, ConfigError } from "./config/index.js";
+import { BridgeServer } from "./server/index.js";
 
 const program = new Command();
 
@@ -13,6 +14,8 @@ program
   .option("-p, --port <number>", "HTTP server port", parseInt)
   .option("-t, --token <string>", "authentication token")
   .action(async (options) => {
+    let server: BridgeServer | undefined;
+
     try {
       const config = await loadConfig({ configPath: options.config });
 
@@ -20,7 +23,10 @@ program
         config._bridge.port = options.port;
       }
 
-      console.log("kokuai-bridge starting with config:", config);
+      console.error("kokuai-bridge starting with config:", config);
+
+      server = new BridgeServer();
+      await server.start();
     } catch (err) {
       if (err instanceof ConfigError) {
         console.error(`Error: ${err.message}`);
@@ -28,10 +34,28 @@ program
           console.error(`  ${issue.path}: ${issue.message}`);
         }
         process.exitCode = 1;
+        return;
       } else {
         throw err;
       }
     }
+
+    let shuttingDown = false;
+    const shutdown = async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      try {
+        if (server) {
+          await server.close();
+        }
+      } catch {
+        // Don't prevent exit on close error
+      }
+      process.exit(0);
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   });
 
 program.parse();
