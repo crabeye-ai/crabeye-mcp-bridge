@@ -16,6 +16,18 @@ export class ToolRegistry {
     return Array.from(this.tools.values()).map((r) => r.tool);
   }
 
+  listRegisteredTools(): RegisteredTool[] {
+    return Array.from(this.tools.values());
+  }
+
+  listSources(): { name: string; toolCount: number }[] {
+    const result: { name: string; toolCount: number }[] = [];
+    for (const [name, toolNames] of this.sourceIndex) {
+      result.push({ name, toolCount: toolNames.size });
+    }
+    return result;
+  }
+
   getTool(name: string): RegisteredTool | undefined {
     return this.tools.get(name);
   }
