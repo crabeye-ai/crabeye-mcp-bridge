@@ -23,6 +23,7 @@
     "@modelcontextprotocol/sdk": "^1.12.1",
     "commander": "^13.1.0",
     "fastify": "^5.2.1",
+    "minisearch": "^7.2.0",
     "zod": "^3.24.2",
     "zod-to-json-schema": "^3.25.1"
   },
