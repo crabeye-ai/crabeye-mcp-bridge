@@ -28,7 +28,7 @@ export const StdioServerConfigSchema = z.object({
 });
 
 export const HttpServerConfigSchema = z.object({
-  type: z.enum(["streamable-http", "sse"]),
+  type: z.enum(["streamable-http", "sse"]).default("streamable-http"),
   url: z.string().url(),
   headers: z.record(z.string()).optional(),
   _bridge: ServerBridgeConfigSchema.optional(),
