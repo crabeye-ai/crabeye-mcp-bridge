@@ -1,6 +1,7 @@
 import type { BridgeConfig, HttpServerConfig } from "../config/schema.js";
 import { isHttpServer } from "../config/schema.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
+import { namespaceTool } from "../server/tool-namespacing.js";
 import { HttpUpstreamClient } from "./http-client.js";
 import type { UpstreamClient, ConnectionStatus } from "./types.js";
 
@@ -46,7 +47,10 @@ export class UpstreamManager {
       this._clients.set(name, client);
 
       const unsubTools = client.onToolsChanged((tools) => {
-        this._toolRegistry.setToolsForSource(name, [...tools]);
+        this._toolRegistry.setToolsForSource(
+          name,
+          tools.map((t) => namespaceTool(name, t)),
+        );
       });
 
       const unsubStatus = client.onStatusChange((event) => {

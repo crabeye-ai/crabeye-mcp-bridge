@@ -6,6 +6,11 @@ import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/typ
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
+import {
+  NAMESPACE_SEPARATOR,
+  namespaceTool,
+  parseNamespacedName,
+} from "../src/server/tool-namespacing.js";
 
 function makeTool(name: string, description?: string): Tool {
   return {
@@ -245,6 +250,57 @@ describe("notifications", () => {
     ).resolves.toBeUndefined();
 
     await cleanup();
+  });
+});
+
+// --- Tool Namespacing ---
+
+describe("namespaceTool", () => {
+  it("produces correct prefixed name", () => {
+    const tool = makeTool("create_issue", "Create an issue");
+    const namespaced = namespaceTool("linear", tool);
+
+    expect(namespaced.name).toBe("linear__create_issue");
+  });
+
+  it("preserves description, inputSchema, and other fields", () => {
+    const tool: Tool = {
+      name: "run_query",
+      description: "Run a DB query",
+      inputSchema: {
+        type: "object" as const,
+        properties: { sql: { type: "string" } },
+        required: ["sql"],
+      },
+    };
+    const namespaced = namespaceTool("db", tool);
+
+    expect(namespaced.description).toBe("Run a DB query");
+    expect(namespaced.inputSchema).toEqual(tool.inputSchema);
+  });
+});
+
+describe("parseNamespacedName", () => {
+  it("splits on first separator", () => {
+    const result = parseNamespacedName("linear__create_issue");
+
+    expect(result).toEqual({ source: "linear", toolName: "create_issue" });
+  });
+
+  it("handles tool names containing the separator", () => {
+    const result = parseNamespacedName("linear__my__tool");
+
+    expect(result).toEqual({ source: "linear", toolName: "my__tool" });
+  });
+
+  it("returns undefined for names without separator", () => {
+    expect(parseNamespacedName("no-separator")).toBeUndefined();
+  });
+});
+
+describe("NAMESPACE_SEPARATOR", () => {
+  it("is double underscore", () => {
+    expect(NAMESPACE_SEPARATOR).toBe("__");
   });
 });
 

@@ -408,8 +408,8 @@ describe("UpstreamManager", () => {
     await manager.connectAll();
 
     expect(toolRegistry.listTools()).toHaveLength(1);
-    expect(toolRegistry.getTool("remote-tool")).toBeDefined();
-    expect(toolRegistry.getTool("remote-tool")!.source).toBe("my-server");
+    expect(toolRegistry.getTool("my-server__remote-tool")).toBeDefined();
+    expect(toolRegistry.getTool("my-server__remote-tool")!.source).toBe("my-server");
 
     await manager.closeAll();
     await mockServer.server.close();
@@ -544,7 +544,7 @@ describe("UpstreamManager", () => {
 
     await manager.connectAll();
 
-    expect(toolRegistry.getTool("tool-from-b")).toBeDefined();
+    expect(toolRegistry.getTool("server-b__tool-from-b")).toBeDefined();
     expect(manager.getClient("server-b")!.status).toBe("connected");
 
     await manager.closeAll();
@@ -638,6 +638,38 @@ describe("UpstreamManager", () => {
     const statusB = statuses.find((s) => s.name === "srv-b")!;
     expect(statusB.status).toBe("connected");
     expect(statusB.toolCount).toBe(1);
+
+    await manager.closeAll();
+    await serverA.server.close();
+    await serverB.server.close();
+  });
+
+  it("namespaces tools from multiple upstreams to avoid collisions", async () => {
+    const serverA = createMockServer([makeTool("create_issue")]);
+    const serverB = createMockServer([makeTool("create_issue")]);
+    const servers: Record<string, ReturnType<typeof createMockServer>> = {
+      linear: serverA,
+      github: serverB,
+    };
+
+    const config = makeConfig({
+      linear: { type: "streamable-http", url: "http://localhost:1111" },
+      github: { type: "streamable-http", url: "http://localhost:2222" },
+    });
+
+    const manager = new UpstreamManager({
+      config,
+      toolRegistry,
+      _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
+    });
+
+    await manager.connectAll();
+
+    expect(toolRegistry.listTools()).toHaveLength(2);
+    expect(toolRegistry.getTool("linear__create_issue")).toBeDefined();
+    expect(toolRegistry.getTool("linear__create_issue")!.source).toBe("linear");
+    expect(toolRegistry.getTool("github__create_issue")).toBeDefined();
+    expect(toolRegistry.getTool("github__create_issue")!.source).toBe("github");
 
     await manager.closeAll();
     await serverA.server.close();
