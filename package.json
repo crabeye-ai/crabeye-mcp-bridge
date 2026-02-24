@@ -6,7 +6,12 @@
   "bin": {
     "kokuai-bridge": "./bin/kokuai-bridge"
   },
+  "files": [
+    "bin/",
+    "dist/"
+  ],
   "scripts": {
+    "prepublishOnly": "npm run build",
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
