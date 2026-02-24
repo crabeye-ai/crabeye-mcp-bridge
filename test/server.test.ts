@@ -3,9 +3,11 @@ import { PassThrough } from "node:stream";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
+import type { BridgeServerOptions } from "../src/server/bridge-server.js";
+import type { UpstreamClient } from "../src/upstream/types.js";
 import {
   NAMESPACE_SEPARATOR,
   namespaceTool,
@@ -20,9 +22,15 @@ function makeTool(name: string, description?: string): Tool {
   };
 }
 
-async function createTestPair(registry?: ToolRegistry) {
-  const toolRegistry = registry ?? new ToolRegistry();
-  const server = new BridgeServer({ toolRegistry });
+async function createTestPair(options?: {
+  registry?: ToolRegistry;
+  getUpstreamClient?: BridgeServerOptions["getUpstreamClient"];
+}) {
+  const toolRegistry = options?.registry ?? new ToolRegistry();
+  const server = new BridgeServer({
+    toolRegistry,
+    getUpstreamClient: options?.getUpstreamClient,
+  });
 
   const client = new Client({ name: "test-client", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -38,6 +46,25 @@ async function createTestPair(registry?: ToolRegistry) {
       await client.close();
       await server.close();
     },
+  };
+}
+
+function makeMockUpstreamClient(
+  name: string,
+  overrides?: Partial<UpstreamClient>,
+): UpstreamClient {
+  return {
+    name,
+    status: "connected",
+    tools: [],
+    connect: vi.fn().mockResolvedValue(undefined),
+    callTool: vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: `called on ${name}` }],
+    }),
+    close: vi.fn().mockResolvedValue(undefined),
+    onStatusChange: vi.fn().mockReturnValue(() => {}),
+    onToolsChanged: vi.fn().mockReturnValue(() => {}),
+    ...overrides,
   };
 }
 
@@ -170,7 +197,7 @@ describe("tools/list", () => {
       makeTool("write-file", "Write a file"),
     ]);
 
-    const { client, cleanup } = await createTestPair(registry);
+    const { client, cleanup } = await createTestPair({ registry });
 
     const result = await client.listTools();
     expect(result.tools).toHaveLength(2);
@@ -184,7 +211,7 @@ describe("tools/list", () => {
     registry.setToolsForSource("server-a", [makeTool("tool-a")]);
     registry.setToolsForSource("server-b", [makeTool("tool-b")]);
 
-    const { client, cleanup } = await createTestPair(registry);
+    const { client, cleanup } = await createTestPair({ registry });
 
     const result = await client.listTools();
     expect(result.tools).toHaveLength(2);
@@ -207,15 +234,148 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("throws error for known tool (routing not implemented)", async () => {
+  it("routes call to correct upstream and returns result", async () => {
     const registry = new ToolRegistry();
-    registry.setToolsForSource("server-a", [makeTool("my-tool")]);
+    registry.setToolsForSource("linear", [makeTool("linear__create_issue")]);
 
-    const { client, cleanup } = await createTestPair(registry);
+    const mockClient = makeMockUpstreamClient("linear", {
+      callTool: vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "issue created" }],
+      } satisfies CallToolResult),
+    });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: (name) => (name === "linear" ? mockClient : undefined),
+    });
+
+    const result = await client.callTool({
+      name: "linear__create_issue",
+      arguments: { title: "Bug" },
+    });
+
+    expect(result.content).toEqual([{ type: "text", text: "issue created" }]);
+    expect(mockClient.callTool).toHaveBeenCalledWith({
+      name: "create_issue",
+      arguments: { title: "Bug" },
+    });
+
+    await cleanup();
+  });
+
+  it("routes to correct upstream when multiple upstreams exist", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("linear", [makeTool("linear__create_issue")]);
+    registry.setToolsForSource("github", [makeTool("github__create_issue")]);
+
+    const linearClient = makeMockUpstreamClient("linear", {
+      callTool: vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "linear issue" }],
+      } satisfies CallToolResult),
+    });
+    const githubClient = makeMockUpstreamClient("github", {
+      callTool: vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "github issue" }],
+      } satisfies CallToolResult),
+    });
+
+    const clients: Record<string, UpstreamClient> = { linear: linearClient, github: githubClient };
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: (name) => clients[name],
+    });
+
+    const result = await client.callTool({
+      name: "github__create_issue",
+      arguments: {},
+    });
+
+    expect(result.content).toEqual([{ type: "text", text: "github issue" }]);
+    expect(githubClient.callTool).toHaveBeenCalledWith({ name: "create_issue", arguments: {} });
+    expect(linearClient.callTool).not.toHaveBeenCalled();
+
+    await cleanup();
+  });
+
+  it("throws error when upstream server is not found", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("gone", [makeTool("gone__my-tool")]);
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => undefined,
+    });
 
     await expect(
-      client.callTool({ name: "my-tool", arguments: {} }),
-    ).rejects.toThrow(/routing not implemented/);
+      client.callTool({ name: "gone__my-tool", arguments: {} }),
+    ).rejects.toThrow(/Upstream server not found: gone/);
+
+    await cleanup();
+  });
+
+  it("throws error when upstream is disconnected", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+
+    const mockClient = makeMockUpstreamClient("srv", { status: "disconnected" });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    await expect(
+      client.callTool({ name: "srv__my-tool", arguments: {} }),
+    ).rejects.toThrow(/not connected/);
+
+    await cleanup();
+  });
+
+  it("wraps upstream callTool errors with server name", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("flaky", [makeTool("flaky__broken")]);
+
+    const mockClient = makeMockUpstreamClient("flaky", {
+      callTool: vi.fn().mockRejectedValue(new Error("connection reset")),
+    });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    await expect(
+      client.callTool({ name: "flaky__broken", arguments: {} }),
+    ).rejects.toThrow(/Upstream server "flaky" error: connection reset/);
+
+    await cleanup();
+  });
+
+  it("throws error when tool has no namespace separator", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("server-a", [makeTool("no-namespace")]);
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => makeMockUpstreamClient("server-a"),
+    });
+
+    await expect(
+      client.callTool({ name: "no-namespace", arguments: {} }),
+    ).rejects.toThrow(/missing namespace/);
+
+    await cleanup();
+  });
+
+  it("throws error when no upstream client resolver is configured", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__tool")]);
+
+    const { client, cleanup } = await createTestPair({ registry });
+
+    await expect(
+      client.callTool({ name: "srv__tool", arguments: {} }),
+    ).rejects.toThrow(/No upstream client resolver/);
 
     await cleanup();
   });
@@ -226,7 +386,7 @@ describe("tools/call", () => {
 describe("notifications", () => {
   it("client receives tools/list_changed when registry changes", async () => {
     const registry = new ToolRegistry();
-    const { client, cleanup } = await createTestPair(registry);
+    const { client, cleanup } = await createTestPair({ registry });
 
     const notificationReceived = new Promise<void>((resolve) => {
       client.setNotificationHandler(
