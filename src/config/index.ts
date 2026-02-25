@@ -1,4 +1,5 @@
 export {
+  ToolPolicySchema,
   ServerOAuthConfigSchema,
   ServerBridgeConfigSchema,
   StdioServerConfigSchema,
@@ -10,6 +11,7 @@ export {
   isStdioServer,
 } from "./schema.js";
 export type {
+  ToolPolicy,
   ServerOAuthConfig,
   ServerBridgeConfig,
   StdioServerConfig,

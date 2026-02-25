@@ -2,6 +2,7 @@ import MiniSearch from "minisearch";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { parseNamespacedName } from "../server/tool-namespacing.js";
+import type { PolicyEngine } from "../policy/index.js";
 
 export interface SearchToolsParams {
   queries?: string[];
@@ -16,6 +17,7 @@ export interface SearchToolResult {
   source: string;
   description: string;
   input_schema: object;
+  disabled?: true;
 }
 
 export interface ProviderResult {
@@ -178,13 +180,17 @@ export const runToolDefinition: Tool = {
 };
 
 export class ToolSearchService {
+  private registry: ToolRegistry;
   private index: MiniSearch<IndexedTool>;
   private indexedTools = new Map<string, IndexedTool>();
   private enabledTools = new Set<string>();
   private listeners = new Set<VisibleToolsChangedCallback>();
   private unsubscribeRegistry: () => void;
+  private policyEngine: PolicyEngine | undefined;
 
-  constructor(private registry: ToolRegistry) {
+  constructor(registry: ToolRegistry, policyEngine?: PolicyEngine) {
+    this.registry = registry;
+    this.policyEngine = policyEngine;
     this.index = this.createIndex();
     this.rebuildIndex();
     this.unsubscribeRegistry = this.registry.onChanged(() => {
@@ -353,6 +359,17 @@ export class ToolSearchService {
 
     const paged = allMatched.slice(offset, offset + limit);
 
+    // Pre-compute policy for each tool on the page
+    const disabledSet = new Set<string>();
+    if (this.policyEngine) {
+      for (const name of paged) {
+        const parsed = parseNamespacedName(name);
+        if (parsed && this.policyEngine.resolvePolicy(parsed.source, parsed.toolName) === "never") {
+          disabledSet.add(name);
+        }
+      }
+    }
+
     const tools: SearchToolResult[] = [];
     for (const name of paged) {
       const doc = this.indexedTools.get(name);
@@ -360,20 +377,30 @@ export class ToolSearchService {
       const registered = this.registry.getTool(name);
       if (!registered) continue;
 
-      tools.push({
-        tool_name: name,
-        source: doc.source,
-        description: doc.description,
-        input_schema: registered.tool.inputSchema,
-      });
+      if (disabledSet.has(name)) {
+        tools.push({
+          tool_name: name,
+          source: doc.source,
+          description: "",
+          input_schema: {},
+          disabled: true,
+        });
+      } else {
+        tools.push({
+          tool_name: name,
+          source: doc.source,
+          description: doc.description,
+          input_schema: registered.tool.inputSchema,
+        });
+      }
     }
 
     // Build provider results from all matched tools (not just the page)
     const providerResults = this.buildProviderResults(allMatched, sourcePatterns);
 
-    // Only enable tools in the current page
+    // Only enable tools in the current page (skip disabled ones)
     const pagedNames = paged.filter(
-      (name) => this.indexedTools.has(name) && this.registry.getTool(name),
+      (name) => this.indexedTools.has(name) && this.registry.getTool(name) && !disabledSet.has(name),
     );
     const newEnabled = new Set(pagedNames);
     const changed = !setsEqual(this.enabledTools, newEnabled);
