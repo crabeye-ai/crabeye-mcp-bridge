@@ -132,7 +132,7 @@ Static credentials (API keys, tokens) can be passed via `env` or `headers` in th
 ## CLI
 
 ```
-npx crabeye-mcp-bridge --config <path>
+npx @crabeye-ai/crabeye-mcp-bridge --config <path>
 ```
 
 | Flag | Description |
