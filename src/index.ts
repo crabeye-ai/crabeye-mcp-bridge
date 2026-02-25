@@ -4,15 +4,16 @@ import { BridgeServer } from "./server/index.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { ToolSearchService } from "./search/index.js";
 import { UpstreamManager } from "./upstream/index.js";
+import { APP_NAME, APP_VERSION } from "./constants.js";
 
 const program = new Command();
 
 program
-  .name("crabeye-mcp-bridge")
+  .name(APP_NAME)
   .description(
     "Aggregates multiple MCP servers behind a single STDIO interface",
   )
-  .version("0.1.0")
+  .version(APP_VERSION)
   .option("-c, --config <path>", "path to config file")
   .option("-p, --port <number>", "HTTP server port", parseInt)
   .option("-t, --token <string>", "authentication token")
@@ -43,7 +44,7 @@ program
       await server.start();
 
       console.error(
-        `crabeye-mcp-bridge running — ${toolRegistry.listRegisteredTools().length} tools indexed from ${upstreamManager.getStatuses().length} servers`,
+        `${APP_NAME} running — ${toolRegistry.listRegisteredTools().length} tools indexed from ${upstreamManager.getStatuses().length} servers`,
       );
     } catch (err) {
       if (err instanceof ConfigError) {

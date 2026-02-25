@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { APP_NAME } from "../constants.js";
 
 // --- Per-server auth config ---
 
@@ -82,7 +83,7 @@ export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
  * earlier sources win: `mcpUpstreams` > `servers` > `mcpServers`.
  *
  * Self-exclusion: entries from `mcpServers` whose `command` or `args`
- * contain "crabeye-mcp-bridge" are filtered out.
+ * contain the app name are filtered out.
  */
 export function resolveUpstreams(
   config: BridgeConfig,
@@ -93,7 +94,7 @@ export function resolveUpstreams(
   for (const [name, server] of Object.entries(config.mcpServers)) {
     if (isStdioServer(server)) {
       const tokens = [server.command, ...(server.args ?? [])];
-      if (tokens.some((t) => t.includes("crabeye-mcp-bridge"))) {
+      if (tokens.some((t) => t.includes(APP_NAME))) {
         continue;
       }
     }

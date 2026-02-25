@@ -3,6 +3,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { StdioServerConfig } from "../config/schema.js";
+import { APP_NAME, APP_VERSION } from "../constants.js";
 import type {
   UpstreamClient,
   ConnectionStatus,
@@ -83,7 +84,7 @@ export class StdioUpstreamClient implements UpstreamClient {
     try {
       const transport = this._createTransport();
       const client = new Client(
-        { name: `crabeye-mcp-bridge/${this.name}`, version: "0.1.0" },
+        { name: `${APP_NAME}/${this.name}`, version: APP_VERSION },
         {
           listChanged: {
             tools: {

@@ -18,6 +18,7 @@ import {
   RUN_TOOL_NAME,
 } from "../search/index.js";
 import type { SearchToolsParams } from "../search/index.js";
+import { APP_NAME, APP_VERSION } from "../constants.js";
 
 export interface BridgeServerOptions {
   stdin?: Readable;
@@ -39,9 +40,28 @@ export class BridgeServer {
     this.toolRegistry = options?.toolRegistry ?? new ToolRegistry();
     this.toolSearchService = options?.toolSearchService;
 
+    const instructions = [
+      "This MCP bridge connects you to many external tools and services.",
+      "You MUST call search_tools BEFORE any of the following:",
+      "- The user mentions a service, tool, or MCP server by name",
+      "- The user says 'use X', 'with X', 'in X', 'on X', 'via X', or 'through X'",
+      "- The user asks you to perform an action that might be handled by an external service (create, update, query, send, manage, etc.)",
+      "- The user asks what tools or integrations are available, or what you can do",
+      "- The user asks 'can you...?' about a capability that could involve an external service",
+      "- You are about to claim a tool is unavailable or that you cannot perform an action — search first, then answer",
+      "- You are about to fall back to a web search for something that might be available as a tool",
+      "",
+      "Call search_tools with multiple descriptive queries in a single call to cover different phrasings and aspects of the user's intent (e.g. queries: [\"create task\", \"new ticket\", \"add item\"]).",
+      "After discovering tools, use run_tool to execute them. You can also call auto-enabled tools directly by their namespaced name.",
+      "When in doubt, search — it is always better to search and find nothing than to miss an available tool.",
+    ].join("\n");
+
     this.server = new Server(
-      { name: "crabeye-mcp-bridge", version: "0.1.0" },
-      { capabilities: { tools: { listChanged: true } } },
+      { name: APP_NAME, version: APP_VERSION },
+      {
+        capabilities: { tools: { listChanged: true } },
+        instructions,
+      },
     );
 
     this.server.setRequestHandler(ListToolsRequestSchema, () => {

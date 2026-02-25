@@ -45,22 +45,34 @@ interface IndexedTool {
 }
 
 const MAX_LIMIT = 50;
-const DEFAULT_LIMIT = 20;
+const DEFAULT_LIMIT = 10;
 const SCORE_CUTOFF = 0.3;
 
 const MAX_REGEX_LEN = 200;
 
 function parseRegex(input: string): RegExp | null {
-  const match = /^\/(.+)\/([gimsuy]*)$/.exec(input);
-  if (!match) return null;
-  if (match[1].length > MAX_REGEX_LEN) return null;
+  // Support "regex:pattern" prefix (preferred) and legacy /pattern/flags format
+  let pattern: string;
+  let flags = "";
+
+  if (input.startsWith("regex:")) {
+    pattern = input.slice(6);
+  } else {
+    const match = /^\/(.+)\/([gimsuy]*)$/.exec(input);
+    if (!match) return null;
+    pattern = match[1];
+    flags = match[2];
+  }
+
+  if (!pattern || pattern.length > MAX_REGEX_LEN) return null;
+
   try {
     // Use 'v' flag (unicode sets) for linear-time guarantee where available,
     // fall back to plain construction on older runtimes.
     try {
-      return new RegExp(match[1], match[2] + "v");
+      return new RegExp(pattern, flags + "v");
     } catch {
-      return new RegExp(match[1], match[2]);
+      return new RegExp(pattern, flags);
     }
   } catch {
     return null;
@@ -86,13 +98,20 @@ export const RUN_TOOL_NAME = "run_tool";
 
 export const searchToolDefinition: Tool = {
   name: SEARCH_TOOL_NAME,
-  description:
-    "Search for available tools, providers, and categories across all connected upstream MCP servers. " +
-    "Returns matching tools with descriptions and auto-enables them for use. " +
-    "Also returns matching provider information (name, tool count, tool list). " +
-    "Use text queries for fuzzy name/description search, or /regex/ patterns for precise matching. " +
-    "Filter by provider or category to scope results to specific servers. " +
+  description: [
+    "Search for available tools across all connected MCP servers. ALWAYS call this BEFORE claiming a tool is unavailable, before web search fallback, or when the user mentions any service/tool/integration.",
+    "",
+    "When to use:",
+    "- User mentions a service or tool by name — search by provider name",
+    "- User wants to perform an action (create, update, query, send, manage, etc.) — search by action keywords",
+    "- User asks what tools or integrations are available — search with broad queries",
+    "- User asks 'can you...?' about external capabilities — search before answering",
+    "- You need a tool you haven't seen yet — many tools are available but not listed until searched",
+    "",
+    "Returns matching tools with descriptions and input schemas, auto-enables them for immediate use.",
+    "Use text queries for fuzzy search or prefix with regex: for precise pattern matching. Filter by provider or category.",
     "At least one of queries, providers, or categories must be specified.",
+  ].join("\n"),
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -100,28 +119,31 @@ export const searchToolDefinition: Tool = {
         type: "array",
         items: { type: "string" },
         description:
-          "Text search queries or /regex/flags patterns to match tool names, descriptions, and provider names. " +
-          "Multiple queries are combined with OR — results matching any query are included.",
+          "Text search queries to match tool names, descriptions, and provider names. " +
+          "Prefix with regex: for regex matching (e.g. \"regex:.*issue.*\"). " +
+          "Multiple queries are combined with OR — results matching any query are included. " +
+          "Prefer passing several queries at once covering synonyms and related terms to minimize round-trips.",
       },
       providers: {
         type: "array",
         items: { type: "string" },
         description:
           "Search or filter by upstream server/provider name. " +
-          "Supports exact names, substring matching, and /regex/flags patterns. " +
-          "Returns all tools from matching providers.",
+          "Supports exact names, substring matching, and regex: prefix for patterns. " +
+          "Returns all tools from matching providers. " +
+          'To list all providers, pass "regex:.*".',
       },
       categories: {
         type: "array",
         items: { type: "string" },
         description:
           "Search by tool category. Categories correspond to provider/source names. " +
-          "Supports exact names, substring matching, and /regex/flags patterns. " +
+          "Supports exact names, substring matching, and regex: prefix for patterns. " +
           "Functionally equivalent to providers — use whichever feels more natural.",
       },
       limit: {
         type: "number",
-        description: `Maximum number of tool results to return (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT})`,
+        description: `Maximum number of tool results to return (default ${DEFAULT_LIMIT} (recommended), max ${MAX_LIMIT})`,
       },
       offset: {
         type: "number",
@@ -133,10 +155,11 @@ export const searchToolDefinition: Tool = {
 
 export const runToolDefinition: Tool = {
   name: RUN_TOOL_NAME,
-  description:
-    "Run any tool from any connected upstream MCP server by its full namespaced name " +
-    "(e.g. 'linear__create_issue'). The tool does not need to be enabled via search first. " +
-    "Use search_tools to discover available tool names, then run_tool to call them directly.",
+  description: [
+    "Execute any tool from any connected MCP server by its full namespaced name (provider__tool_name format).",
+    "Use this after discovering tools via search_tools. The tool does not need to be enabled first.",
+    "Pass the exact namespaced name from search results and the required arguments.",
+  ].join("\n"),
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -310,6 +333,24 @@ export class ToolSearchService {
 
     const allMatched = Array.from(candidates);
     const total = allMatched.length;
+
+    // Provider/category-only search: return just provider names and tool counts
+    const providerOnly = !hasQueries && (hasProviders || hasCategories);
+
+    if (providerOnly) {
+      const providerResults = this.buildProviderResults(allMatched, sourcePatterns)
+        .map(({ name, tool_count }) => ({ name, tool_count, tools: [] as string[] }));
+      return {
+        tools: [],
+        providers: providerResults,
+        auto_enabled: [],
+        total,
+        limit,
+        offset,
+        count: 0,
+      };
+    }
+
     const paged = allMatched.slice(offset, offset + limit);
 
     const tools: SearchToolResult[] = [];
