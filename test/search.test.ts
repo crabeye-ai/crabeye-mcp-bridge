@@ -153,29 +153,33 @@ describe("ToolSearchService", () => {
       ]);
     });
 
-    it("exact provider name returns all tools from that provider", () => {
+    it("exact provider name returns provider info without tool details", () => {
       const result = service.search({ providers: ["linear"] });
       expect(result.total).toBe(2);
-      expect(result.tools.every((r) => r.source === "linear")).toBe(true);
+      expect(result.tools).toEqual([]);
+      expect(result.providers).toHaveLength(1);
+      expect(result.providers[0].name).toBe("linear");
+      expect(result.providers[0].tool_count).toBe(2);
     });
 
     it("substring provider match works", () => {
       const result = service.search({ providers: ["git"] });
       expect(result.total).toBe(1);
-      expect(result.tools[0].source).toBe("github");
+      expect(result.tools).toEqual([]);
+      expect(result.providers[0].name).toBe("github");
     });
 
     it("regex provider search works", () => {
       const result = service.search({ providers: ["/^(linear|figma)$/"] });
       expect(result.total).toBe(3);
-      const sources = new Set(result.tools.map((r) => r.source));
+      const sources = new Set(result.providers.map((r) => r.name));
       expect(sources).toEqual(new Set(["linear", "figma"]));
     });
 
     it("multiple providers are OR-combined", () => {
       const result = service.search({ providers: ["linear", "figma"] });
       expect(result.total).toBe(3);
-      const sources = new Set(result.tools.map((r) => r.source));
+      const sources = new Set(result.providers.map((r) => r.name));
       expect(sources).toEqual(new Set(["linear", "figma"]));
     });
 
@@ -206,20 +210,21 @@ describe("ToolSearchService", () => {
     it("categories works like providers", () => {
       const result = service.search({ categories: ["linear"] });
       expect(result.total).toBe(1);
-      expect(result.tools[0].source).toBe("linear");
+      expect(result.tools).toEqual([]);
+      expect(result.providers[0].name).toBe("linear");
     });
 
     it("multiple categories are OR-combined", () => {
       const result = service.search({ categories: ["linear", "github"] });
       expect(result.total).toBe(2);
-      const sources = new Set(result.tools.map((r) => r.source));
+      const sources = new Set(result.providers.map((r) => r.name));
       expect(sources).toEqual(new Set(["linear", "github"]));
     });
 
     it("categories and providers are merged", () => {
       const result = service.search({ providers: ["linear"], categories: ["figma"] });
       expect(result.total).toBe(2);
-      const sources = new Set(result.tools.map((r) => r.source));
+      const sources = new Set(result.providers.map((r) => r.name));
       expect(sources).toEqual(new Set(["linear", "figma"]));
     });
 
@@ -235,7 +240,8 @@ describe("ToolSearchService", () => {
     it("categories accepts regex patterns", () => {
       const result = service.search({ categories: ["/^fig/"] });
       expect(result.total).toBe(1);
-      expect(result.tools[0].source).toBe("figma");
+      expect(result.tools).toEqual([]);
+      expect(result.providers[0].name).toBe("figma");
     });
   });
 
@@ -289,12 +295,12 @@ describe("ToolSearchService", () => {
       expect(result.providers[0].tool_count).toBe(2);
     });
 
-    it("provider-only search includes provider info", () => {
+    it("provider-only search includes provider info without tool names", () => {
       const result = service.search({ providers: ["linear"] });
       expect(result.providers).toHaveLength(1);
       expect(result.providers[0].name).toBe("linear");
       expect(result.providers[0].tool_count).toBe(2);
-      expect(result.providers[0].tools).toHaveLength(2);
+      expect(result.providers[0].tools).toEqual([]);
     });
   });
 
@@ -325,13 +331,13 @@ describe("ToolSearchService", () => {
     });
 
     it("limit and offset pagination", () => {
-      const page1 = service.search({ providers: ["src"], limit: 5, offset: 0 });
+      const page1 = service.search({ queries: ["Tool number"], limit: 5, offset: 0 });
       expect(page1.count).toBe(5);
       expect(page1.total).toBe(30);
       expect(page1.limit).toBe(5);
       expect(page1.offset).toBe(0);
 
-      const page2 = service.search({ providers: ["src"], limit: 5, offset: 5 });
+      const page2 = service.search({ queries: ["Tool number"], limit: 5, offset: 5 });
       expect(page2.count).toBe(5);
       expect(page2.offset).toBe(5);
 
@@ -341,34 +347,34 @@ describe("ToolSearchService", () => {
     });
 
     it("limit clamped to 50", () => {
-      const result = service.search({ providers: ["src"], limit: 100 });
+      const result = service.search({ queries: ["Tool number"], limit: 100 });
       expect(result.limit).toBe(50);
       expect(result.count).toBeLessThanOrEqual(50);
     });
 
     it("default limit is 20", () => {
-      const result = service.search({ providers: ["src"] });
+      const result = service.search({ queries: ["Tool number"] });
       expect(result.limit).toBe(20);
       expect(result.count).toBe(20);
     });
 
     it("only paged tools are enabled in getVisibleTools", () => {
-      service.search({ providers: ["src"], limit: 5, offset: 0 });
+      service.search({ queries: ["Tool number"], limit: 5, offset: 0 });
       const visible = service.getVisibleTools();
       // search_tools + run_tool + 5 paged tools
       expect(visible).toHaveLength(7);
     });
 
     it("auto_enabled only contains paged tools", () => {
-      const result = service.search({ providers: ["src"], limit: 5, offset: 0 });
+      const result = service.search({ queries: ["Tool number"], limit: 5, offset: 0 });
       expect(result.auto_enabled).toHaveLength(5);
       expect(result.total).toBe(30);
     });
 
     it("paging to next page replaces enabled tools", () => {
-      const page1 = service.search({ providers: ["src"], limit: 5, offset: 0 });
+      const page1 = service.search({ queries: ["Tool number"], limit: 5, offset: 0 });
 
-      const page2 = service.search({ providers: ["src"], limit: 5, offset: 5 });
+      const page2 = service.search({ queries: ["Tool number"], limit: 5, offset: 5 });
       const page2Visible = service.getVisibleTools().map((t) => t.name);
 
       // Page 1 tools should no longer be visible
@@ -408,7 +414,7 @@ describe("ToolSearchService", () => {
       expect(names).toContain("linear__create_issue");
       expect(names).toContain("github__create_pr");
 
-      service.search({ providers: ["github"] });
+      service.search({ queries: ["create_pr"] });
       names = service.getVisibleTools().map((t) => t.name);
       expect(names).toContain("github__create_pr");
       expect(names).not.toContain("linear__create_issue");
@@ -426,10 +432,10 @@ describe("ToolSearchService", () => {
     it("onVisibleToolsChanged does not fire when results are identical", () => {
       const callback = vi.fn();
 
-      service.search({ providers: ["github"] });
+      service.search({ queries: ["pull request"] });
       service.onVisibleToolsChanged(callback);
 
-      service.search({ providers: ["github"] });
+      service.search({ queries: ["pull request"] });
       expect(callback).not.toHaveBeenCalled();
     });
   });
@@ -452,14 +458,14 @@ describe("ToolSearchService", () => {
     });
 
     it("enabled tools pruned when removed from registry", () => {
-      registry.setToolsForSource("a", [makeTool("a__tool1"), makeTool("a__tool2")]);
-      service.search({ providers: ["a"] });
+      registry.setToolsForSource("a", [makeTool("a__tool1", "Alpha tool"), makeTool("a__tool2", "Alpha tool")]);
+      service.search({ queries: ["Alpha tool"] });
 
       let visible = service.getVisibleTools().map((t) => t.name);
       expect(visible).toContain("a__tool1");
       expect(visible).toContain("a__tool2");
 
-      registry.setToolsForSource("a", [makeTool("a__tool1")]);
+      registry.setToolsForSource("a", [makeTool("a__tool1", "Alpha tool")]);
 
       visible = service.getVisibleTools().map((t) => t.name);
       expect(visible).toContain("a__tool1");
@@ -467,8 +473,8 @@ describe("ToolSearchService", () => {
     });
 
     it("visibleToolsChanged fires on prune", () => {
-      registry.setToolsForSource("a", [makeTool("a__tool1"), makeTool("a__tool2")]);
-      service.search({ providers: ["a"] });
+      registry.setToolsForSource("a", [makeTool("a__tool1", "Alpha tool"), makeTool("a__tool2", "Alpha tool")]);
+      service.search({ queries: ["Alpha tool"] });
 
       const callback = vi.fn();
       service.onVisibleToolsChanged(callback);
@@ -493,8 +499,8 @@ describe("ToolSearchService", () => {
       const callback = vi.fn();
       service.onVisibleToolsChanged(callback);
 
-      registry.setToolsForSource("a", [makeTool("a__t1")]);
-      service.search({ providers: ["a"] });
+      registry.setToolsForSource("a", [makeTool("a__t1", "Alpha tool")]);
+      service.search({ queries: ["Alpha tool"] });
       callback.mockClear();
 
       service.dispose();
@@ -582,7 +588,7 @@ describe("BridgeServer with ToolSearchService", () => {
     await cleanup();
   });
 
-  it("search by provider returns provider info", async () => {
+  it("search by provider returns provider info without tool details", async () => {
     const { client, cleanup } = await createSearchTestPair([
       {
         source: "linear",
@@ -603,6 +609,7 @@ describe("BridgeServer with ToolSearchService", () => {
       (result.content as Array<{ type: string; text: string }>)[0].text,
     );
     expect(parsed.total).toBe(2);
+    expect(parsed.tools).toEqual([]);
     expect(parsed.providers).toHaveLength(1);
     expect(parsed.providers[0].name).toBe("linear");
     expect(parsed.providers[0].tool_count).toBe(2);
@@ -610,7 +617,7 @@ describe("BridgeServer with ToolSearchService", () => {
     await cleanup();
   });
 
-  it("search by categories works like providers", async () => {
+  it("search by categories returns provider info without tool details", async () => {
     const { client, cleanup } = await createSearchTestPair([
       { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
       { source: "github", tools: [makeTool("github__create_pr", "Create PR")] },
@@ -625,7 +632,8 @@ describe("BridgeServer with ToolSearchService", () => {
       (result.content as Array<{ type: string; text: string }>)[0].text,
     );
     expect(parsed.total).toBe(1);
-    expect(parsed.tools[0].source).toBe("github");
+    expect(parsed.tools).toEqual([]);
+    expect(parsed.providers[0].name).toBe("github");
 
     await cleanup();
   });
