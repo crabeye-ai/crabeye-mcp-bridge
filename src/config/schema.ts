@@ -49,7 +49,7 @@ export const GlobalBridgeConfigSchema = z
     logLevel: z
       .enum(["debug", "info", "warn", "error"])
       .default("info"),
-    maxUpstreamConnections: z.number().int().positive().default(20),
+    maxUpstreamConnections: z.number().int().positive().default(1000),
     connectionTimeout: z.number().int().positive().default(30),
     idleTimeout: z.number().int().positive().default(600),
   })

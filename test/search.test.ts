@@ -352,10 +352,10 @@ describe("ToolSearchService", () => {
       expect(result.count).toBeLessThanOrEqual(50);
     });
 
-    it("default limit is 20", () => {
+    it("default limit is 10", () => {
       const result = service.search({ queries: ["Tool number"] });
-      expect(result.limit).toBe(20);
-      expect(result.count).toBe(20);
+      expect(result.limit).toBe(10);
+      expect(result.count).toBe(10);
     });
 
     it("only paged tools are enabled in getVisibleTools", () => {
