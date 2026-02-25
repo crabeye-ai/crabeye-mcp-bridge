@@ -24,14 +24,14 @@ export const ServerBridgeConfigSchema = z
 export const StdioServerConfigSchema = z.object({
   command: z.string(),
   args: z.array(z.string()).optional(),
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
   _bridge: ServerBridgeConfigSchema.optional(),
 });
 
 export const HttpServerConfigSchema = z.object({
   type: z.enum(["streamable-http", "sse"]).default("streamable-http"),
   url: z.string().url(),
-  headers: z.record(z.string()).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   _bridge: ServerBridgeConfigSchema.optional(),
 });
 
@@ -61,7 +61,13 @@ export const BridgeConfigSchema = z.object({
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
   mcpUpstreams: z.record(z.string(), ServerConfigSchema).optional(),
   servers: z.record(z.string(), ServerConfigSchema).optional(),
-  _bridge: GlobalBridgeConfigSchema.default({}),
+  _bridge: GlobalBridgeConfigSchema.default({
+    port: 19875,
+    logLevel: "info" as const,
+    maxUpstreamConnections: 1000,
+    connectionTimeout: 30,
+    idleTimeout: 600,
+  }),
 });
 
 // --- Inferred types ---
