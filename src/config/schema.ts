@@ -22,6 +22,7 @@ export const ServerBridgeConfigSchema = z
     auth: ServerOAuthConfigSchema.optional(),
     toolPolicy: ToolPolicySchema.optional(),
     tools: z.record(z.string(), ToolPolicySchema).optional(),
+    category: z.string().optional(),
   })
   .strict();
 

@@ -52,6 +52,11 @@ export class UpstreamManager {
       const client = this._clientFactory(name, serverConfig);
       this._clients.set(name, client);
 
+      const category = serverConfig._bridge?.category;
+      if (category) {
+        this._toolRegistry.setCategoryForSource(name, category);
+      }
+
       const unsubTools = client.onToolsChanged((tools) => {
         const namespaced = tools.map((t) => namespaceTool(name, t));
         this._toolRegistry.setToolsForSource(name, namespaced);

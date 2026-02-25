@@ -4,12 +4,17 @@ import type { ToolRegistry } from "../server/tool-registry.js";
 import { parseNamespacedName } from "../server/tool-namespacing.js";
 import type { PolicyEngine } from "../policy/index.js";
 
-export interface SearchToolsParams {
-  queries?: string[];
-  providers?: string[];
-  categories?: string[];
+export interface SearchQuery {
+  tool?: string;
+  provider?: string;
+  category?: string;
+  expand_tools?: boolean;
   limit?: number;
   offset?: number;
+}
+
+export interface SearchToolsParams {
+  queries: SearchQuery[];
 }
 
 export interface SearchToolResult {
@@ -22,18 +27,22 @@ export interface SearchToolResult {
 
 export interface ProviderResult {
   name: string;
+  category?: string;
   tool_count: number;
-  tools: string[];
+  tools: SearchToolResult[];
+}
+
+export interface QueryResult {
+  providers: ProviderResult[];
+  total: number;
+  count: number;
+  remaining: number;
+  offset: number;
+  limit: number;
 }
 
 export interface SearchToolsResponse {
-  tools: SearchToolResult[];
-  providers: ProviderResult[];
-  auto_enabled: string[];
-  total: number;
-  limit: number;
-  offset: number;
-  count: number;
+  results: QueryResult[];
 }
 
 type VisibleToolsChangedCallback = () => void;
@@ -44,6 +53,7 @@ interface IndexedTool {
   originalName: string;
   description: string;
   source: string;
+  category: string;
 }
 
 const MAX_LIMIT = 50;
@@ -89,10 +99,10 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
   return true;
 }
 
-function matchesPattern(value: string, pattern: string): boolean {
+function matchesPrefixOrRegex(value: string, pattern: string): boolean {
   const regex = parseRegex(pattern);
   if (regex) return regex.test(value);
-  return value.toLowerCase().includes(pattern.toLowerCase());
+  return value.toLowerCase().startsWith(pattern.toLowerCase());
 }
 
 export const SEARCH_TOOL_NAME = "search_tools";
@@ -103,55 +113,74 @@ export const searchToolDefinition: Tool = {
   description: [
     "Search for available tools across all connected MCP servers. ALWAYS call this BEFORE claiming a tool is unavailable, before web search fallback, or when the user mentions any service/tool/integration.",
     "",
+    "Discovery workflow:",
+    "1. Search by provider or category to get provider summaries (tool counts, no details)",
+    "2. If you need the tools, drill in with a tool filter or expand_tools: true to get full tool definitions",
+    "",
     "When to use:",
-    "- User mentions a service or tool by name — search by provider name",
-    "- User wants to perform an action (create, update, query, send, manage, etc.) — search by action keywords",
-    "- User asks what tools or integrations are available — search with broad queries",
+    "- User mentions a service or tool by name — search by provider name first",
+    "- User wants to perform an action (create, update, query, etc.) — search by tool keyword",
+    "- User asks what tools or integrations are available — search by provider or category for summaries",
     "- User asks 'can you...?' about external capabilities — search before answering",
     "- You need a tool you haven't seen yet — many tools are available but not listed until searched",
     "",
-    "Returns matching tools with descriptions and input schemas, auto-enables them for immediate use.",
-    "Use text queries for fuzzy search or prefix with regex: for precise pattern matching. Filter by provider or category.",
-    "At least one of queries, providers, or categories must be specified.",
+    "Response shape: results[].providers[].tools[]",
+    "Without a tool filter, only provider summaries are returned (name, category, tool_count). Use a tool query or expand_tools: true to get full tool definitions.",
+    "Use text queries for fuzzy search or prefix with regex: for precise pattern matching.",
+    "Each query object can have its own filters and pagination.",
   ].join("\n"),
   inputSchema: {
     type: "object" as const,
     properties: {
       queries: {
         type: "array",
-        items: { type: "string" },
+        items: {
+          type: "object",
+          properties: {
+            tool: {
+              type: "string",
+              description:
+                "Text search query to match tool names and descriptions. " +
+                "Prefix with regex: for regex matching (e.g. \"regex:.*issue.*\"). " +
+                "Prefer passing several queries covering synonyms and related terms to minimize round-trips.",
+            },
+            provider: {
+              type: "string",
+              description:
+                "Filter by upstream server/provider name. " +
+                "Prefix match by default (e.g. \"git\" matches \"github\"). " +
+                "Use regex: prefix for patterns (e.g. \"regex:^(linear|figma)$\").",
+            },
+            category: {
+              type: "string",
+              description:
+                "Filter by tool category (configured via _bridge.category in server config). " +
+                "Prefix match by default. Use regex: prefix for patterns.",
+            },
+            expand_tools: {
+              type: "boolean",
+              description:
+                "When true, return full tool definitions for all tools from matched providers. " +
+                "Without this, provider-only queries return summaries (name, tool_count) without tool details. " +
+                "Ignored when a tool filter is present (tool filter always returns details).",
+            },
+            limit: {
+              type: "number",
+              description: `Maximum number of tool results for this query (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT})`,
+            },
+            offset: {
+              type: "number",
+              description: "Number of tool results to skip for pagination (default 0)",
+            },
+          },
+        },
         description:
-          "Text search queries to match tool names, descriptions, and provider names. " +
-          "Prefix with regex: for regex matching (e.g. \"regex:.*issue.*\"). " +
-          "Multiple queries are combined with OR — results matching any query are included. " +
-          "Prefer passing several queries at once covering synonyms and related terms to minimize round-trips.",
-      },
-      providers: {
-        type: "array",
-        items: { type: "string" },
-        description:
-          "Search or filter by upstream server/provider name. " +
-          "Supports exact names, substring matching, and regex: prefix for patterns. " +
-          "Returns all tools from matching providers. " +
-          'To list all providers, pass "regex:.*".',
-      },
-      categories: {
-        type: "array",
-        items: { type: "string" },
-        description:
-          "Search by tool category. Categories correspond to provider/source names. " +
-          "Supports exact names, substring matching, and regex: prefix for patterns. " +
-          "Functionally equivalent to providers — use whichever feels more natural.",
-      },
-      limit: {
-        type: "number",
-        description: `Maximum number of tool results to return (default ${DEFAULT_LIMIT} (recommended), max ${MAX_LIMIT})`,
-      },
-      offset: {
-        type: "number",
-        description: "Number of tool results to skip for pagination (default 0)",
+          "Array of query objects. Each query is self-contained with its own filters and pagination. " +
+          "Results are deduplicated across queries — first query wins. " +
+          "Each query must have at least one of: tool, provider, category.",
       },
     },
+    required: ["queries"],
   },
 };
 
@@ -201,7 +230,7 @@ export class ToolSearchService {
   private createIndex(): MiniSearch<IndexedTool> {
     return new MiniSearch<IndexedTool>({
       fields: ["name", "originalName", "description", "source"],
-      storeFields: ["name", "originalName", "description", "source"],
+      storeFields: ["name", "originalName", "description", "source", "category"],
       searchOptions: {
         boost: { name: 3, originalName: 3, description: 1, source: 0.5 },
         prefix: (term) => term.length >= 3,
@@ -220,6 +249,7 @@ export class ToolSearchService {
     for (const { source, tool } of registered) {
       const parsed = parseNamespacedName(tool.name);
       const originalName = parsed?.toolName ?? tool.name;
+      const category = this.registry.getCategoryForSource(source) ?? "";
 
       const doc: IndexedTool = {
         id: tool.name,
@@ -227,6 +257,7 @@ export class ToolSearchService {
         originalName,
         description: tool.description ?? "",
         source,
+        category,
       };
       this.indexedTools.set(tool.name, doc);
       this.index.add(doc);
@@ -247,42 +278,91 @@ export class ToolSearchService {
   }
 
   search(params: SearchToolsParams): SearchToolsResponse {
-    const { queries, providers, categories } = params;
-    const hasQueries = queries && queries.length > 0;
-    const hasProviders = providers && providers.length > 0;
-    const hasCategories = categories && categories.length > 0;
+    const queries = params.queries;
 
-    if (!hasQueries && !hasProviders && !hasCategories) {
-      return {
-        tools: [],
-        providers: [],
-        auto_enabled: [],
-        total: 0,
-        limit: params.limit ?? DEFAULT_LIMIT,
-        offset: params.offset ?? 0,
-        count: 0,
-      };
+    if (!queries || queries.length === 0) {
+      return { results: [] };
     }
 
-    const limit = Math.min(
-      Math.max(1, params.limit ?? DEFAULT_LIMIT),
-      MAX_LIMIT,
-    );
-    const offset = Math.max(0, params.offset ?? 0);
+    // Compute total tool count per source (for ProviderResult.tool_count)
+    const sourceToolCounts = new Map<string, number>();
+    for (const doc of this.indexedTools.values()) {
+      sourceToolCounts.set(doc.source, (sourceToolCounts.get(doc.source) ?? 0) + 1);
+    }
 
-    // Merge providers and categories into one list of source patterns
-    const sourcePatterns: string[] = [
-      ...(providers ?? []),
-      ...(categories ?? []),
-    ];
+    const seenTools = new Set<string>();
+    const allEnabled: string[] = [];
+    const results: QueryResult[] = [];
 
-    // Collect candidate tool names from queries (OR across queries)
-    let queryCandidates: Set<string> | null = null;
+    for (const query of queries) {
+      const hasToolFilter = query.tool !== undefined && query.tool !== "";
+      const hasProviderFilter = query.provider !== undefined && query.provider !== "";
+      const hasCategoryFilter = query.category !== undefined && query.category !== "";
+      const expandTools = query.expand_tools === true;
 
-    if (hasQueries) {
-      queryCandidates = new Set<string>();
-      for (const query of queries) {
-        const regex = parseRegex(query);
+      // Query with no filters: return empty result for this slot
+      if (!hasToolFilter && !hasProviderFilter && !hasCategoryFilter) {
+        results.push({
+          providers: [],
+          total: 0,
+          count: 0,
+          remaining: 0,
+          offset: query.offset ?? 0,
+          limit: query.limit ?? DEFAULT_LIMIT,
+        });
+        continue;
+      }
+
+      const limit = Math.min(
+        Math.max(1, query.limit ?? DEFAULT_LIMIT),
+        MAX_LIMIT,
+      );
+      const offset = Math.max(0, query.offset ?? 0);
+      const isSummary = !hasToolFilter && !expandTools;
+
+      if (isSummary) {
+        // Summary mode: provider summaries only, no tool details
+        const matchedSources = new Set<string>();
+        for (const doc of this.indexedTools.values()) {
+          if (hasProviderFilter && !matchesPrefixOrRegex(doc.source, query.provider!)) continue;
+          if (hasCategoryFilter && (!doc.category || !matchesPrefixOrRegex(doc.category, query.category!))) continue;
+          matchedSources.add(doc.source);
+        }
+
+        const providers: ProviderResult[] = [];
+        let totalToolCount = 0;
+        for (const source of matchedSources) {
+          const count = sourceToolCounts.get(source) ?? 0;
+          const category = this.registry.getCategoryForSource(source);
+          providers.push({
+            name: source,
+            ...(category ? { category } : {}),
+            tool_count: count,
+            tools: [],
+          });
+          totalToolCount += count;
+        }
+
+        results.push({
+          providers,
+          total: totalToolCount,
+          count: 0,
+          remaining: 0,
+          offset,
+          limit,
+        });
+        // Do NOT add to seenTools or allEnabled in summary mode
+        continue;
+      }
+
+      // Detail mode: collect candidate tools, then group by provider
+      let toolCandidates: Set<string> | null = null;
+      let providerCandidates: Set<string> | null = null;
+      let categoryCandidates: Set<string> | null = null;
+
+      if (hasToolFilter) {
+        toolCandidates = new Set<string>();
+        const regex = parseRegex(query.tool!);
         if (regex) {
           for (const [name, doc] of this.indexedTools) {
             if (
@@ -291,118 +371,157 @@ export class ToolSearchService {
               regex.test(doc.description) ||
               regex.test(doc.source)
             ) {
-              queryCandidates.add(name);
+              toolCandidates.add(name);
             }
           }
         } else {
-          const results = this.index.search(query);
-          if (results.length > 0) {
-            const topScore = results[0].score;
+          const searchResults = this.index.search(query.tool!);
+          if (searchResults.length > 0) {
+            const topScore = searchResults[0].score;
             const threshold = topScore * SCORE_CUTOFF;
-            for (const result of results) {
-              if (result.score >= threshold) {
-                queryCandidates.add(result.id as string);
+            for (const r of searchResults) {
+              if (r.score >= threshold) {
+                toolCandidates.add(r.id as string);
               }
             }
           }
         }
       }
-    }
 
-    // Collect tool names matching source patterns
-    let sourceCandidates: Set<string> | null = null;
-
-    if (sourcePatterns.length > 0) {
-      sourceCandidates = new Set<string>();
-      for (const pattern of sourcePatterns) {
+      if (hasProviderFilter) {
+        providerCandidates = new Set<string>();
         for (const [name, doc] of this.indexedTools) {
-          if (matchesPattern(doc.source, pattern)) {
-            sourceCandidates.add(name);
+          if (matchesPrefixOrRegex(doc.source, query.provider!)) {
+            providerCandidates.add(name);
           }
         }
       }
-    }
 
-    // Combine: if both queries and source patterns given, intersect them;
-    // otherwise use whichever is available
-    let candidates: Set<string>;
-    if (queryCandidates !== null && sourceCandidates !== null) {
-      candidates = new Set<string>();
-      for (const name of queryCandidates) {
-        if (sourceCandidates.has(name)) {
-          candidates.add(name);
+      if (hasCategoryFilter) {
+        categoryCandidates = new Set<string>();
+        for (const [name, doc] of this.indexedTools) {
+          if (doc.category && matchesPrefixOrRegex(doc.category, query.category!)) {
+            categoryCandidates.add(name);
+          }
         }
       }
-    } else {
-      candidates = queryCandidates ?? sourceCandidates ?? new Set();
-    }
 
-    const allMatched = Array.from(candidates);
-    const total = allMatched.length;
+      // Intersect all non-null filter sets (AND logic within a query)
+      const filterSets = [toolCandidates, providerCandidates, categoryCandidates].filter(
+        (s): s is Set<string> => s !== null,
+      );
 
-    // Provider/category-only search: return just provider names and tool counts
-    const providerOnly = !hasQueries && (hasProviders || hasCategories);
-
-    if (providerOnly) {
-      const providerResults = this.buildProviderResults(allMatched, sourcePatterns)
-        .map(({ name, tool_count }) => ({ name, tool_count, tools: [] as string[] }));
-      return {
-        tools: [],
-        providers: providerResults,
-        auto_enabled: [],
-        total,
-        limit,
-        offset,
-        count: 0,
-      };
-    }
-
-    const paged = allMatched.slice(offset, offset + limit);
-
-    // Pre-compute policy for each tool on the page
-    const disabledSet = new Set<string>();
-    if (this.policyEngine) {
-      for (const name of paged) {
-        const parsed = parseNamespacedName(name);
-        if (parsed && this.policyEngine.resolvePolicy(parsed.source, parsed.toolName) === "never") {
-          disabledSet.add(name);
-        }
-      }
-    }
-
-    const tools: SearchToolResult[] = [];
-    for (const name of paged) {
-      const doc = this.indexedTools.get(name);
-      if (!doc) continue;
-      const registered = this.registry.getTool(name);
-      if (!registered) continue;
-
-      if (disabledSet.has(name)) {
-        tools.push({
-          tool_name: name,
-          source: doc.source,
-          description: "",
-          input_schema: {},
-          disabled: true,
-        });
+      let candidates: Set<string>;
+      if (filterSets.length === 0) {
+        candidates = new Set();
+      } else if (filterSets.length === 1) {
+        candidates = filterSets[0];
       } else {
-        tools.push({
-          tool_name: name,
-          source: doc.source,
-          description: doc.description,
-          input_schema: registered.tool.inputSchema,
+        // Intersect: start with smallest set for efficiency
+        const sorted = filterSets.sort((a, b) => a.size - b.size);
+        candidates = new Set<string>();
+        for (const name of sorted[0]) {
+          if (sorted.every((s) => s.has(name))) {
+            candidates.add(name);
+          }
+        }
+      }
+
+      // Deduplicate across queries — remove tools already seen
+      const deduped: string[] = [];
+      for (const name of candidates) {
+        if (!seenTools.has(name)) {
+          deduped.push(name);
+        }
+      }
+
+      const total = deduped.length;
+      const paged = deduped.slice(offset, offset + limit);
+
+      // Pre-compute policy for each tool on the page
+      const disabledSet = new Set<string>();
+      if (this.policyEngine) {
+        for (const name of paged) {
+          const parsed = parseNamespacedName(name);
+          if (parsed && this.policyEngine.resolvePolicy(parsed.source, parsed.toolName) === "never") {
+            disabledSet.add(name);
+          }
+        }
+      }
+
+      // Build tools grouped by provider
+      const providerToolsMap = new Map<string, SearchToolResult[]>();
+      const providerOrder: string[] = [];
+
+      for (const name of paged) {
+        const doc = this.indexedTools.get(name);
+        if (!doc) continue;
+        const registered = this.registry.getTool(name);
+        if (!registered) continue;
+
+        if (!providerToolsMap.has(doc.source)) {
+          providerToolsMap.set(doc.source, []);
+          providerOrder.push(doc.source);
+        }
+
+        if (disabledSet.has(name)) {
+          providerToolsMap.get(doc.source)!.push({
+            tool_name: name,
+            source: doc.source,
+            description: "",
+            input_schema: {},
+            disabled: true,
+          });
+        } else {
+          providerToolsMap.get(doc.source)!.push({
+            tool_name: name,
+            source: doc.source,
+            description: doc.description,
+            input_schema: registered.tool.inputSchema,
+          });
+        }
+      }
+
+      const providers: ProviderResult[] = [];
+      for (const source of providerOrder) {
+        const category = this.registry.getCategoryForSource(source);
+        providers.push({
+          name: source,
+          ...(category ? { category } : {}),
+          tool_count: sourceToolCounts.get(source) ?? 0,
+          tools: providerToolsMap.get(source) ?? [],
         });
+      }
+
+      const toolCount = providers.reduce((sum, p) => sum + p.tools.length, 0);
+      const remaining = Math.max(0, total - offset - toolCount);
+
+      results.push({
+        providers,
+        total,
+        count: toolCount,
+        remaining,
+        offset,
+        limit,
+      });
+
+      // Mark tools as seen for deduplication, collect enabled tools
+      for (const name of deduped) {
+        seenTools.add(name);
+      }
+
+      // Only enable tools in the current page (skip disabled ones)
+      for (const name of paged) {
+        if (!disabledSet.has(name) && this.indexedTools.has(name) && this.registry.getTool(name)) {
+          allEnabled.push(name);
+        }
       }
     }
 
-    // Build provider results from all matched tools (not just the page)
-    const providerResults = this.buildProviderResults(allMatched, sourcePatterns);
+    // Cap total enabled tools at MAX_LIMIT
+    const cappedEnabled = allEnabled.slice(0, MAX_LIMIT);
 
-    // Only enable tools in the current page (skip disabled ones)
-    const pagedNames = paged.filter(
-      (name) => this.indexedTools.has(name) && this.registry.getTool(name) && !disabledSet.has(name),
-    );
-    const newEnabled = new Set(pagedNames);
+    const newEnabled = new Set(cappedEnabled);
     const changed = !setsEqual(this.enabledTools, newEnabled);
     this.enabledTools = newEnabled;
 
@@ -410,65 +529,7 @@ export class ToolSearchService {
       this.notifyVisibleToolsChanged();
     }
 
-    return {
-      tools,
-      providers: providerResults,
-      auto_enabled: pagedNames,
-      total,
-      limit,
-      offset,
-      count: tools.length,
-    };
-  }
-
-  private buildProviderResults(
-    matchedToolNames: string[],
-    sourcePatterns: string[],
-  ): ProviderResult[] {
-    // Collect providers that either have matched tools or match the source patterns
-    const providerToolsMap = new Map<string, string[]>();
-
-    // From matched tools
-    for (const name of matchedToolNames) {
-      const doc = this.indexedTools.get(name);
-      if (!doc) continue;
-      let list = providerToolsMap.get(doc.source);
-      if (!list) {
-        list = [];
-        providerToolsMap.set(doc.source, list);
-      }
-      list.push(name);
-    }
-
-    // Also include providers matched by source patterns even if they have
-    // zero tool matches (e.g. when intersected with queries).
-    // This lets the LLM discover providers even when no tools match the query.
-    const allSources = this.registry.listSources();
-    const sourceMap = new Map(allSources.map((s) => [s.name, s]));
-
-    if (sourcePatterns.length > 0) {
-      for (const { name: sourceName } of allSources) {
-        if (providerToolsMap.has(sourceName)) continue;
-        for (const pattern of sourcePatterns) {
-          if (matchesPattern(sourceName, pattern)) {
-            providerToolsMap.set(sourceName, []);
-            break;
-          }
-        }
-      }
-    }
-
-    const results: ProviderResult[] = [];
-    for (const [name, toolNames] of providerToolsMap) {
-      const sourceInfo = sourceMap.get(name);
-      results.push({
-        name,
-        tool_count: sourceInfo?.toolCount ?? toolNames.length,
-        tools: toolNames,
-      });
-    }
-
-    return results.sort((a, b) => b.tool_count - a.tool_count);
+    return { results };
   }
 
   getVisibleTools(): Tool[] {
