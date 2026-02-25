@@ -708,7 +708,7 @@ describe("UpstreamManager", () => {
     await serverB.server.close();
   });
 
-  it("merges mcpUpstreams and mcpServers into a union", async () => {
+  it("merges upstreamMcpServers and mcpServers into a union", async () => {
     const serverA = createMockServer([makeTool("tool")]);
     const serverB = createMockServer([makeTool("tool")]);
     const servers: Record<string, ReturnType<typeof createMockServer>> = {
@@ -717,7 +717,7 @@ describe("UpstreamManager", () => {
     };
 
     const config = BridgeConfigSchema.parse({
-      mcpUpstreams: {
+      upstreamMcpServers: {
         "from-upstreams": { type: "streamable-http", url: "http://localhost:9999" },
       },
       mcpServers: {

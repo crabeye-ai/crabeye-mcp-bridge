@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { APP_NAME } from "../constants.js";
 
+// --- Tool policy ---
+
+export const ToolPolicySchema = z.enum(["always", "never", "prompt"]);
+
 // --- Per-server auth config ---
 
 export const ServerOAuthConfigSchema = z.object({
@@ -16,6 +20,8 @@ export const ServerOAuthConfigSchema = z.object({
 export const ServerBridgeConfigSchema = z
   .object({
     auth: ServerOAuthConfigSchema.optional(),
+    toolPolicy: ToolPolicySchema.optional(),
+    tools: z.record(z.string(), ToolPolicySchema).optional(),
   })
   .strict();
 
@@ -52,6 +58,7 @@ export const GlobalBridgeConfigSchema = z
     maxUpstreamConnections: z.number().int().positive().default(1000),
     connectionTimeout: z.number().int().positive().default(30),
     idleTimeout: z.number().int().positive().default(600),
+    toolPolicy: ToolPolicySchema.default("always"),
   })
   .strict();
 
@@ -59,19 +66,22 @@ export const GlobalBridgeConfigSchema = z
 
 export const BridgeConfigSchema = z.object({
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
-  mcpUpstreams: z.record(z.string(), ServerConfigSchema).optional(),
+  upstreamMcpServers: z.record(z.string(), ServerConfigSchema).optional(),
   servers: z.record(z.string(), ServerConfigSchema).optional(),
+  context_servers: z.record(z.string(), ServerConfigSchema).optional(),
   _bridge: GlobalBridgeConfigSchema.default({
     port: 19875,
     logLevel: "info" as const,
     maxUpstreamConnections: 1000,
     connectionTimeout: 30,
     idleTimeout: 600,
+    toolPolicy: "always" as const,
   }),
 });
 
 // --- Inferred types ---
 
+export type ToolPolicy = z.infer<typeof ToolPolicySchema>;
 export type ServerOAuthConfig = z.infer<typeof ServerOAuthConfigSchema>;
 export type ServerBridgeConfig = z.infer<typeof ServerBridgeConfigSchema>;
 export type StdioServerConfig = z.infer<typeof StdioServerConfigSchema>;
@@ -86,10 +96,11 @@ export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
  * Resolves which servers to use as upstreams.
  *
  * Returns the union of all present config keys. On duplicate names,
- * earlier sources win: `mcpUpstreams` > `servers` > `mcpServers`.
+ * earlier sources win:
+ * `upstreamMcpServers` > `servers` > `context_servers` > `mcpServers`.
  *
- * Self-exclusion: entries from `mcpServers` whose `command` or `args`
- * contain the app name are filtered out.
+ * Self-exclusion: entries from `mcpServers` and `context_servers` whose
+ * `command` or `args` contain the app name are filtered out.
  */
 export function resolveUpstreams(
   config: BridgeConfig,
@@ -107,14 +118,27 @@ export function resolveUpstreams(
     result[name] = server;
   }
 
-  // servers (middle priority)
+  // context_servers (with self-exclusion, above mcpServers)
+  if (config.context_servers) {
+    for (const [name, server] of Object.entries(config.context_servers)) {
+      if (isStdioServer(server)) {
+        const tokens = [server.command, ...(server.args ?? [])];
+        if (tokens.some((t) => t.includes(APP_NAME))) {
+          continue;
+        }
+      }
+      result[name] = server;
+    }
+  }
+
+  // servers (above context_servers)
   if (config.servers) {
     Object.assign(result, config.servers);
   }
 
-  // mcpUpstreams (highest priority)
-  if (config.mcpUpstreams) {
-    Object.assign(result, config.mcpUpstreams);
+  // upstreamMcpServers (highest priority)
+  if (config.upstreamMcpServers) {
+    Object.assign(result, config.upstreamMcpServers);
   }
 
   return result;
