@@ -17,11 +17,25 @@ export class ConfigError extends Error {
   }
 }
 
+function flattenZodIssue(
+  issue: z.ZodIssue,
+  parentPath: string[] = [],
+): ConfigIssue[] {
+  const fullPath = [...parentPath, ...issue.path.map(String)];
+
+  // Union errors: dig into each branch and surface the specifics
+  if (issue.code === "invalid_union" && "errors" in issue) {
+    const unionErrors = issue.errors as z.ZodIssue[][];
+    return unionErrors.flatMap((branchErrors) =>
+      branchErrors.flatMap((e) => flattenZodIssue(e, fullPath)),
+    );
+  }
+
+  return [{ path: fullPath.join("."), message: issue.message }];
+}
+
 function formatZodIssues(error: z.ZodError): ConfigIssue[] {
-  return error.issues.map((issue) => ({
-    path: issue.path.join("."),
-    message: issue.message,
-  }));
+  return error.issues.flatMap((issue) => flattenZodIssue(issue));
 }
 
 export interface LoadConfigOptions {

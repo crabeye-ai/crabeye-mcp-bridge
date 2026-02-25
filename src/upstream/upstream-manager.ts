@@ -44,27 +44,40 @@ export class UpstreamManager {
     const connectPromises: Promise<void>[] = [];
 
     for (const [name, serverConfig] of entries) {
+      const transport = isStdioServer(serverConfig)
+        ? "stdio"
+        : (serverConfig as HttpServerConfig).type;
+      this._log(`[${name}] connecting (${transport})`);
+
       const client = this._clientFactory(name, serverConfig);
       this._clients.set(name, client);
 
       const unsubTools = client.onToolsChanged((tools) => {
-        this._toolRegistry.setToolsForSource(
-          name,
-          tools.map((t) => namespaceTool(name, t)),
+        const namespaced = tools.map((t) => namespaceTool(name, t));
+        this._toolRegistry.setToolsForSource(name, namespaced);
+        this._log(
+          `[${name}] ${tools.length} tool${tools.length === 1 ? "" : "s"} discovered: ${namespaced.map((t) => t.name).join(", ")}`,
         );
       });
 
       const unsubStatus = client.onStatusChange((event) => {
         if (event.current === "error") {
+          this._log(
+            `[${name}] error: ${event.error?.message ?? "unknown"}`,
+          );
           this._toolRegistry.removeSource(name);
+        } else {
+          this._log(`[${name}] ${event.current}`);
         }
       });
 
       this._unsubscribers.push(unsubTools, unsubStatus);
 
       connectPromises.push(
-        client.connect().catch(() => {
-          // Individual failures must not block other connections
+        client.connect().catch((err) => {
+          this._log(
+            `[${name}] failed to connect: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }),
       );
     }
@@ -96,6 +109,10 @@ export class UpstreamManager {
 
   getClient(name: string): UpstreamClient | undefined {
     return this._clients.get(name);
+  }
+
+  private _log(message: string): void {
+    console.error(message);
   }
 
   getStatuses(): UpstreamStatus[] {
