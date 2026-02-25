@@ -198,6 +198,22 @@ describe("schema validation", () => {
     }
   });
 
+  it("accepts category in server-level _bridge", () => {
+    const input = {
+      mcpServers: {
+        s: {
+          command: "node",
+          _bridge: { category: "project management" },
+        },
+      },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.mcpServers.s._bridge?.category).toBe("project management");
+    }
+  });
+
   it("rejects invalid toolPolicy value in global _bridge", () => {
     const input = {
       mcpServers: { s: { command: "node" } },

@@ -111,7 +111,7 @@ On startup the bridge launches every configured upstream server, connects to it,
 
 Two meta-tools are exposed to the AI assistant:
 
-- **`search_tools`** — Fuzzy-search across all discovered tools by name, description, or provider. Matching tools are automatically enabled for use.
+- **`search_tools`** — Fuzzy-search across all discovered tools by name, description, provider, or category. Matching tools are automatically enabled for use.
 - **`run_tool`** — Execute any discovered tool directly by its namespaced name (e.g. `linear__create_issue`).
 
 The AI assistant calls `search_tools` automatically when it detects a relevant intent, then uses `run_tool` or calls the auto-enabled tools directly.
@@ -120,51 +120,136 @@ When `search_tools` is called, the assistant receives the matching tools and the
 
 ## Examples
 
-### Searching for tools
+### Discovering providers
 
-The assistant calls `search_tools` whenever it needs a capability it doesn't have yet. Queries are fuzzy-matched against tool names, descriptions, and providers:
+The assistant starts by searching for providers to see what's available. Without a `tool` filter, provider summaries are returned — name, category, and tool count, but no tool details:
 
 ```json
 {
   "name": "search_tools",
   "arguments": {
-    "queries": ["create issue"]
+    "queries": [{ "provider": "linear" }]
   }
 }
 ```
 
-The bridge returns matching tools with their full input schemas:
+Response:
 
 ```json
 {
-  "tools": [
+  "results": [
     {
-      "tool_name": "linear__create_issue",
-      "source": "linear",
-      "description": "Create a new Linear issue",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "title": { "type": "string" },
-          "team": { "type": "string" },
-          "description": { "type": "string" }
-        },
-        "required": ["title", "team"]
-      }
-    },
-    {
-      "tool_name": "github__create_issue",
-      "source": "github",
-      "description": "Create a GitHub issue",
-      "input_schema": { "..." }
+      "providers": [
+        {
+          "name": "linear",
+          "category": "project management",
+          "tool_count": 47,
+          "tools": []
+        }
+      ],
+      "total": 47,
+      "count": 0,
+      "offset": 0,
+      "limit": 10
     }
-  ],
-  "auto_enabled": ["linear__create_issue", "github__create_issue"],
-  "total": 2
+  ]
 }
 ```
 
-The tools listed in `auto_enabled` are now directly callable by the assistant — no extra step needed.
+To get full tool definitions, add `expand_tools: true` or use a `tool` filter to drill in:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": [{ "provider": "linear", "expand_tools": true }]
+  }
+}
+```
+
+### Searching for tools
+
+The assistant calls `search_tools` with a `tool` filter to find specific tools by name or description. Results are grouped by provider:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": [{ "tool": "create issue" }]
+  }
+}
+```
+
+The bridge returns matching tools with their full input schemas, grouped by provider:
+
+```json
+{
+  "results": [
+    {
+      "providers": [
+        {
+          "name": "linear",
+          "category": "project management",
+          "tool_count": 47,
+          "tools": [
+            {
+              "tool_name": "linear__create_issue",
+              "source": "linear",
+              "description": "Create a new Linear issue",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "title": { "type": "string" },
+                  "team": { "type": "string" },
+                  "description": { "type": "string" }
+                },
+                "required": ["title", "team"]
+              }
+            }
+          ]
+        },
+        {
+          "name": "github",
+          "tool_count": 32,
+          "tools": [
+            {
+              "tool_name": "github__create_issue",
+              "source": "github",
+              "description": "Create a GitHub issue",
+              "input_schema": { "..." }
+            }
+          ]
+        }
+      ],
+      "total": 2,
+      "count": 2,
+      "offset": 0,
+      "limit": 10
+    }
+  ]
+}
+```
+
+Matching tools are automatically enabled for direct use by the assistant — no extra step needed.
+
+### Multiple queries
+
+Pass multiple query objects to search for different things in a single call. Results are deduplicated across queries — first query wins. Summary and detail queries can be mixed:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": [
+      { "tool": "create issue" },
+      { "provider": "github" },
+      { "category": "design", "expand_tools": true }
+    ]
+  }
+}
+```
+
+The first query returns tool details (has `tool` filter), the second returns a provider summary, and the third returns expanded tool details for design tools. Each query produces its own result set with independent pagination.
 
 ### Running a tool directly
 
@@ -188,29 +273,28 @@ The response is passed through exactly as the upstream server returns it.
 
 ### Filtering by provider
 
-Search for all tools from a specific server:
+Combine a tool search with a provider filter to narrow results:
 
 ```json
 {
   "name": "search_tools",
   "arguments": {
-    "queries": ["list"],
-    "providers": ["github"]
+    "queries": [{ "tool": "list", "provider": "github" }]
   }
 }
 ```
 
-Only tools from the `github` server matching "list" are returned.
+Only tools from the `github` server matching "list" are returned, grouped under the `github` provider. Provider matching uses prefix match by default (`"git"` matches `"github"`, but `"hub"` does not).
 
 ### Regex search
 
-For precise matching, prefix the query with `regex:`:
+For precise matching, prefix the tool query with `regex:`:
 
 ```json
 {
   "name": "search_tools",
   "arguments": {
-    "queries": ["regex:^list_"]
+    "queries": [{ "tool": "regex:^list_" }]
   }
 }
 ```
@@ -252,6 +336,33 @@ Remote servers accessible via HTTP:
 ```
 
 `type` defaults to `"streamable-http"`. Use `"sse"` for servers that use Server-Sent Events transport.
+
+### Categories
+
+Assign a category to a server so tools can be discovered by domain rather than server name:
+
+```json
+{
+  "upstreamMcpServers": {
+    "linear": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/linear-mcp-server"],
+      "_bridge": {
+        "category": "project management"
+      }
+    },
+    "figma": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/figma-mcp-server"],
+      "_bridge": {
+        "category": "design"
+      }
+    }
+  }
+}
+```
+
+The assistant can then search by category: `{ "queries": [{ "category": "design" }] }`. Category matching uses prefix match by default, so `"project"` matches `"project management"`. Use `regex:` prefix for pattern matching.
 
 ### Authentication
 

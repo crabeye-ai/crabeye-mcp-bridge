@@ -10,6 +10,7 @@ export type ToolListChangedCallback = () => void;
 export class ToolRegistry {
   private tools = new Map<string, RegisteredTool>();
   private sourceIndex = new Map<string, Set<string>>();
+  private sourceCategories = new Map<string, string>();
   private listeners = new Set<ToolListChangedCallback>();
 
   listTools(): Tool[] {
@@ -30,6 +31,14 @@ export class ToolRegistry {
 
   getTool(name: string): RegisteredTool | undefined {
     return this.tools.get(name);
+  }
+
+  setCategoryForSource(source: string, category: string): void {
+    this.sourceCategories.set(source, category);
+  }
+
+  getCategoryForSource(source: string): string | undefined {
+    return this.sourceCategories.get(source);
   }
 
   setToolsForSource(source: string, tools: Tool[]): void {
@@ -66,6 +75,7 @@ export class ToolRegistry {
       }
     }
     this.sourceIndex.delete(source);
+    this.sourceCategories.delete(source);
 
     if (removed) {
       this.notify();

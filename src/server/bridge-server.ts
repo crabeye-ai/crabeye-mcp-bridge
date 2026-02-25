@@ -55,7 +55,11 @@ export class BridgeServer {
       "- You are about to claim a tool is unavailable or that you cannot perform an action — search first, then answer",
       "- You are about to fall back to a web search for something that might be available as a tool",
       "",
-      "Call search_tools with multiple descriptive queries in a single call to cover different phrasings and aspects of the user's intent (e.g. queries: [\"create task\", \"new ticket\", \"add item\"]).",
+      "Discovery workflow:",
+      '1. Start broad: search by provider or category to get summaries: { "queries": [{ "provider": "linear" }] }',
+      '2. Drill in: use a tool filter or expand_tools to get full definitions: { "queries": [{ "provider": "linear", "expand_tools": true }] } or { "queries": [{ "tool": "create", "provider": "linear" }] }',
+      "",
+      "Results are always grouped by provider: results[].providers[].tools[]",
       "After discovering tools, use run_tool to execute them. You can also call auto-enabled tools directly by their namespaced name.",
       "When in doubt, search — it is always better to search and find nothing than to miss an available tool.",
     ].join("\n");
@@ -81,21 +85,32 @@ export class BridgeServer {
       // Handle search_tools call
       if (this.toolSearchService && name === SEARCH_TOOL_NAME) {
         const params = (args ?? {}) as SearchToolsParams;
-        const hasInput =
-          (params.queries && params.queries.length > 0) ||
-          (params.providers && params.providers.length > 0) ||
-          (params.categories && params.categories.length > 0);
 
-        if (!hasInput) {
+        if (!Array.isArray(params.queries) || params.queries.length === 0) {
           return {
             content: [
               {
                 type: "text" as const,
-                text: "Error: At least one of 'queries', 'providers', or 'categories' must be specified.",
+                text: "Error: 'queries' must be a non-empty array of query objects.",
               },
             ],
             isError: true,
           };
+        }
+
+        for (let i = 0; i < params.queries.length; i++) {
+          const q = params.queries[i];
+          if (!q.tool && !q.provider && !q.category) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Error: queries[${i}] must have at least one of 'tool', 'provider', or 'category'.`,
+                },
+              ],
+              isError: true,
+            };
+          }
         }
 
         const result = this.toolSearchService.search(params);

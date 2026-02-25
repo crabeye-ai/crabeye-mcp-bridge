@@ -6,8 +6,10 @@ export {
   runToolDefinition,
 } from "./tool-search-service.js";
 export type {
+  SearchQuery,
   SearchToolsParams,
   SearchToolsResponse,
   SearchToolResult,
   ProviderResult,
+  QueryResult,
 } from "./tool-search-service.js";
