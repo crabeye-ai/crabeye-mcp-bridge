@@ -168,7 +168,7 @@ export class HttpUpstreamClient implements UpstreamClient {
 
     const url = new URL(this._config.url);
     const requestInit: RequestInit | undefined = this._config.headers
-      ? { headers: this._config.headers }
+      ? { headers: this._config.headers as Record<string, string> }
       : undefined;
 
     if (this._config.type === "streamable-http") {

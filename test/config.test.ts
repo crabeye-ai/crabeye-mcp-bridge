@@ -464,7 +464,8 @@ describe("loadConfig", () => {
 describe("generateJsonSchema", () => {
   it("produces a schema with expected structure", () => {
     const schema = generateJsonSchema();
-    expect(schema).toHaveProperty("definitions");
-    expect(schema).toHaveProperty("$ref");
+    expect(schema).toHaveProperty("$schema");
+    expect(schema).toHaveProperty("type", "object");
+    expect(schema).toHaveProperty("properties");
   });
 });

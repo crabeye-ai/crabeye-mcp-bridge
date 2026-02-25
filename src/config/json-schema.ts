@@ -1,9 +1,6 @@
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { z } from "zod";
 import { BridgeConfigSchema } from "./schema.js";
 
 export function generateJsonSchema(): Record<string, unknown> {
-  return zodToJsonSchema(BridgeConfigSchema, "BridgeConfig") as Record<
-    string,
-    unknown
-  >;
+  return z.toJSONSchema(BridgeConfigSchema) as Record<string, unknown>;
 }
