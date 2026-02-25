@@ -82,6 +82,7 @@ function matchesPattern(value: string, pattern: string): boolean {
 }
 
 export const SEARCH_TOOL_NAME = "search_tools";
+export const RUN_TOOL_NAME = "run_tool";
 
 export const searchToolDefinition: Tool = {
   name: SEARCH_TOOL_NAME,
@@ -127,6 +128,29 @@ export const searchToolDefinition: Tool = {
         description: "Number of tool results to skip for pagination (default 0)",
       },
     },
+  },
+};
+
+export const runToolDefinition: Tool = {
+  name: RUN_TOOL_NAME,
+  description:
+    "Run any tool from any connected upstream MCP server by its full namespaced name " +
+    "(e.g. 'linear__create_issue'). The tool does not need to be enabled via search first. " +
+    "Use search_tools to discover available tool names, then run_tool to call them directly.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      name: {
+        type: "string",
+        description:
+          "The full namespaced tool name to call (e.g. 'linear__create_issue')",
+      },
+      arguments: {
+        type: "object",
+        description: "Arguments to pass to the tool",
+      },
+    },
+    required: ["name"],
   },
 };
 
@@ -306,8 +330,11 @@ export class ToolSearchService {
     // Build provider results from all matched tools (not just the page)
     const providerResults = this.buildProviderResults(allMatched, sourcePatterns);
 
-    // Replace enabled tools with this result set (full match set, not just the page)
-    const newEnabled = new Set(allMatched);
+    // Only enable tools in the current page
+    const pagedNames = paged.filter(
+      (name) => this.indexedTools.has(name) && this.registry.getTool(name),
+    );
+    const newEnabled = new Set(pagedNames);
     const changed = !setsEqual(this.enabledTools, newEnabled);
     this.enabledTools = newEnabled;
 
@@ -318,7 +345,7 @@ export class ToolSearchService {
     return {
       tools,
       providers: providerResults,
-      auto_enabled: allMatched,
+      auto_enabled: pagedNames,
       total,
       limit,
       offset,
@@ -377,7 +404,7 @@ export class ToolSearchService {
   }
 
   getVisibleTools(): Tool[] {
-    const tools: Tool[] = [searchToolDefinition];
+    const tools: Tool[] = [searchToolDefinition, runToolDefinition];
     for (const name of this.enabledTools) {
       const registered = this.registry.getTool(name);
       if (registered) {

@@ -6,6 +6,7 @@ import {
   ErrorCode,
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Readable, Writable } from "node:stream";
 import { ToolRegistry } from "./tool-registry.js";
@@ -14,6 +15,7 @@ import type { UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
   SEARCH_TOOL_NAME,
+  RUN_TOOL_NAME,
 } from "../search/index.js";
 import type { SearchToolsParams } from "../search/index.js";
 
@@ -78,8 +80,28 @@ export class BridgeServer {
         };
       }
 
-      const registered = this.toolRegistry.getTool(name);
+      // Handle run_tool call
+      if (this.toolSearchService && name === RUN_TOOL_NAME) {
+        const toolName = (args as { name?: string })?.name;
+        const toolArgs = (args as { arguments?: Record<string, unknown> })?.arguments;
 
+        if (!toolName) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "Error: 'name' is required — provide the full namespaced tool name (e.g. 'linear__create_issue').",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return this.routeToUpstream(toolName, toolArgs);
+      }
+
+      // Direct tool call (tool must be in registry)
+      const registered = this.toolRegistry.getTool(name);
       if (!registered) {
         throw new McpError(
           ErrorCode.InvalidParams,
@@ -87,49 +109,7 @@ export class BridgeServer {
         );
       }
 
-      const parsed = parseNamespacedName(name);
-      if (!parsed) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          `Invalid tool name (missing namespace): ${name}`,
-        );
-      }
-
-      const getClient = this.options.getUpstreamClient;
-      if (!getClient) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `No upstream client resolver configured`,
-        );
-      }
-
-      const client = getClient(parsed.source);
-      if (!client) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Upstream server not found: ${parsed.source}`,
-        );
-      }
-
-      if (client.status !== "connected") {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Upstream server "${parsed.source}" is not connected (status: ${client.status})`,
-        );
-      }
-
-      try {
-        return await client.callTool({
-          name: parsed.toolName,
-          arguments: args,
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Upstream server "${parsed.source}" error: ${message}`,
-        );
-      }
+      return this.routeToUpstream(name, args);
     });
 
     if (this.toolSearchService) {
@@ -144,6 +124,55 @@ export class BridgeServer {
           // Ignore errors when no client is connected
         });
       });
+    }
+  }
+
+  private async routeToUpstream(
+    name: string,
+    args?: Record<string, unknown>,
+  ): Promise<CallToolResult> {
+    const parsed = parseNamespacedName(name);
+    if (!parsed) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Invalid tool name (missing namespace): ${name}`,
+      );
+    }
+
+    const getClient = this.options.getUpstreamClient;
+    if (!getClient) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `No upstream client resolver configured`,
+      );
+    }
+
+    const client = getClient(parsed.source);
+    if (!client) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Upstream server not found: ${parsed.source}`,
+      );
+    }
+
+    if (client.status !== "connected") {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Upstream server "${parsed.source}" is not connected (status: ${client.status})`,
+      );
+    }
+
+    try {
+      return await client.callTool({
+        name: parsed.toolName,
+        arguments: args,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Upstream server "${parsed.source}" error: ${message}`,
+      );
     }
   }
 

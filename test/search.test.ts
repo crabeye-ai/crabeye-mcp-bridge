@@ -5,7 +5,7 @@ import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/typ
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
-import { ToolSearchService, SEARCH_TOOL_NAME } from "../src/search/index.js";
+import { ToolSearchService, SEARCH_TOOL_NAME, RUN_TOOL_NAME } from "../src/search/index.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
 
 function makeTool(name: string, description?: string): Tool {
@@ -47,10 +47,10 @@ describe("ToolSearchService", () => {
   });
 
   describe("getVisibleTools", () => {
-    it("returns only search_tools initially", () => {
+    it("returns only meta-tools initially", () => {
       const tools = service.getVisibleTools();
-      expect(tools).toHaveLength(1);
-      expect(tools[0].name).toBe(SEARCH_TOOL_NAME);
+      expect(tools).toHaveLength(2);
+      expect(tools.map((t) => t.name)).toEqual([SEARCH_TOOL_NAME, RUN_TOOL_NAME]);
     });
   });
 
@@ -351,6 +351,35 @@ describe("ToolSearchService", () => {
       expect(result.limit).toBe(20);
       expect(result.count).toBe(20);
     });
+
+    it("only paged tools are enabled in getVisibleTools", () => {
+      service.search({ providers: ["src"], limit: 5, offset: 0 });
+      const visible = service.getVisibleTools();
+      // search_tools + run_tool + 5 paged tools
+      expect(visible).toHaveLength(7);
+    });
+
+    it("auto_enabled only contains paged tools", () => {
+      const result = service.search({ providers: ["src"], limit: 5, offset: 0 });
+      expect(result.auto_enabled).toHaveLength(5);
+      expect(result.total).toBe(30);
+    });
+
+    it("paging to next page replaces enabled tools", () => {
+      const page1 = service.search({ providers: ["src"], limit: 5, offset: 0 });
+
+      const page2 = service.search({ providers: ["src"], limit: 5, offset: 5 });
+      const page2Visible = service.getVisibleTools().map((t) => t.name);
+
+      // Page 1 tools should no longer be visible
+      for (const name of page1.auto_enabled) {
+        expect(page2Visible).not.toContain(name);
+      }
+      // Page 2 tools should be visible
+      for (const name of page2.auto_enabled) {
+        expect(page2Visible).toContain(name);
+      }
+    });
   });
 
   describe("enable/replace", () => {
@@ -518,14 +547,16 @@ describe("BridgeServer with ToolSearchService", () => {
     };
   }
 
-  it("tools/list returns only search_tools when no search done", async () => {
+  it("tools/list returns only meta-tools when no search done", async () => {
     const { client, cleanup } = await createSearchTestPair([
       { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
     ]);
 
     const result = await client.listTools();
-    expect(result.tools).toHaveLength(1);
-    expect(result.tools[0].name).toBe(SEARCH_TOOL_NAME);
+    expect(result.tools).toHaveLength(2);
+    const names = result.tools.map((t) => t.name);
+    expect(names).toContain(SEARCH_TOOL_NAME);
+    expect(names).toContain(RUN_TOOL_NAME);
 
     await cleanup();
   });
@@ -605,7 +636,7 @@ describe("BridgeServer with ToolSearchService", () => {
     ]);
 
     let list = await client.listTools();
-    expect(list.tools).toHaveLength(1);
+    expect(list.tools).toHaveLength(2);
 
     await client.callTool({
       name: SEARCH_TOOL_NAME,
@@ -686,6 +717,104 @@ describe("BridgeServer with ToolSearchService", () => {
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     expect(text).toContain("Error");
     expect(result.isError).toBe(true);
+
+    await cleanup();
+  });
+
+  // --- run_tool ---
+
+  it("run_tool calls upstream tool without search", async () => {
+    const { client, linearClient, cleanup } = await createSearchTestPair([
+      { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
+    ]);
+
+    const result = await client.callTool({
+      name: RUN_TOOL_NAME,
+      arguments: { name: "linear__create_issue", arguments: { title: "Bug" } },
+    });
+
+    expect(result.content).toEqual([{ type: "text", text: "upstream result" }]);
+    expect(linearClient.callTool).toHaveBeenCalledWith({
+      name: "create_issue",
+      arguments: { title: "Bug" },
+    });
+
+    await cleanup();
+  });
+
+  it("run_tool works without arguments field", async () => {
+    const { client, linearClient, cleanup } = await createSearchTestPair([
+      { source: "linear", tools: [makeTool("linear__list_issues", "List issues")] },
+    ]);
+
+    const result = await client.callTool({
+      name: RUN_TOOL_NAME,
+      arguments: { name: "linear__list_issues" },
+    });
+
+    expect(result.content).toEqual([{ type: "text", text: "upstream result" }]);
+    expect(linearClient.callTool).toHaveBeenCalledWith({
+      name: "list_issues",
+      arguments: undefined,
+    });
+
+    await cleanup();
+  });
+
+  it("run_tool with missing name returns error", async () => {
+    const { client, cleanup } = await createSearchTestPair([
+      { source: "linear", tools: [makeTool("linear__tool")] },
+    ]);
+
+    const result = await client.callTool({
+      name: RUN_TOOL_NAME,
+      arguments: {},
+    });
+
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    expect(text).toContain("Error");
+    expect(result.isError).toBe(true);
+
+    await cleanup();
+  });
+
+  it("run_tool with invalid namespace throws error", async () => {
+    const { client, cleanup } = await createSearchTestPair([
+      { source: "linear", tools: [makeTool("linear__tool")] },
+    ]);
+
+    await expect(
+      client.callTool({
+        name: RUN_TOOL_NAME,
+        arguments: { name: "no-namespace" },
+      }),
+    ).rejects.toThrow(/missing namespace/);
+
+    await cleanup();
+  });
+
+  it("run_tool with unknown upstream throws error", async () => {
+    const { client, cleanup } = await createSearchTestPair([
+      { source: "linear", tools: [makeTool("linear__tool")] },
+    ]);
+
+    await expect(
+      client.callTool({
+        name: RUN_TOOL_NAME,
+        arguments: { name: "unknown__tool" },
+      }),
+    ).rejects.toThrow(/Upstream server not found/);
+
+    await cleanup();
+  });
+
+  it("run_tool is always visible in tools/list", async () => {
+    const { client, cleanup } = await createSearchTestPair([
+      { source: "linear", tools: [makeTool("linear__tool")] },
+    ]);
+
+    const list = await client.listTools();
+    expect(list.tools.map((t) => t.name)).toContain(RUN_TOOL_NAME);
 
     await cleanup();
   });
