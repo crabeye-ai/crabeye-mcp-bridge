@@ -15,8 +15,6 @@ program
   )
   .version(APP_VERSION)
   .option("-c, --config <path>", "path to config file")
-  .option("-p, --port <number>", "HTTP server port", parseInt)
-  .option("-t, --token <string>", "authentication token")
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
@@ -24,10 +22,6 @@ program
 
     try {
       const config = await loadConfig({ configPath: options.config });
-
-      if (options.port !== undefined) {
-        config._bridge.port = options.port;
-      }
 
       const toolRegistry = new ToolRegistry();
       upstreamManager = new UpstreamManager({ config, toolRegistry });
