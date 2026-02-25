@@ -138,6 +138,7 @@ describe("schema validation", () => {
         maxUpstreamConnections: 1000,
         connectionTimeout: 30,
         idleTimeout: 600,
+        toolPolicy: "always",
       });
     }
   });
@@ -153,6 +154,83 @@ describe("schema validation", () => {
       expect(result.data._bridge.port).toBe(3000);
       expect(result.data._bridge.logLevel).toBe("info");
     }
+  });
+
+  it("accepts toolPolicy in global _bridge", () => {
+    const input = {
+      mcpServers: { s: { command: "node" } },
+      _bridge: { toolPolicy: "never" },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data._bridge.toolPolicy).toBe("never");
+    }
+  });
+
+  it("defaults global toolPolicy to always", () => {
+    const input = { mcpServers: { s: { command: "node" } } };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data._bridge.toolPolicy).toBe("always");
+    }
+  });
+
+  it("accepts toolPolicy and tools in server-level _bridge", () => {
+    const input = {
+      mcpServers: {
+        s: {
+          command: "node",
+          _bridge: {
+            toolPolicy: "prompt",
+            tools: { create_issue: "never", list_issues: "always" },
+          },
+        },
+      },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const bridge = result.data.mcpServers.s._bridge;
+      expect(bridge?.toolPolicy).toBe("prompt");
+      expect(bridge?.tools).toEqual({ create_issue: "never", list_issues: "always" });
+    }
+  });
+
+  it("rejects invalid toolPolicy value in global _bridge", () => {
+    const input = {
+      mcpServers: { s: { command: "node" } },
+      _bridge: { toolPolicy: "invalid" },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects invalid toolPolicy value in server-level _bridge", () => {
+    const input = {
+      mcpServers: {
+        s: {
+          command: "node",
+          _bridge: { toolPolicy: "invalid" },
+        },
+      },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects invalid tool policy value in server-level tools map", () => {
+    const input = {
+      mcpServers: {
+        s: {
+          command: "node",
+          _bridge: { tools: { create_issue: "invalid" } },
+        },
+      },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(false);
   });
 });
 
@@ -246,9 +324,9 @@ describe("type guards", () => {
 // --- Flexible upstream config keys ---
 
 describe("flexible upstream config keys", () => {
-  it("accepts config with only mcpUpstreams", () => {
+  it("accepts config with only upstreamMcpServers", () => {
     const input = {
-      mcpUpstreams: { s: { command: "node" } },
+      upstreamMcpServers: { s: { command: "node" } },
     };
     const result = BridgeConfigSchema.safeParse(input);
     expect(result.success).toBe(true);
@@ -262,9 +340,17 @@ describe("flexible upstream config keys", () => {
     expect(result.success).toBe(true);
   });
 
-  it("accepts config with both mcpUpstreams and mcpServers", () => {
+  it("accepts config with only context_servers", () => {
     const input = {
-      mcpUpstreams: { a: { command: "node" } },
+      context_servers: { s: { command: "node" } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts config with both upstreamMcpServers and mcpServers", () => {
+    const input = {
+      upstreamMcpServers: { a: { command: "node" } },
       mcpServers: { b: { command: "python" } },
     };
     const result = BridgeConfigSchema.safeParse(input);
@@ -289,19 +375,20 @@ describe("resolveUpstreams", () => {
     return result;
   }
 
-  it("merges all three sources into a union", () => {
+  it("merges all four sources into a union", () => {
     const config = parsed({
-      mcpUpstreams: { a: { command: "node" } },
+      upstreamMcpServers: { a: { command: "node" } },
       servers: { b: { command: "python" } },
-      mcpServers: { c: { command: "ruby" } },
+      context_servers: { c: { command: "ruby" } },
+      mcpServers: { d: { command: "go" } },
     });
     const upstreams = resolveUpstreams(config);
-    expect(Object.keys(upstreams).sort()).toEqual(["a", "b", "c"]);
+    expect(Object.keys(upstreams).sort()).toEqual(["a", "b", "c", "d"]);
   });
 
-  it("mcpUpstreams wins over servers and mcpServers on duplicate names", () => {
+  it("upstreamMcpServers wins over servers and mcpServers on duplicate names", () => {
     const config = parsed({
-      mcpUpstreams: { s: { command: "from-upstreams" } },
+      upstreamMcpServers: { s: { command: "from-upstreams" } },
       servers: { s: { command: "from-servers" } },
       mcpServers: { s: { command: "from-mcp" } },
     });
@@ -309,13 +396,23 @@ describe("resolveUpstreams", () => {
     expect((upstreams.s as { command: string }).command).toBe("from-upstreams");
   });
 
-  it("servers wins over mcpServers on duplicate names", () => {
+  it("servers wins over context_servers and mcpServers on duplicate names", () => {
     const config = parsed({
       servers: { s: { command: "from-servers" } },
+      context_servers: { s: { command: "from-context" } },
       mcpServers: { s: { command: "from-mcp" } },
     });
     const upstreams = resolveUpstreams(config);
     expect((upstreams.s as { command: string }).command).toBe("from-servers");
+  });
+
+  it("context_servers wins over mcpServers on duplicate names", () => {
+    const config = parsed({
+      context_servers: { s: { command: "from-context" } },
+      mcpServers: { s: { command: "from-mcp" } },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect((upstreams.s as { command: string }).command).toBe("from-context");
   });
 
   it("reads from mcpServers when it is the only source", () => {
@@ -349,9 +446,20 @@ describe("resolveUpstreams", () => {
     expect(Object.keys(upstreams)).toEqual(["real"]);
   });
 
-  it("does not apply self-exclusion to mcpUpstreams or servers", () => {
+  it("applies self-exclusion to context_servers", () => {
     const config = parsed({
-      mcpUpstreams: { bridge1: { command: "npx crabeye-mcp-bridge" } },
+      context_servers: {
+        bridge: { command: "npx", args: ["-y", "crabeye-mcp-bridge"] },
+        real: { command: "node", args: ["server.js"] },
+      },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams)).toEqual(["real"]);
+  });
+
+  it("does not apply self-exclusion to upstreamMcpServers or servers", () => {
+    const config = parsed({
+      upstreamMcpServers: { bridge1: { command: "npx crabeye-mcp-bridge" } },
       servers: { bridge2: { command: "npx", args: ["crabeye-mcp-bridge"] } },
     });
     const upstreams = resolveUpstreams(config);
