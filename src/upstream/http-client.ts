@@ -171,7 +171,7 @@ export class HttpUpstreamClient implements UpstreamClient {
       ? { headers: this._config.headers as Record<string, string> }
       : undefined;
 
-    if (this._config.type === "streamable-http") {
+    if (this._config.type !== "sse") {
       return new StreamableHTTPClientTransport(url, { requestInit });
     }
     return new SSEClientTransport(url, { requestInit });
