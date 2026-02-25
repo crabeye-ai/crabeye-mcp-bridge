@@ -1,8 +1,29 @@
-# crabeye-mcp-bridge
+# Crabeye MCP Bridge
 
-Aggregates multiple MCP servers behind a single STDIO interface. Point your AI assistant at one bridge instead of configuring each MCP server individually.
+One MCP connection for all your tools — with discovery, namespacing, and execution policies.
 
-Requires Node.js >= 22.
+Every MCP server you add to your AI assistant means another connection, another set of tool definitions injected into the context window, and no way to search or control them centrally. Wire up ten servers with a hundred tools each and your assistant is burning tokens on a thousand tool schemas before the conversation even starts — most of which it will never call.
+
+crabeye-mcp-bridge consolidates all your upstream MCP servers behind a single STDIO interface and exposes exactly **two tools** to the assistant: `search_tools` and `run_tool`. Tools from every server are discovered, namespaced, and indexed at startup, but none of them touch the context window until the assistant actually searches for them. You can have a thousand tools ready to go without bloating the context, with fuzzy search to find them and per-tool execution policies to control what runs freely, what needs approval, and what is blocked.
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 25, 'rankSpacing': 70}}}%%
+flowchart LR
+    classDef client fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+    classDef bridge fill:#ede9fe,stroke:#7c3aed,stroke-width:3px
+    classDef server fill:#d1fae5,stroke:#059669,stroke-width:2px
+    classDef more fill:#f1f5f9,stroke:#64748b,stroke-width:2px,stroke-dasharray:5 5
+
+    A["AI Assistant<br/>(Claude, Cursor, Windsurf, ...)"]:::client
+    A -- "1 STDIO connection<br/>2 tools exposed" --> B
+    B["crabeye-mcp-bridge<br/>search_tools + run_tool"]:::bridge
+
+    B -- STDIO --> C["Linear<br/>47 tools"]:::server
+    B -- STDIO --> D["GitHub<br/>32 tools"]:::server
+    B -- HTTP --> E["Slack<br/>28 tools"]:::server
+    B -- SSE --> F["Sentry<br/>19 tools"]:::server
+    B -.-> G["N more<br/>servers"]:::more
+```
 
 ## Quick start
 
@@ -86,14 +107,115 @@ You can, of course, also use a completely different config file for the bridge. 
 
 ## How it works
 
-The bridge starts each configured upstream server, discovers their tools, and exposes them through two meta-tools:
+On startup the bridge launches every configured upstream server, connects to it, and discovers its tools. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
 
-- **`search_tools`** — Search for tools by name, description, or provider. Results are auto-enabled for use.
-- **`run_tool`** — Execute any discovered tool by its namespaced name (e.g. `linear__create_issue`).
+Two meta-tools are exposed to the AI assistant:
+
+- **`search_tools`** — Fuzzy-search across all discovered tools by name, description, or provider. Matching tools are automatically enabled for use.
+- **`run_tool`** — Execute any discovered tool directly by its namespaced name (e.g. `linear__create_issue`).
 
 The AI assistant calls `search_tools` automatically when it detects a relevant intent, then uses `run_tool` or calls the auto-enabled tools directly.
 
-When `search_tools` gets called, the AI assistant receives the available tools and the schema for how to call them. When the search is completed the bridge will also directly expose the searched tools to the AI assistant. Some assistants don't refresh the tools available for the session, so they might still not see the newly exposed tools, but they can still make calls through the `run_tool` tool and they will get executed exactly as if done directly on the original tool.
+When `search_tools` is called, the assistant receives the matching tools and their input schemas. The bridge also directly exposes the searched tools to the assistant so they can be called natively. Some assistants don't refresh their tool list mid-session, so they may not see the newly exposed tools — but they can still call them through `run_tool` and the call is executed exactly as if made directly on the original tool.
+
+## Examples
+
+### Searching for tools
+
+The assistant calls `search_tools` whenever it needs a capability it doesn't have yet. Queries are fuzzy-matched against tool names, descriptions, and providers:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": ["create issue"]
+  }
+}
+```
+
+The bridge returns matching tools with their full input schemas:
+
+```json
+{
+  "tools": [
+    {
+      "tool_name": "linear__create_issue",
+      "source": "linear",
+      "description": "Create a new Linear issue",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "team": { "type": "string" },
+          "description": { "type": "string" }
+        },
+        "required": ["title", "team"]
+      }
+    },
+    {
+      "tool_name": "github__create_issue",
+      "source": "github",
+      "description": "Create a GitHub issue",
+      "input_schema": { "..." }
+    }
+  ],
+  "auto_enabled": ["linear__create_issue", "github__create_issue"],
+  "total": 2
+}
+```
+
+The tools listed in `auto_enabled` are now directly callable by the assistant — no extra step needed.
+
+### Running a tool directly
+
+If the assistant already knows the namespaced name, it can skip the search and call `run_tool` directly:
+
+```json
+{
+  "name": "run_tool",
+  "arguments": {
+    "name": "linear__create_issue",
+    "arguments": {
+      "title": "Fix login crash",
+      "team": "Engineering",
+      "description": "The app crashes on login when the session token is expired"
+    }
+  }
+}
+```
+
+The response is passed through exactly as the upstream server returns it.
+
+### Filtering by provider
+
+Search for all tools from a specific server:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": ["list"],
+    "providers": ["github"]
+  }
+}
+```
+
+Only tools from the `github` server matching "list" are returned.
+
+### Regex search
+
+For precise matching, prefix the query with `regex:`:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": ["regex:^list_"]
+  }
+}
+```
+
+This finds all tools whose name starts with `list_` — across every server.
 
 ## Configuration
 
