@@ -18,6 +18,7 @@ import {
   RUN_TOOL_NAME,
 } from "../search/index.js";
 import type { SearchToolsParams } from "../search/index.js";
+import type { PolicyEngine } from "../policy/index.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 
 export interface BridgeServerOptions {
@@ -25,6 +26,7 @@ export interface BridgeServerOptions {
   stdout?: Writable;
   toolRegistry?: ToolRegistry;
   toolSearchService?: ToolSearchService;
+  policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
 }
 
@@ -32,6 +34,7 @@ export class BridgeServer {
   private server: Server;
   private toolRegistry: ToolRegistry;
   private toolSearchService: ToolSearchService | undefined;
+  private policyEngine: PolicyEngine | undefined;
   private unsubscribe: (() => void) | undefined;
   private options: BridgeServerOptions;
 
@@ -39,6 +42,7 @@ export class BridgeServer {
     this.options = options ?? {};
     this.toolRegistry = options?.toolRegistry ?? new ToolRegistry();
     this.toolSearchService = options?.toolSearchService;
+    this.policyEngine = options?.policyEngine;
 
     const instructions = [
       "This MCP bridge connects you to many external tools and services.",
@@ -157,6 +161,11 @@ export class BridgeServer {
         ErrorCode.InvalidParams,
         `Invalid tool name (missing namespace): ${name}`,
       );
+    }
+
+    if (this.policyEngine) {
+      const elicitFn = this.server.elicitInput.bind(this.server);
+      await this.policyEngine.enforce(parsed.source, parsed.toolName, args, elicitFn);
     }
 
     const getClient = this.options.getUpstreamClient;

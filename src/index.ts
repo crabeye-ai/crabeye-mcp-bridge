@@ -1,8 +1,11 @@
 import { Command } from "commander";
 import { loadConfig, ConfigError } from "./config/index.js";
+import { resolveUpstreams } from "./config/schema.js";
+import type { ServerBridgeConfig } from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { ToolSearchService } from "./search/index.js";
+import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 
@@ -28,11 +31,26 @@ program
 
       await upstreamManager.connectAll();
 
-      toolSearchService = new ToolSearchService(toolRegistry);
+      // Build per-server bridge configs for the policy engine
+      const upstreams = resolveUpstreams(config);
+      const serverBridgeConfigs: Record<string, ServerBridgeConfig> = {};
+      for (const [name, serverConfig] of Object.entries(upstreams)) {
+        if ("_bridge" in serverConfig && serverConfig._bridge) {
+          serverBridgeConfigs[name] = serverConfig._bridge;
+        }
+      }
+
+      const policyEngine = new PolicyEngine(
+        config._bridge.toolPolicy,
+        serverBridgeConfigs,
+      );
+
+      toolSearchService = new ToolSearchService(toolRegistry, policyEngine);
 
       server = new BridgeServer({
         toolRegistry,
         toolSearchService,
+        policyEngine,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
       });
       await server.start();
