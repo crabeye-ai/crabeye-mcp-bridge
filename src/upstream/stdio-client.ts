@@ -83,7 +83,7 @@ export class StdioUpstreamClient implements UpstreamClient {
     try {
       const transport = this._createTransport();
       const client = new Client(
-        { name: `kokuai-bridge/${this.name}`, version: "0.1.0" },
+        { name: `crabeye-mcp-bridge/${this.name}`, version: "0.1.0" },
         {
           listChanged: {
             tools: {

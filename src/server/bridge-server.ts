@@ -40,7 +40,7 @@ export class BridgeServer {
     this.toolSearchService = options?.toolSearchService;
 
     this.server = new Server(
-      { name: "kokuai-bridge", version: "0.1.0" },
+      { name: "crabeye-mcp-bridge", version: "0.1.0" },
       { capabilities: { tools: { listChanged: true } } },
     );
 

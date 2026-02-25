@@ -326,10 +326,10 @@ describe("resolveUpstreams", () => {
     expect(Object.keys(upstreams)).toEqual(["s"]);
   });
 
-  it("excludes entries with kokuai-bridge in command from mcpServers", () => {
+  it("excludes entries with crabeye-mcp-bridge in command from mcpServers", () => {
     const config = parsed({
       mcpServers: {
-        bridge: { command: "npx kokuai-bridge", args: ["--config", "c.json"] },
+        bridge: { command: "npx crabeye-mcp-bridge", args: ["--config", "c.json"] },
         real: { command: "node", args: ["server.js"] },
         httpServer: { type: "streamable-http", url: "https://example.com/mcp" },
       },
@@ -338,10 +338,10 @@ describe("resolveUpstreams", () => {
     expect(Object.keys(upstreams).sort()).toEqual(["httpServer", "real"]);
   });
 
-  it("excludes entries with kokuai-bridge in args from mcpServers", () => {
+  it("excludes entries with crabeye-mcp-bridge in args from mcpServers", () => {
     const config = parsed({
       mcpServers: {
-        bridge: { command: "npx", args: ["-y", "kokuai-bridge", "--config", "c.json"] },
+        bridge: { command: "npx", args: ["-y", "crabeye-mcp-bridge", "--config", "c.json"] },
         real: { command: "node", args: ["server.js"] },
       },
     });
@@ -351,8 +351,8 @@ describe("resolveUpstreams", () => {
 
   it("does not apply self-exclusion to mcpUpstreams or servers", () => {
     const config = parsed({
-      mcpUpstreams: { bridge1: { command: "npx kokuai-bridge" } },
-      servers: { bridge2: { command: "npx", args: ["kokuai-bridge"] } },
+      mcpUpstreams: { bridge1: { command: "npx crabeye-mcp-bridge" } },
+      servers: { bridge2: { command: "npx", args: ["crabeye-mcp-bridge"] } },
     });
     const upstreams = resolveUpstreams(config);
     expect(Object.keys(upstreams).sort()).toEqual(["bridge1", "bridge2"]);
@@ -405,7 +405,7 @@ describe("resolveConfigPath", () => {
 // --- loadConfig with temp files ---
 
 describe("loadConfig", () => {
-  const testDir = join(tmpdir(), `kokuai-bridge-test-${process.pid}`);
+  const testDir = join(tmpdir(), `crabeye-mcp-bridge-test-${process.pid}`);
 
   async function writeConfig(name: string, content: string): Promise<string> {
     await mkdir(testDir, { recursive: true });

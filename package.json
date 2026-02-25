@@ -1,10 +1,10 @@
 {
-  "name": "kokuai-bridge",
+  "name": "crabeye-mcp-bridge",
   "version": "0.1.0",
   "description": "Aggregates multiple MCP servers behind a single STDIO interface",
   "type": "module",
   "bin": {
-    "kokuai-bridge": "./bin/kokuai-bridge"
+    "crabeye-mcp-bridge": "./bin/crabeye-mcp-bridge"
   },
   "files": [
     "bin/",
