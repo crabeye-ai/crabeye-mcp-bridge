@@ -160,7 +160,7 @@ describe("BridgeServer initialize", () => {
 
     const serverInfo = client.getServerVersion();
     expect(serverInfo).toBeDefined();
-    expect(serverInfo!.name).toBe("kokuai-bridge");
+    expect(serverInfo!.name).toBe("crabeye-mcp-bridge");
     expect(serverInfo!.version).toBe("0.1.0");
 
     await cleanup();

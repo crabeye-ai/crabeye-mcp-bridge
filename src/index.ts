@@ -8,7 +8,7 @@ import { UpstreamManager } from "./upstream/index.js";
 const program = new Command();
 
 program
-  .name("kokuai-bridge")
+  .name("crabeye-mcp-bridge")
   .description(
     "Aggregates multiple MCP servers behind a single STDIO interface",
   )
@@ -43,7 +43,7 @@ program
       await server.start();
 
       console.error(
-        `kokuai-bridge running — ${toolRegistry.listRegisteredTools().length} tools indexed from ${upstreamManager.getStatuses().length} servers`,
+        `crabeye-mcp-bridge running — ${toolRegistry.listRegisteredTools().length} tools indexed from ${upstreamManager.getStatuses().length} servers`,
       );
     } catch (err) {
       if (err instanceof ConfigError) {

@@ -1,4 +1,4 @@
-# kokuai-bridge
+# crabeye-mcp-bridge
 
 A local CLI tool that aggregates multiple MCP (Model Context Protocol) servers behind a single STDIO interface. Works fully standalone on your local machine.
 
@@ -13,13 +13,13 @@ npm run build
 
 ```bash
 # Show help
-./bin/kokuai-bridge --help
+./bin/crabeye-mcp-bridge --help
 
 # Run with a config file
-./bin/kokuai-bridge --config ./config.json
+./bin/crabeye-mcp-bridge --config ./config.json
 
 # Run with optional port and token
-./bin/kokuai-bridge --config ./config.json --port 3000 --token mytoken
+./bin/crabeye-mcp-bridge --config ./config.json --port 3000 --token mytoken
 ```
 
 ## Development
