@@ -41,6 +41,10 @@ export class ToolRegistry {
     return this.sourceCategories.get(source);
   }
 
+  removeCategoryForSource(source: string): void {
+    this.sourceCategories.delete(source);
+  }
+
   setToolsForSource(source: string, tools: Tool[]): void {
     const oldNames = this.sourceIndex.get(source);
     if (oldNames) {

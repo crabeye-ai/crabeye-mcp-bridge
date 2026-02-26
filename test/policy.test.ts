@@ -61,6 +61,23 @@ describe("PolicyEngine.resolvePolicy", () => {
   });
 });
 
+// --- update ---
+
+describe("PolicyEngine.update", () => {
+  it("replaces global and server configs", () => {
+    const engine = new PolicyEngine("always", {});
+    expect(engine.resolvePolicy("linear", "create_issue")).toBe("always");
+
+    engine.update("never", {
+      linear: { toolPolicy: "prompt", tools: { create_issue: "always" } },
+    });
+
+    expect(engine.resolvePolicy("linear", "create_issue")).toBe("always");
+    expect(engine.resolvePolicy("linear", "list_issues")).toBe("prompt");
+    expect(engine.resolvePolicy("github", "some_tool")).toBe("never");
+  });
+});
+
 // --- enforce ---
 
 describe("PolicyEngine.enforce", () => {

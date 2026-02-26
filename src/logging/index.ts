@@ -6,6 +6,7 @@ export interface Logger {
   warn(message: string, context?: Record<string, unknown>): void;
   error(message: string, context?: Record<string, unknown>): void;
   child(defaultContext: Record<string, unknown>): Logger;
+  setLevel(level: LogLevel): void;
 }
 
 const LEVEL_VALUE: Record<LogLevel, number> = {
@@ -75,15 +76,16 @@ function formatJson(
 }
 
 class LoggerImpl implements Logger {
-  private _threshold: number;
+  private _shared: { threshold: number };
   private _format: "text" | "json";
   private _defaultContext: Record<string, unknown>;
 
   constructor(
     options: CreateLoggerOptions,
     defaultContext: Record<string, unknown> = {},
+    shared?: { threshold: number },
   ) {
-    this._threshold = LEVEL_VALUE[options.level];
+    this._shared = shared ?? { threshold: LEVEL_VALUE[options.level] };
     this._format = options.format;
     this._defaultContext = defaultContext;
   }
@@ -104,13 +106,16 @@ class LoggerImpl implements Logger {
     this._log("error", message, context);
   }
 
+  setLevel(level: LogLevel): void {
+    this._shared.threshold = LEVEL_VALUE[level];
+  }
+
   child(defaultContext: Record<string, unknown>): Logger {
-    const child = new LoggerImpl(
+    return new LoggerImpl(
       { level: "debug", format: this._format },
       { ...this._defaultContext, ...defaultContext },
+      this._shared,
     );
-    child._threshold = this._threshold;
-    return child;
   }
 
   private _log(
@@ -118,7 +123,7 @@ class LoggerImpl implements Logger {
     message: string,
     context?: Record<string, unknown>,
   ): void {
-    if (LEVEL_VALUE[level] < this._threshold) return;
+    if (LEVEL_VALUE[level] < this._shared.threshold) return;
     const merged = context
       ? { ...this._defaultContext, ...context }
       : this._defaultContext;
@@ -143,6 +148,7 @@ export function createNoopLogger(): Logger {
     warn: noop,
     error: noop,
     child: () => logger,
+    setLevel: noop,
   };
   return logger;
 }

@@ -242,6 +242,34 @@ describe("Logger", () => {
     });
   });
 
+  describe("setLevel", () => {
+    it("changes the threshold for the logger and all children", () => {
+      const logger = createLogger({ level: "error", format: "text" });
+      const child = logger.child({ component: "test" });
+
+      // At error level, info is suppressed
+      child.info("hidden");
+      expect(stderrSpy).not.toHaveBeenCalled();
+
+      // Change to debug — both parent and child should see info
+      logger.setLevel("debug");
+      logger.info("parent visible");
+      child.info("child visible");
+      expect(stderrSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("child setLevel affects parent and siblings", () => {
+      const logger = createLogger({ level: "error", format: "text" });
+      const child1 = logger.child({ component: "a" });
+      const child2 = logger.child({ component: "b" });
+
+      child1.setLevel("info");
+      logger.info("parent");
+      child2.info("sibling");
+      expect(stderrSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe("createNoopLogger", () => {
     it("does not write anything", () => {
       const logger = createNoopLogger();

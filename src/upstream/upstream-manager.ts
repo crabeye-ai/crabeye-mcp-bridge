@@ -1,5 +1,6 @@
 import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
 import { isStdioServer, resolveUpstreams } from "../config/schema.js";
+import type { ConfigDiff } from "../config/config-diff.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
@@ -44,7 +45,7 @@ export class UpstreamManager {
   private _logger: Logger;
   private _clientFactory: (name: string, config: ServerConfig, logger: Logger) => UpstreamClient;
   private _clients = new Map<string, UpstreamClient>();
-  private _unsubscribers: Array<() => void> = [];
+  private _unsubscribers = new Map<string, Array<() => void>>();
   private _healthCheckInterval: number;
   private _healthTimer: ReturnType<typeof setInterval> | undefined;
   private _healthTracking = new Map<string, HealthTracking>();
@@ -68,56 +69,79 @@ export class UpstreamManager {
       });
   }
 
+  private _addClient(
+    name: string,
+    serverConfig: ServerConfig,
+  ): Promise<{ name: string; error?: string }> {
+    const log = this._logger.child({ component: "upstream", server: name });
+    const transport = isStdioServer(serverConfig)
+      ? "stdio"
+      : (serverConfig as HttpServerConfig).type;
+    log.info(`connecting (${transport})`);
+
+    const client = this._clientFactory(name, serverConfig, log);
+    this._clients.set(name, client);
+
+    const category = serverConfig._bridge?.category;
+    if (category) {
+      this._toolRegistry.setCategoryForSource(name, category);
+    }
+
+    const unsubTools = client.onToolsChanged((tools) => {
+      const namespaced = tools.map((t) => namespaceTool(name, t));
+      this._toolRegistry.setToolsForSource(name, namespaced);
+      log.info(
+        `${tools.length} tool${tools.length === 1 ? "" : "s"} discovered: ${namespaced.map((t) => t.name).join(", ")}`,
+      );
+    });
+
+    const unsubStatus = client.onStatusChange((event) => {
+      if (event.current === "error") {
+        log.error(
+          `error: ${event.error?.message ?? "unknown"}`,
+        );
+        this._toolRegistry.removeSource(name);
+      } else {
+        log.debug(`${event.current}`);
+      }
+    });
+
+    this._unsubscribers.set(name, [unsubTools, unsubStatus]);
+
+    return client.connect().then(
+      () => ({ name }),
+      (err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(`failed to connect: ${message}`);
+        return { name, error: message };
+      },
+    );
+  }
+
+  private async _removeClient(name: string): Promise<void> {
+    const unsubs = this._unsubscribers.get(name);
+    if (unsubs) {
+      for (const unsub of unsubs) unsub();
+      this._unsubscribers.delete(name);
+    }
+
+    const client = this._clients.get(name);
+    if (client) {
+      await client.close().catch(() => {});
+      this._clients.delete(name);
+    }
+
+    this._toolRegistry.removeSource(name);
+    this._healthTracking.delete(name);
+    this._pingsInFlight.delete(name);
+  }
+
   async connectAll(): Promise<ConnectAllResult> {
     const entries = Object.entries(resolveUpstreams(this._config));
     const connectPromises: Promise<{ name: string; error?: string }>[] = [];
 
     for (const [name, serverConfig] of entries) {
-      const log = this._logger.child({ component: "upstream", server: name });
-      const transport = isStdioServer(serverConfig)
-        ? "stdio"
-        : (serverConfig as HttpServerConfig).type;
-      log.info(`connecting (${transport})`);
-
-      const client = this._clientFactory(name, serverConfig, log);
-      this._clients.set(name, client);
-
-      const category = serverConfig._bridge?.category;
-      if (category) {
-        this._toolRegistry.setCategoryForSource(name, category);
-      }
-
-      const unsubTools = client.onToolsChanged((tools) => {
-        const namespaced = tools.map((t) => namespaceTool(name, t));
-        this._toolRegistry.setToolsForSource(name, namespaced);
-        log.info(
-          `${tools.length} tool${tools.length === 1 ? "" : "s"} discovered: ${namespaced.map((t) => t.name).join(", ")}`,
-        );
-      });
-
-      const unsubStatus = client.onStatusChange((event) => {
-        if (event.current === "error") {
-          log.error(
-            `error: ${event.error?.message ?? "unknown"}`,
-          );
-          this._toolRegistry.removeSource(name);
-        } else {
-          log.debug(`${event.current}`);
-        }
-      });
-
-      this._unsubscribers.push(unsubTools, unsubStatus);
-
-      connectPromises.push(
-        client.connect().then(
-          () => ({ name }),
-          (err) => {
-            const message = err instanceof Error ? err.message : String(err);
-            log.error(`failed to connect: ${message}`);
-            return { name, error: message };
-          },
-        ),
-      );
+      connectPromises.push(this._addClient(name, serverConfig));
     }
 
     const outcomes = await Promise.all(connectPromises);
@@ -132,10 +156,10 @@ export class UpstreamManager {
   async closeAll(): Promise<void> {
     this.stopHealthChecks();
 
-    for (const unsub of this._unsubscribers) {
-      unsub();
+    for (const unsubs of this._unsubscribers.values()) {
+      for (const unsub of unsubs) unsub();
     }
-    this._unsubscribers = [];
+    this._unsubscribers.clear();
 
     const names = Array.from(this._clients.keys());
 
@@ -153,6 +177,56 @@ export class UpstreamManager {
     this._clients.clear();
     this._healthTracking.clear();
     this._pingsInFlight.clear();
+  }
+
+  async applyConfigDiff(diff: ConfigDiff, newConfig: BridgeConfig): Promise<void> {
+    // 1. Remove deleted servers
+    for (const name of diff.servers.removed) {
+      this._logger.info(`removing server`, { component: "reload", server: name });
+      await this._removeClient(name);
+    }
+
+    // 2. Reconnect servers with changed connection fields
+    for (const { name, config } of diff.servers.reconnect) {
+      this._logger.info(`reconnecting server`, { component: "reload", server: name });
+      await this._removeClient(name);
+      const result = await this._addClient(name, config);
+      if (result.error) {
+        this._logger.warn(`server failed to connect after reload`, {
+          component: "reload", server: name, error: result.error,
+        });
+      }
+    }
+
+    // 3. Add new servers
+    for (const { name, config } of diff.servers.added) {
+      this._logger.info(`adding server`, { component: "reload", server: name });
+      const result = await this._addClient(name, config);
+      if (result.error) {
+        this._logger.warn(`server failed to connect after reload`, {
+          component: "reload", server: name, error: result.error,
+        });
+      }
+    }
+
+    // 4. Update metadata-only servers (policy changes handled separately via PolicyEngine.update)
+    for (const { name, config } of diff.servers.updated) {
+      this._logger.info(`updating metadata`, { component: "reload", server: name });
+      const category = config._bridge?.category;
+      if (category) {
+        this._toolRegistry.setCategoryForSource(name, category);
+      } else {
+        this._toolRegistry.removeCategoryForSource(name);
+      }
+    }
+
+    this._config = newConfig;
+  }
+
+  restartHealthChecks(interval: number): void {
+    this.stopHealthChecks();
+    this._healthCheckInterval = interval;
+    this.startHealthChecks();
   }
 
   getClient(name: string): UpstreamClient | undefined {
