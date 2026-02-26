@@ -84,7 +84,7 @@ export class BridgeServer {
 
       // Handle search_tools call
       if (this.toolSearchService && name === SEARCH_TOOL_NAME) {
-        const params = (args ?? {}) as SearchToolsParams;
+        const params = (args ?? {}) as unknown as SearchToolsParams;
 
         if (!Array.isArray(params.queries) || params.queries.length === 0) {
           return {
