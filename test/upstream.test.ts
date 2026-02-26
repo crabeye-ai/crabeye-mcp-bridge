@@ -391,6 +391,33 @@ describe("HttpUpstreamClient", () => {
 
     expect(client.status).toBe("disconnected");
   });
+
+  it("ping() throws when not connected", async () => {
+    const { client } = createLinkedClient("test", mockServerHandle.server);
+    upstreamClient = client;
+
+    await expect(client.ping()).rejects.toThrow(/not connected/);
+  });
+
+  it("ping() succeeds when connected", async () => {
+    const { client } = createLinkedClient("test", mockServerHandle.server);
+    upstreamClient = client;
+
+    await client.connect();
+    await expect(client.ping()).resolves.toBeUndefined();
+  });
+
+  it("reconnect() resets state and reconnects", async () => {
+    const { client } = createLinkedClient("test", mockServerHandle.server);
+    upstreamClient = client;
+
+    await client.connect();
+    expect(client.status).toBe("connected");
+
+    await client.reconnect();
+    expect(client.status).toBe("connected");
+    expect(client.tools).toHaveLength(2);
+  });
 });
 
 // --- UpstreamManager ---
@@ -412,6 +439,7 @@ describe("UpstreamManager", () => {
         maxUpstreamConnections: 1000,
         connectionTimeout: 30,
         idleTimeout: 600,
+        healthCheckInterval: 30,
         toolPolicy: "always",
       },
     } as BridgeConfig;
@@ -699,10 +727,12 @@ describe("UpstreamManager", () => {
 
     const statusA = statuses.find((s) => s.name === "srv-a")!;
     expect(statusA.status).toBe("connected");
+    expect(statusA.health).toBe("unknown");
     expect(statusA.toolCount).toBe(2);
 
     const statusB = statuses.find((s) => s.name === "srv-b")!;
     expect(statusB.status).toBe("connected");
+    expect(statusB.health).toBe("unknown");
     expect(statusB.toolCount).toBe(1);
 
     await manager.closeAll();
@@ -1046,5 +1076,32 @@ describe("StdioUpstreamClient", () => {
     await client.connect().catch(() => {});
 
     expect(client.status).toBe("disconnected");
+  });
+
+  it("ping() throws when not connected", async () => {
+    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
+    upstreamClient = client;
+
+    await expect(client.ping()).rejects.toThrow(/not connected/);
+  });
+
+  it("ping() succeeds when connected", async () => {
+    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
+    upstreamClient = client;
+
+    await client.connect();
+    await expect(client.ping()).resolves.toBeUndefined();
+  });
+
+  it("reconnect() resets state and reconnects", async () => {
+    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
+    upstreamClient = client;
+
+    await client.connect();
+    expect(client.status).toBe("connected");
+
+    await client.reconnect();
+    expect(client.status).toBe("connected");
+    expect(client.tools).toHaveLength(2);
   });
 });

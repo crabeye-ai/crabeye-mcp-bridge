@@ -89,6 +89,7 @@ program
             logger.error(`${f.name}: ${f.error}`, { component: "bridge" });
           }
         }
+        upstreamManager?.startHealthChecks();
       }).catch(() => {
         // Individual failures already logged by UpstreamManager
       });

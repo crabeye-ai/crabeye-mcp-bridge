@@ -139,6 +139,7 @@ describe("schema validation", () => {
         maxUpstreamConnections: 1000,
         connectionTimeout: 30,
         idleTimeout: 600,
+        healthCheckInterval: 30,
         toolPolicy: "always",
       });
     }

@@ -30,6 +30,8 @@ function makeMockUpstreamClient(
       content: [{ type: "text", text: `called on ${name}` }],
     }),
     close: vi.fn().mockResolvedValue(undefined),
+    ping: vi.fn().mockResolvedValue(undefined),
+    reconnect: vi.fn().mockResolvedValue(undefined),
     onStatusChange: vi.fn().mockReturnValue(() => {}),
     onToolsChanged: vi.fn().mockReturnValue(() => {}),
     ...overrides,

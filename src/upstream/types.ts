@@ -6,6 +6,8 @@ export type ConnectionStatus =
   | "connected"
   | "error";
 
+export type HealthState = "unknown" | "healthy" | "unhealthy";
+
 export interface StatusChangeEvent {
   previous: ConnectionStatus;
   current: ConnectionStatus;
@@ -26,6 +28,12 @@ export interface UpstreamClient {
     arguments?: Record<string, unknown>;
   }): Promise<CallToolResult>;
   close(): Promise<void>;
+
+  /** Ping the upstream server. Throws if not connected or if ping times out. */
+  ping(timeoutMs?: number): Promise<void>;
+
+  /** Fresh reconnection: resets backoff, closes inner client, reconnects. */
+  reconnect(): Promise<void>;
 
   onStatusChange(callback: StatusChangeCallback): () => void;
   onToolsChanged(callback: ToolsChangedCallback): () => void;

@@ -62,6 +62,7 @@ export const GlobalBridgeConfigSchema = z
     maxUpstreamConnections: z.number().int().positive().default(1000),
     connectionTimeout: z.number().int().positive().default(30),
     idleTimeout: z.number().int().positive().default(600),
+    healthCheckInterval: z.number().int().min(0).default(30),
     toolPolicy: ToolPolicySchema.default("always"),
   })
   .strict();

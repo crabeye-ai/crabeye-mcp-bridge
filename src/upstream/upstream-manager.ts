@@ -6,12 +6,14 @@ import type { ToolRegistry } from "../server/tool-registry.js";
 import { namespaceTool } from "../server/tool-namespacing.js";
 import { HttpUpstreamClient } from "./http-client.js";
 import { StdioUpstreamClient } from "./stdio-client.js";
-import type { UpstreamClient, ConnectionStatus } from "./types.js";
+import type { UpstreamClient, ConnectionStatus, HealthState } from "./types.js";
 
 export interface UpstreamManagerOptions {
   config: BridgeConfig;
   toolRegistry: ToolRegistry;
   logger?: Logger;
+  /** Health check interval in seconds. 0 to disable. Overrides config value. */
+  healthCheckInterval?: number;
   /** Injectable client factory for testing. */
   _clientFactory?: (name: string, config: ServerConfig, logger: Logger) => UpstreamClient;
 }
@@ -19,7 +21,15 @@ export interface UpstreamManagerOptions {
 export interface UpstreamStatus {
   name: string;
   status: ConnectionStatus;
+  health: HealthState;
   toolCount: number;
+  lastPingAt?: number;
+}
+
+interface HealthTracking {
+  consecutiveFailures: number;
+  lastPingAt?: number;
+  health: HealthState;
 }
 
 export interface ConnectAllResult {
@@ -35,11 +45,19 @@ export class UpstreamManager {
   private _clientFactory: (name: string, config: ServerConfig, logger: Logger) => UpstreamClient;
   private _clients = new Map<string, UpstreamClient>();
   private _unsubscribers: Array<() => void> = [];
+  private _healthCheckInterval: number;
+  private _healthTimer: ReturnType<typeof setInterval> | undefined;
+  private _healthTracking = new Map<string, HealthTracking>();
+  private _pingsInFlight = new Set<string>();
+  private _pingTimeoutMs = 5000;
+  private _unhealthyThreshold = 3;
 
   constructor(options: UpstreamManagerOptions) {
     this._config = options.config;
     this._toolRegistry = options.toolRegistry;
     this._logger = options.logger ?? createNoopLogger();
+    this._healthCheckInterval =
+      options.healthCheckInterval ?? options.config._bridge.healthCheckInterval;
     this._clientFactory =
       options._clientFactory ??
       ((name, config, logger) => {
@@ -112,6 +130,8 @@ export class UpstreamManager {
   }
 
   async closeAll(): Promise<void> {
+    this.stopHealthChecks();
+
     for (const unsub of this._unsubscribers) {
       unsub();
     }
@@ -131,6 +151,8 @@ export class UpstreamManager {
     }
 
     this._clients.clear();
+    this._healthTracking.clear();
+    this._pingsInFlight.clear();
   }
 
   getClient(name: string): UpstreamClient | undefined {
@@ -138,10 +160,102 @@ export class UpstreamManager {
   }
 
   getStatuses(): UpstreamStatus[] {
-    return Array.from(this._clients.values()).map((client) => ({
-      name: client.name,
-      status: client.status,
-      toolCount: client.tools.length,
-    }));
+    return Array.from(this._clients.values()).map((client) => {
+      const tracking = this._healthTracking.get(client.name);
+      return {
+        name: client.name,
+        status: client.status,
+        health: tracking?.health ?? "unknown",
+        toolCount: client.tools.length,
+        lastPingAt: tracking?.lastPingAt,
+      };
+    });
+  }
+
+  startHealthChecks(): void {
+    if (this._healthCheckInterval <= 0) return;
+    if (this._healthTimer) return;
+
+    this._logger.debug("starting health checks", {
+      component: "health",
+      interval: this._healthCheckInterval,
+    });
+
+    this._healthTimer = setInterval(() => {
+      this._runHealthCheck();
+    }, this._healthCheckInterval * 1000);
+  }
+
+  stopHealthChecks(): void {
+    if (this._healthTimer) {
+      clearInterval(this._healthTimer);
+      this._healthTimer = undefined;
+    }
+  }
+
+  private _runHealthCheck(): void {
+    for (const [name, client] of this._clients) {
+      if (client.status !== "connected") continue;
+      if (this._pingsInFlight.has(name)) continue;
+
+      let tracking = this._healthTracking.get(name);
+      if (!tracking) {
+        tracking = { consecutiveFailures: 0, health: "unknown" };
+        this._healthTracking.set(name, tracking);
+      }
+
+      this._pingsInFlight.add(name);
+
+      client.ping(this._pingTimeoutMs).then(
+        () => {
+          this._pingsInFlight.delete(name);
+          const t = this._healthTracking.get(name);
+          if (!t) return;
+          const wasUnhealthy = t.health === "unhealthy";
+          t.consecutiveFailures = 0;
+          t.lastPingAt = Date.now();
+          t.health = "healthy";
+          if (wasUnhealthy) {
+            this._logger.info("recovered", {
+              component: "health",
+              server: name,
+            });
+          }
+        },
+        (err) => {
+          this._pingsInFlight.delete(name);
+          const t = this._healthTracking.get(name);
+          if (!t) return;
+          t.consecutiveFailures++;
+          t.health = "unhealthy";
+
+          this._logger.warn("ping failed", {
+            component: "health",
+            server: name,
+            error: err instanceof Error ? err.message : String(err),
+            failures: t.consecutiveFailures,
+          });
+
+          if (t.consecutiveFailures >= this._unhealthyThreshold) {
+            this._logger.error(
+              `${t.consecutiveFailures} consecutive ping failures, reconnecting`,
+              { component: "health", server: name },
+            );
+            t.consecutiveFailures = 0;
+            t.health = "unknown";
+            client.reconnect().catch((reconnectErr) => {
+              this._logger.error("reconnect failed", {
+                component: "health",
+                server: name,
+                error:
+                  reconnectErr instanceof Error
+                    ? reconnectErr.message
+                    : String(reconnectErr),
+              });
+            });
+          }
+        },
+      );
+    }
   }
 }

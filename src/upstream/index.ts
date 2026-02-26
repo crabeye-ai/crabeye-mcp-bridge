@@ -1,10 +1,13 @@
 export type {
   ConnectionStatus,
+  HealthState,
   StatusChangeEvent,
   StatusChangeCallback,
   ToolsChangedCallback,
   UpstreamClient,
 } from "./types.js";
+export { BaseUpstreamClient } from "./base-client.js";
+export type { BaseUpstreamClientOptions } from "./base-client.js";
 export { HttpUpstreamClient } from "./http-client.js";
 export type { HttpUpstreamClientOptions } from "./http-client.js";
 export { StdioUpstreamClient } from "./stdio-client.js";
