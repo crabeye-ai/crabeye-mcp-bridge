@@ -29,8 +29,6 @@ program
       const toolRegistry = new ToolRegistry();
       upstreamManager = new UpstreamManager({ config, toolRegistry });
 
-      await upstreamManager.connectAll();
-
       // Build per-server bridge configs for the policy engine
       const upstreams = resolveUpstreams(config);
       const serverBridgeConfigs: Record<string, ServerBridgeConfig> = {};
@@ -55,9 +53,16 @@ program
       });
       await server.start();
 
-      console.error(
-        `${APP_NAME} running — ${toolRegistry.listRegisteredTools().length} tools indexed from ${upstreamManager.getStatuses().length} servers`,
-      );
+      // Connect upstreams in the background — tools appear as each server connects
+      upstreamManager.connectAll().then(() => {
+        console.error(
+          `${APP_NAME} ready — ${toolRegistry.listRegisteredTools().length} tools indexed from ${upstreamManager!.getStatuses().length} servers`,
+        );
+      }).catch(() => {
+        // Individual failures already logged by UpstreamManager
+      });
+
+      console.error(`${APP_NAME} running — connecting to ${Object.keys(upstreams).length} upstream servers`);
     } catch (err) {
       if (err instanceof ConfigError) {
         console.error(`Error: ${err.message}`);
