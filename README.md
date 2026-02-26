@@ -415,8 +415,23 @@ npx @crabeye-ai/crabeye-mcp-bridge --config <path>
 | Flag | Description |
 |------|-------------|
 | `-c, --config <path>` | Path to config file (required, or set `MCP_BRIDGE_CONFIG`) |
+| `--validate` | Validate config and list upstream servers, then exit |
 | `-V, --version` | Print version |
 | `-h, --help` | Print help |
+
+### Validating your config
+
+Use `--validate` to check your config file without starting the bridge:
+
+```
+$ npx @crabeye-ai/crabeye-mcp-bridge --config config.json --validate
+Config OK — 3 upstream servers
+  linear (stdio) [project management]
+  github (stdio)
+  sentry (streamable-http)
+```
+
+Exits with code 0 on success, code 1 on validation errors.
 
 ## License
 
