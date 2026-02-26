@@ -24,6 +24,14 @@ export class PolicyEngine {
     this.serverConfigs = serverConfigs;
   }
 
+  update(
+    globalPolicy: ToolPolicy,
+    serverConfigs: Record<string, ServerBridgeConfig>,
+  ): void {
+    this.globalPolicy = globalPolicy;
+    this.serverConfigs = serverConfigs;
+  }
+
   resolvePolicy(source: string, toolName: string): ToolPolicy {
     const serverConfig = this.serverConfigs[source];
     if (serverConfig) {
