@@ -408,9 +408,11 @@ describe("UpstreamManager", () => {
       _bridge: {
         port: 19875,
         logLevel: "info",
+        logFormat: "text",
         maxUpstreamConnections: 1000,
         connectionTimeout: 30,
         idleTimeout: 600,
+        toolPolicy: "always",
       },
     } as BridgeConfig;
   }

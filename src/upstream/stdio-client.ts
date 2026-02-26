@@ -4,6 +4,8 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { StdioServerConfig } from "../config/schema.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
+import type { Logger } from "../logging/index.js";
+import { createNoopLogger } from "../logging/index.js";
 import type {
   UpstreamClient,
   ConnectionStatus,
@@ -15,6 +17,7 @@ import type {
 export interface StdioUpstreamClientOptions {
   name: string;
   config: StdioServerConfig;
+  logger?: Logger;
   maxReconnectAttempts?: number;
   reconnectBaseDelay?: number;
   reconnectMaxDelay?: number;
@@ -38,6 +41,7 @@ export class StdioUpstreamClient implements UpstreamClient {
   private _reconnectBaseDelay: number;
   private _reconnectMaxDelay: number;
   private _transportFactory: (() => Transport) | undefined;
+  private _logger: Logger;
   private _statusListeners = new Set<StatusChangeCallback>();
   private _toolsListeners = new Set<ToolsChangedCallback>();
 
@@ -48,6 +52,7 @@ export class StdioUpstreamClient implements UpstreamClient {
     this._reconnectBaseDelay = options.reconnectBaseDelay ?? 1000;
     this._reconnectMaxDelay = options.reconnectMaxDelay ?? 30000;
     this._transportFactory = options._transportFactory;
+    this._logger = options.logger ?? createNoopLogger();
   }
 
   get status(): ConnectionStatus {
@@ -80,6 +85,7 @@ export class StdioUpstreamClient implements UpstreamClient {
     }
 
     this._setStatus("connecting");
+    this._logger.debug("connecting");
 
     try {
       const transport = this._createTransport();
@@ -115,6 +121,9 @@ export class StdioUpstreamClient implements UpstreamClient {
       this._setStatus("connected");
       this._notifyToolsChanged();
     } catch (err) {
+      this._logger.debug("connection failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
       this._setStatus("disconnected");
       throw err;
     }
@@ -172,12 +181,12 @@ export class StdioUpstreamClient implements UpstreamClient {
       stderr: "pipe",
     });
 
-    // Forward subprocess stderr to bridge stderr with server name prefix
+    // Forward subprocess stderr through the logger
     transport.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString().trimEnd();
       if (text) {
         for (const line of text.split("\n")) {
-          process.stderr.write(`[${this.name}] ${line}\n`);
+          this._logger.debug(line, { stream: "stderr" });
         }
       }
     });
@@ -220,6 +229,7 @@ export class StdioUpstreamClient implements UpstreamClient {
     if (this._connectPromise) return;
 
     if (this._reconnectAttempt >= this._maxReconnectAttempts) {
+      this._logger.warn("max reconnect attempts reached");
       this._setStatus("error", new Error("Max reconnect attempts exceeded"));
       return;
     }
@@ -229,6 +239,7 @@ export class StdioUpstreamClient implements UpstreamClient {
       this._reconnectMaxDelay,
     );
     this._reconnectAttempt++;
+    this._logger.debug(`reconnecting in ${delay}ms`, { attempt: this._reconnectAttempt });
 
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = undefined;

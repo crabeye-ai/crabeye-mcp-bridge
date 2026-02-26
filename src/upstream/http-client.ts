@@ -5,6 +5,8 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { HttpServerConfig } from "../config/schema.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
+import type { Logger } from "../logging/index.js";
+import { createNoopLogger } from "../logging/index.js";
 import type {
   UpstreamClient,
   ConnectionStatus,
@@ -16,6 +18,7 @@ import type {
 export interface HttpUpstreamClientOptions {
   name: string;
   config: HttpServerConfig;
+  logger?: Logger;
   maxReconnectAttempts?: number;
   reconnectBaseDelay?: number;
   reconnectMaxDelay?: number;
@@ -39,6 +42,7 @@ export class HttpUpstreamClient implements UpstreamClient {
   private _reconnectBaseDelay: number;
   private _reconnectMaxDelay: number;
   private _transportFactory: (() => Transport) | undefined;
+  private _logger: Logger;
   private _statusListeners = new Set<StatusChangeCallback>();
   private _toolsListeners = new Set<ToolsChangedCallback>();
 
@@ -49,6 +53,7 @@ export class HttpUpstreamClient implements UpstreamClient {
     this._reconnectBaseDelay = options.reconnectBaseDelay ?? 1000;
     this._reconnectMaxDelay = options.reconnectMaxDelay ?? 30000;
     this._transportFactory = options._transportFactory;
+    this._logger = options.logger ?? createNoopLogger();
   }
 
   get status(): ConnectionStatus {
@@ -81,6 +86,7 @@ export class HttpUpstreamClient implements UpstreamClient {
     }
 
     this._setStatus("connecting");
+    this._logger.debug("connecting");
 
     try {
       const transport = this._createTransport();
@@ -116,6 +122,9 @@ export class HttpUpstreamClient implements UpstreamClient {
       this._setStatus("connected");
       this._notifyToolsChanged();
     } catch (err) {
+      this._logger.debug("connection failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
       this._setStatus("disconnected");
       throw err;
     }
@@ -212,6 +221,7 @@ export class HttpUpstreamClient implements UpstreamClient {
     if (this._connectPromise) return;
 
     if (this._reconnectAttempt >= this._maxReconnectAttempts) {
+      this._logger.warn("max reconnect attempts reached");
       this._setStatus("error", new Error("Max reconnect attempts exceeded"));
       return;
     }
@@ -221,6 +231,7 @@ export class HttpUpstreamClient implements UpstreamClient {
       this._reconnectMaxDelay,
     );
     this._reconnectAttempt++;
+    this._logger.debug(`reconnecting in ${delay}ms`, { attempt: this._reconnectAttempt });
 
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = undefined;

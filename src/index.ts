@@ -8,6 +8,7 @@ import { ToolSearchService } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
+import { createLogger } from "./logging/index.js";
 
 const program = new Command();
 
@@ -28,23 +29,28 @@ program
       const config = await loadConfig({ configPath: options.config });
       const upstreams = resolveUpstreams(config);
 
-      // --validate: print config summary and exit
+      const logger = createLogger({
+        level: config._bridge.logLevel,
+        format: config._bridge.logFormat,
+      });
+
+      // --validate: print config summary and exit (always human-readable CLI output)
       if (options.validate) {
         const entries = Object.entries(upstreams);
-        console.error(`Config OK — ${entries.length} upstream server${entries.length === 1 ? "" : "s"}`);
+        process.stderr.write(`Config OK — ${entries.length} upstream server${entries.length === 1 ? "" : "s"}\n`);
         for (const [name, serverConfig] of entries) {
           const transport = isStdioServer(serverConfig)
             ? "stdio"
             : (serverConfig as HttpServerConfig).type;
           const category = serverConfig._bridge?.category;
           const suffix = category ? ` [${category}]` : "";
-          console.error(`  ${name} (${transport})${suffix}`);
+          process.stderr.write(`  ${name} (${transport})${suffix}\n`);
         }
         return;
       }
 
       const toolRegistry = new ToolRegistry();
-      upstreamManager = new UpstreamManager({ config, toolRegistry });
+      upstreamManager = new UpstreamManager({ config, toolRegistry, logger });
 
       // Build per-server bridge configs for the policy engine
       const serverBridgeConfigs: Record<string, ServerBridgeConfig> = {};
@@ -70,17 +76,17 @@ program
       await server.start();
 
       const serverCount = Object.keys(upstreams).length;
-      console.error(`${APP_NAME} running — connecting to ${serverCount} upstream server${serverCount === 1 ? "" : "s"}`);
+      logger.info(`${APP_NAME} running — connecting to ${serverCount} upstream server${serverCount === 1 ? "" : "s"}`, { component: "bridge" });
 
       // Connect upstreams in the background — tools appear as each server connects
       upstreamManager.connectAll().then((result) => {
         const tools = toolRegistry.listRegisteredTools().length;
         if (result.failed.length === 0) {
-          console.error(`${APP_NAME} ready — ${tools} tools from ${result.connected} servers`);
+          logger.info(`${APP_NAME} ready — ${tools} tools from ${result.connected} servers`, { component: "bridge" });
         } else {
-          console.error(`${APP_NAME} ready — ${tools} tools from ${result.connected} servers (${result.failed.length} failed)`);
+          logger.warn(`${APP_NAME} ready — ${tools} tools from ${result.connected} servers (${result.failed.length} failed)`, { component: "bridge" });
           for (const f of result.failed) {
-            console.error(`  ${f.name}: ${f.error}`);
+            logger.error(`${f.name}: ${f.error}`, { component: "bridge" });
           }
         }
       }).catch(() => {
@@ -88,9 +94,9 @@ program
       });
     } catch (err) {
       if (err instanceof ConfigError) {
-        console.error(`Error: ${err.message}`);
+        process.stderr.write(`Error: ${err.message}\n`);
         for (const issue of err.issues) {
-          console.error(`  ${issue.path}: ${issue.message}`);
+          process.stderr.write(`  ${issue.path}: ${issue.message}\n`);
         }
         process.exitCode = 1;
         return;
