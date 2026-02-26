@@ -19,6 +19,12 @@ export interface UpstreamStatus {
   toolCount: number;
 }
 
+export interface ConnectAllResult {
+  total: number;
+  connected: number;
+  failed: Array<{ name: string; error: string }>;
+}
+
 export class UpstreamManager {
   private _config: BridgeConfig;
   private _toolRegistry: ToolRegistry;
@@ -39,9 +45,9 @@ export class UpstreamManager {
       });
   }
 
-  async connectAll(): Promise<void> {
+  async connectAll(): Promise<ConnectAllResult> {
     const entries = Object.entries(resolveUpstreams(this._config));
-    const connectPromises: Promise<void>[] = [];
+    const connectPromises: Promise<{ name: string; error?: string }>[] = [];
 
     for (const [name, serverConfig] of entries) {
       const transport = isStdioServer(serverConfig)
@@ -79,15 +85,24 @@ export class UpstreamManager {
       this._unsubscribers.push(unsubTools, unsubStatus);
 
       connectPromises.push(
-        client.connect().catch((err) => {
-          this._log(
-            `[${name}] failed to connect: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }),
+        client.connect().then(
+          () => ({ name }),
+          (err) => {
+            const message = err instanceof Error ? err.message : String(err);
+            this._log(`[${name}] failed to connect: ${message}`);
+            return { name, error: message };
+          },
+        ),
       );
     }
 
-    await Promise.all(connectPromises);
+    const outcomes = await Promise.all(connectPromises);
+    const failed = outcomes.filter((o) => o.error !== undefined) as Array<{ name: string; error: string }>;
+    return {
+      total: entries.length,
+      connected: entries.length - failed.length,
+      failed,
+    };
   }
 
   async closeAll(): Promise<void> {
