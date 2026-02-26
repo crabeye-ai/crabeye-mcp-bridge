@@ -384,7 +384,7 @@ describe("ToolSearchService", () => {
     it("query with no filters returns empty result for that slot", () => {
       registry.setToolsForSource("a", [makeTool("a__tool", "A tool")]);
 
-      const result = service.search({ queries: [{} as any] });
+      const result = service.search({ queries: [{} as Record<string, never>] });
       expect(result.results).toHaveLength(1);
       expect(result.results[0].total).toBe(0);
       expect(result.results[0].providers).toEqual([]);
@@ -778,8 +778,8 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(parsed.results).toHaveLength(1);
     expect(parsed.results[0].total).toBeGreaterThan(0);
     expect(parsed.results[0].providers.length).toBeGreaterThan(0);
-    const tools = parsed.results[0].providers.flatMap((p: any) => p.tools);
-    expect(tools[0].tool_name).toBe("linear__create_issue");
+    const tools = parsed.results[0].providers.flatMap((p: { tools: unknown[] }) => p.tools);
+    expect((tools[0] as { tool_name: string }).tool_name).toBe("linear__create_issue");
 
     await cleanup();
   });
@@ -835,9 +835,9 @@ describe("BridgeServer with ToolSearchService", () => {
     );
     expect(parsed.results[0].total).toBe(2);
     expect(parsed.results[0].providers).toHaveLength(1);
-    const tools = parsed.results[0].providers.flatMap((p: any) => p.tools);
+    const tools = parsed.results[0].providers.flatMap((p: { tools: unknown[] }) => p.tools);
     expect(tools).toHaveLength(2);
-    expect(tools.every((t: any) => t.source === "linear")).toBe(true);
+    expect(tools.every((t: { source?: string }) => t.source === "linear")).toBe(true);
 
     await cleanup();
   });
