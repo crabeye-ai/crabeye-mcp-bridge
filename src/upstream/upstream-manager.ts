@@ -1,5 +1,7 @@
 import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
 import { isStdioServer, resolveUpstreams } from "../config/schema.js";
+import type { Logger } from "../logging/index.js";
+import { createNoopLogger } from "../logging/index.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { namespaceTool } from "../server/tool-namespacing.js";
 import { HttpUpstreamClient } from "./http-client.js";
@@ -9,8 +11,9 @@ import type { UpstreamClient, ConnectionStatus } from "./types.js";
 export interface UpstreamManagerOptions {
   config: BridgeConfig;
   toolRegistry: ToolRegistry;
+  logger?: Logger;
   /** Injectable client factory for testing. */
-  _clientFactory?: (name: string, config: ServerConfig) => UpstreamClient;
+  _clientFactory?: (name: string, config: ServerConfig, logger: Logger) => UpstreamClient;
 }
 
 export interface UpstreamStatus {
@@ -28,20 +31,22 @@ export interface ConnectAllResult {
 export class UpstreamManager {
   private _config: BridgeConfig;
   private _toolRegistry: ToolRegistry;
-  private _clientFactory: (name: string, config: ServerConfig) => UpstreamClient;
+  private _logger: Logger;
+  private _clientFactory: (name: string, config: ServerConfig, logger: Logger) => UpstreamClient;
   private _clients = new Map<string, UpstreamClient>();
   private _unsubscribers: Array<() => void> = [];
 
   constructor(options: UpstreamManagerOptions) {
     this._config = options.config;
     this._toolRegistry = options.toolRegistry;
+    this._logger = options.logger ?? createNoopLogger();
     this._clientFactory =
       options._clientFactory ??
-      ((name, config) => {
+      ((name, config, logger) => {
         if (isStdioServer(config)) {
-          return new StdioUpstreamClient({ name, config });
+          return new StdioUpstreamClient({ name, config, logger });
         }
-        return new HttpUpstreamClient({ name, config: config as HttpServerConfig });
+        return new HttpUpstreamClient({ name, config: config as HttpServerConfig, logger });
       });
   }
 
@@ -50,12 +55,13 @@ export class UpstreamManager {
     const connectPromises: Promise<{ name: string; error?: string }>[] = [];
 
     for (const [name, serverConfig] of entries) {
+      const log = this._logger.child({ component: "upstream", server: name });
       const transport = isStdioServer(serverConfig)
         ? "stdio"
         : (serverConfig as HttpServerConfig).type;
-      this._log(`[${name}] connecting (${transport})`);
+      log.info(`connecting (${transport})`);
 
-      const client = this._clientFactory(name, serverConfig);
+      const client = this._clientFactory(name, serverConfig, log);
       this._clients.set(name, client);
 
       const category = serverConfig._bridge?.category;
@@ -66,19 +72,19 @@ export class UpstreamManager {
       const unsubTools = client.onToolsChanged((tools) => {
         const namespaced = tools.map((t) => namespaceTool(name, t));
         this._toolRegistry.setToolsForSource(name, namespaced);
-        this._log(
-          `[${name}] ${tools.length} tool${tools.length === 1 ? "" : "s"} discovered: ${namespaced.map((t) => t.name).join(", ")}`,
+        log.info(
+          `${tools.length} tool${tools.length === 1 ? "" : "s"} discovered: ${namespaced.map((t) => t.name).join(", ")}`,
         );
       });
 
       const unsubStatus = client.onStatusChange((event) => {
         if (event.current === "error") {
-          this._log(
-            `[${name}] error: ${event.error?.message ?? "unknown"}`,
+          log.error(
+            `error: ${event.error?.message ?? "unknown"}`,
           );
           this._toolRegistry.removeSource(name);
         } else {
-          this._log(`[${name}] ${event.current}`);
+          log.debug(`${event.current}`);
         }
       });
 
@@ -89,7 +95,7 @@ export class UpstreamManager {
           () => ({ name }),
           (err) => {
             const message = err instanceof Error ? err.message : String(err);
-            this._log(`[${name}] failed to connect: ${message}`);
+            log.error(`failed to connect: ${message}`);
             return { name, error: message };
           },
         ),
@@ -129,10 +135,6 @@ export class UpstreamManager {
 
   getClient(name: string): UpstreamClient | undefined {
     return this._clients.get(name);
-  }
-
-  private _log(message: string): void {
-    console.error(message);
   }
 
   getStatuses(): UpstreamStatus[] {

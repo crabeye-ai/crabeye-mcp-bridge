@@ -58,6 +58,7 @@ export const GlobalBridgeConfigSchema = z
     logLevel: z
       .enum(["debug", "info", "warn", "error"])
       .default("info"),
+    logFormat: z.enum(["text", "json"]).default("text"),
     maxUpstreamConnections: z.number().int().positive().default(1000),
     connectionTimeout: z.number().int().positive().default(30),
     idleTimeout: z.number().int().positive().default(600),
@@ -72,14 +73,9 @@ export const BridgeConfigSchema = z.object({
   upstreamMcpServers: z.record(z.string(), ServerConfigSchema).optional(),
   servers: z.record(z.string(), ServerConfigSchema).optional(),
   context_servers: z.record(z.string(), ServerConfigSchema).optional(),
-  _bridge: GlobalBridgeConfigSchema.default({
-    port: 19875,
-    logLevel: "info" as const,
-    maxUpstreamConnections: 1000,
-    connectionTimeout: 30,
-    idleTimeout: 600,
-    toolPolicy: "always" as const,
-  }),
+  _bridge: GlobalBridgeConfigSchema.default(
+    GlobalBridgeConfigSchema.parse({}),
+  ),
 });
 
 // --- Inferred types ---

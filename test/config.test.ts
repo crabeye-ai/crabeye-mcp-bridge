@@ -135,6 +135,7 @@ describe("schema validation", () => {
       expect(result.data._bridge).toEqual({
         port: 19875,
         logLevel: "info",
+        logFormat: "text",
         maxUpstreamConnections: 1000,
         connectionTimeout: 30,
         idleTimeout: 600,
