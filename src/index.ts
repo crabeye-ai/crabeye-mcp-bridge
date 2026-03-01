@@ -15,6 +15,13 @@ import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
+import {
+  CredentialStore,
+  CredentialSchema,
+  CredentialError,
+  createKeychainAdapter,
+  type Credential,
+} from "./credentials/index.js";
 
 function buildServerBridgeConfigs(
   upstreams: Record<string, ServerConfig>,
@@ -192,6 +199,160 @@ program
 
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
+  });
+
+// --- Credential helpers ---
+
+function readStdin(): Promise<string> {
+  const MAX_STDIN_BYTES = 1024 * 1024; // 1 MB
+  if (process.stdin.isTTY) {
+    return Promise.resolve("");
+  }
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    process.stdin.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_STDIN_BYTES) {
+        process.stdin.destroy();
+        reject(new Error("stdin input too large (max 1 MB)"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    process.stdin.on("end", () =>
+      resolve(Buffer.concat(chunks).toString("utf-8").trim()),
+    );
+    process.stdin.on("error", reject);
+  });
+}
+
+function redact(credential: Credential): Credential {
+  const mask = (value: string): string => {
+    // Tokens under 20 chars are fully masked to avoid leaking most of the value.
+    // Longer tokens show first 4 and last 4 characters.
+    if (value.length < 20) return "****";
+    return value.slice(0, 4) + "****" + value.slice(-4);
+  };
+
+  const result = { ...credential };
+  result.access_token = mask(result.access_token);
+  if ("refresh_token" in result && result.refresh_token) {
+    result.refresh_token = mask(result.refresh_token);
+  }
+  return result;
+}
+
+// --- Credential subcommand ---
+
+const credential = program
+  .command("credential")
+  .description("Manage stored credentials");
+
+credential
+  .command("set <key>")
+  .description("Store a credential (reads JSON from --value or stdin)")
+  .option("--value <json>", "credential JSON (prefer stdin to avoid process-list exposure)")
+  .action(async (key: string, options: { value?: string }) => {
+    try {
+      const json = options.value ?? await readStdin();
+      if (!json) {
+        process.stderr.write("Error: no credential provided (use --value or pipe to stdin)\n");
+        process.exitCode = 1;
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(json);
+      } catch {
+        process.stderr.write("Error: invalid JSON\n");
+        process.exitCode = 1;
+        return;
+      }
+
+      const result = CredentialSchema.safeParse(parsed);
+      if (!result.success) {
+        process.stderr.write(`Error: invalid credential: ${result.error.message}\n`);
+        process.exitCode = 1;
+        return;
+      }
+
+      const keychain = createKeychainAdapter();
+      const store = new CredentialStore({ keychain });
+      await store.set(key, result.data);
+      process.stderr.write(`Credential "${key}" stored\n`);
+    } catch (err) {
+      const message = err instanceof CredentialError ? err.message : String(err);
+      process.stderr.write(`Error: ${message}\n`);
+      process.exitCode = 1;
+    }
+  });
+
+credential
+  .command("get <key>")
+  .description("Retrieve a stored credential")
+  .option("--show-secret", "show full secret values")
+  .action(async (key: string, options: { showSecret?: boolean }) => {
+    try {
+      const keychain = createKeychainAdapter();
+      const store = new CredentialStore({ keychain });
+      const cred = await store.get(key);
+
+      if (!cred) {
+        process.stderr.write(`Credential "${key}" not found\n`);
+        process.exitCode = 1;
+        return;
+      }
+
+      const output = options.showSecret ? cred : redact(cred);
+      process.stdout.write(JSON.stringify(output, null, 2) + "\n");
+    } catch (err) {
+      const message = err instanceof CredentialError ? err.message : String(err);
+      process.stderr.write(`Error: ${message}\n`);
+      process.exitCode = 1;
+    }
+  });
+
+credential
+  .command("delete <key>")
+  .description("Delete a stored credential")
+  .action(async (key: string) => {
+    try {
+      const keychain = createKeychainAdapter();
+      const store = new CredentialStore({ keychain });
+      const deleted = await store.delete(key);
+
+      if (deleted) {
+        process.stderr.write(`Credential "${key}" deleted\n`);
+      } else {
+        process.stderr.write(`Credential "${key}" not found\n`);
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      const message = err instanceof CredentialError ? err.message : String(err);
+      process.stderr.write(`Error: ${message}\n`);
+      process.exitCode = 1;
+    }
+  });
+
+credential
+  .command("list")
+  .description("List all stored credential keys")
+  .action(async () => {
+    try {
+      const keychain = createKeychainAdapter();
+      const store = new CredentialStore({ keychain });
+      const keys = await store.list();
+
+      for (const k of keys) {
+        process.stdout.write(k + "\n");
+      }
+    } catch (err) {
+      const message = err instanceof CredentialError ? err.message : String(err);
+      process.stderr.write(`Error: ${message}\n`);
+      process.exitCode = 1;
+    }
   });
 
 program.parse();
