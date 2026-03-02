@@ -1,6 +1,7 @@
 import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
 import { isStdioServer, resolveUpstreams } from "../config/schema.js";
 import type { ConfigDiff } from "../config/config-diff.js";
+import type { CredentialStore } from "../credentials/credential-store.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
@@ -13,6 +14,7 @@ export interface UpstreamManagerOptions {
   config: BridgeConfig;
   toolRegistry: ToolRegistry;
   logger?: Logger;
+  credentialStore?: CredentialStore;
   /** Health check interval in seconds. 0 to disable. Overrides config value. */
   healthCheckInterval?: number;
   /** Injectable client factory for testing. */
@@ -59,13 +61,14 @@ export class UpstreamManager {
     this._logger = options.logger ?? createNoopLogger();
     this._healthCheckInterval =
       options.healthCheckInterval ?? options.config._bridge.healthCheckInterval;
+    const credentialStore = options.credentialStore;
     this._clientFactory =
       options._clientFactory ??
       ((name, config, logger) => {
         if (isStdioServer(config)) {
-          return new StdioUpstreamClient({ name, config, logger });
+          return new StdioUpstreamClient({ name, config, logger, credentialStore });
         }
-        return new HttpUpstreamClient({ name, config: config as HttpServerConfig, logger });
+        return new HttpUpstreamClient({ name, config: config as HttpServerConfig, logger, credentialStore });
       });
   }
 

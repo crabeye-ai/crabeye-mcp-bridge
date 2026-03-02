@@ -83,6 +83,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     this._logger.debug("connecting");
 
     try {
+      await this._prepareConnect();
       const transport = this._createTransport();
       const client = new Client(
         { name: `${APP_NAME}/${this.name}`, version: APP_VERSION },
@@ -193,6 +194,9 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     }
     return this._buildTransport();
   }
+
+  /** Async hook called before transport creation in _doConnect(). Override for async setup. */
+  protected async _prepareConnect(): Promise<void> {}
 
   /** Subclasses create the real transport here. */
   protected abstract _buildTransport(): Transport;

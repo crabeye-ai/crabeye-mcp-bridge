@@ -16,9 +16,15 @@ export const OAuth2CredentialSchema = z.object({
   expires_at: z.number().int().nonnegative().finite().optional(),
 });
 
+export const SecretCredentialSchema = z.object({
+  type: z.literal("secret"),
+  value: z.string().min(1),
+});
+
 export const CredentialSchema = z.union([
   BearerCredentialSchema,
   OAuth2CredentialSchema,
+  SecretCredentialSchema,
 ]);
 
 export const CredentialStoreFileSchema = z.object({
@@ -30,5 +36,14 @@ export const CredentialStoreFileSchema = z.object({
 
 export type BearerCredential = z.infer<typeof BearerCredentialSchema>;
 export type OAuth2Credential = z.infer<typeof OAuth2CredentialSchema>;
+export type SecretCredential = z.infer<typeof SecretCredentialSchema>;
 export type Credential = z.infer<typeof CredentialSchema>;
 export type CredentialStoreFile = z.infer<typeof CredentialStoreFileSchema>;
+
+// --- Helpers ---
+
+/** Extract the resolved string value from any credential type. */
+export function resolveCredentialValue(credential: Credential): string {
+  if (credential.type === "secret") return credential.value;
+  return credential.access_token;
+}
