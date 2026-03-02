@@ -47,7 +47,13 @@ Say your MCP client config looks like this today:
 }
 ```
 
-To use the bridge, rename `mcpServers` to `upstreamMcpServers` and add the bridge as the only entry in `mcpServers`:
+First, store your secrets in the encrypted credential store:
+
+```bash
+crabeye-mcp-bridge credential set github-pat ghp_abc123
+```
+
+Then rename `mcpServers` to `upstreamMcpServers`, add the bridge, and replace hardcoded tokens with `${credential:key}` references:
 
 ```json
 {
@@ -66,7 +72,7 @@ To use the bridge, rename `mcpServers` to `upstreamMcpServers` and add the bridg
       "command": "npx",
       "args": ["-y", "@anthropic/github-mcp-server"],
       "env": {
-        "GITHUB_TOKEN": "ghp_..."
+        "GITHUB_TOKEN": "${credential:github-pat}"
       }
     }
   }
@@ -94,7 +100,7 @@ Alternatively, you can add the bridge alongside your existing `mcpServers` entri
       "command": "npx",
       "args": ["-y", "@anthropic/github-mcp-server"],
       "env": {
-        "GITHUB_TOKEN": "ghp_..."
+        "GITHUB_TOKEN": "${credential:github-pat}"
       }
     }
   }
@@ -366,7 +372,46 @@ The assistant can then search by category: `{ "queries": [{ "category": "design"
 
 ### Authentication
 
-Static credentials (API keys, tokens) can be passed via `env` or `headers` in the server config. OAuth is not yet supported.
+Secrets belong in the encrypted credential store, not in config files. Store a secret once, then reference it with `${credential:key}` in `env` or `headers`:
+
+```bash
+# Store credentials
+crabeye-mcp-bridge credential set github-pat ghp_abc123
+crabeye-mcp-bridge credential set remote-api-key sk_live_xyz
+```
+
+```json
+{
+  "upstreamMcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/github-mcp-server"],
+      "env": { "GITHUB_TOKEN": "${credential:github-pat}" }
+    },
+    "remote-api": {
+      "url": "https://mcp.example.com/sse",
+      "type": "sse",
+      "headers": { "Authorization": "Bearer ${credential:remote-api-key}" }
+    }
+  }
+}
+```
+
+Templates are resolved on every connect and reconnect, so rotating a credential takes effect without restarting the bridge.
+
+**How it works:** Credentials are encrypted with AES-256-GCM. The master key is stored in your OS keychain (macOS Keychain, Linux secret-tool, Windows Credential Manager). Set `MCP_BRIDGE_MASTER_KEY` (64 hex chars) to use a static key instead.
+
+**CLI commands:**
+
+| Command | Description |
+|---------|-------------|
+| `credential set <key> [value]` | Store a plain string secret |
+| `credential set <key> --json '<json>'` | Store a typed credential (bearer/oauth2/secret) |
+| `credential get <key>` | Retrieve a credential (masked by default, `--show-secret` for full) |
+| `credential delete <key>` | Delete a stored credential |
+| `credential list` | List all stored credential keys |
+
+Pipe-friendly: `echo "ghp_abc123" | crabeye-mcp-bridge credential set github-pat`
 
 ### Tool policies
 
@@ -412,12 +457,16 @@ In this example, all Linear tools require confirmation except `list_issues` (run
 npx @crabeye-ai/crabeye-mcp-bridge --config <path>
 ```
 
-| Flag | Description |
-|------|-------------|
+| Flag / Subcommand | Description |
+|-------------------|-------------|
 | `-c, --config <path>` | Path to config file (required, or set `MCP_BRIDGE_CONFIG`) |
 | `--validate` | Validate config and list upstream servers, then exit |
 | `-V, --version` | Print version |
 | `-h, --help` | Print help |
+| `credential set <key> [value]` | Store a credential (plain string, `--json` for typed, or pipe stdin) |
+| `credential get <key>` | Retrieve a credential (`--show-secret` to unmask) |
+| `credential delete <key>` | Delete a stored credential |
+| `credential list` | List all stored credential keys |
 
 ### Validating your config
 

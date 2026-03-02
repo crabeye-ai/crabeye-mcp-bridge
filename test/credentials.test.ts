@@ -6,8 +6,10 @@ import { randomBytes } from "node:crypto";
 import {
   BearerCredentialSchema,
   OAuth2CredentialSchema,
+  SecretCredentialSchema,
   CredentialSchema,
   CredentialStoreFileSchema,
+  resolveCredentialValue,
   type Credential,
 } from "../src/credentials/types.js";
 import { CredentialError } from "../src/credentials/errors.js";
@@ -147,6 +149,26 @@ describe("credential schemas", () => {
     expect(result.success).toBe(false);
   });
 
+  it("validates a secret credential", () => {
+    const input = { type: "secret", value: "ghp_abc123" };
+    const result = SecretCredentialSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.type).toBe("secret");
+      expect(result.data.value).toBe("ghp_abc123");
+    }
+  });
+
+  it("rejects empty secret value", () => {
+    const result = SecretCredentialSchema.safeParse({ type: "secret", value: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects secret without value", () => {
+    const result = SecretCredentialSchema.safeParse({ type: "secret" });
+    expect(result.success).toBe(false);
+  });
+
   it("discriminated union picks correct schema", () => {
     const bearer = CredentialSchema.parse({
       type: "bearer",
@@ -164,6 +186,41 @@ describe("credential schemas", () => {
     if (oauth.type === "oauth2") {
       expect(oauth.refresh_token).toBe("ref");
     }
+
+    const secret = CredentialSchema.parse({
+      type: "secret",
+      value: "my-secret",
+    });
+    expect(secret.type).toBe("secret");
+    if (secret.type === "secret") {
+      expect(secret.value).toBe("my-secret");
+    }
+  });
+
+  it("validates a credential store file with secret type", () => {
+    const input = {
+      version: 1,
+      credentials: {
+        github: { type: "bearer", access_token: "ghp_abc" },
+        pat: { type: "secret", value: "ghp_xyz" },
+      },
+    };
+    const result = CredentialStoreFileSchema.safeParse(input);
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("resolveCredentialValue", () => {
+  it("returns access_token for bearer", () => {
+    expect(resolveCredentialValue({ type: "bearer", access_token: "tok123" })).toBe("tok123");
+  });
+
+  it("returns access_token for oauth2", () => {
+    expect(resolveCredentialValue({ type: "oauth2", access_token: "ya29.abc" })).toBe("ya29.abc");
+  });
+
+  it("returns value for secret", () => {
+    expect(resolveCredentialValue({ type: "secret", value: "my-secret" })).toBe("my-secret");
   });
 });
 
@@ -306,7 +363,7 @@ describe("CredentialStore CRUD", () => {
     await store.set("key", { type: "bearer", access_token: "old" });
     await store.set("key", { type: "bearer", access_token: "new" });
     const result = await store.get("key");
-    expect(result!.access_token).toBe("new");
+    expect(result).toEqual({ type: "bearer", access_token: "new" });
   });
 
   it("delete returns true for existing key", async () => {
@@ -581,7 +638,7 @@ describe("key auto-generation", () => {
     // Create new store instance with same keychain
     const store2 = new CredentialStore({ keychain, filePath });
     const result = await store2.get("key");
-    expect(result!.access_token).toBe("tok");
+    expect(result).toEqual({ type: "bearer", access_token: "tok" });
 
     // Key should be the same
     const key2 = await keychain.getKey();

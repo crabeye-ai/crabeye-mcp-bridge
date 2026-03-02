@@ -77,7 +77,8 @@ program
       }
 
       const toolRegistry = new ToolRegistry();
-      upstreamManager = new UpstreamManager({ config, toolRegistry, logger });
+      const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
+      upstreamManager = new UpstreamManager({ config, toolRegistry, logger, credentialStore });
 
       const serverBridgeConfigs = buildServerBridgeConfigs(upstreams);
 
@@ -235,6 +236,10 @@ function redact(credential: Credential): Credential {
     return value.slice(0, 4) + "****" + value.slice(-4);
   };
 
+  if (credential.type === "secret") {
+    return { ...credential, value: mask(credential.value) };
+  }
+
   const result = { ...credential };
   result.access_token = mask(result.access_token);
   if ("refresh_token" in result && result.refresh_token) {
@@ -250,37 +255,58 @@ const credential = program
   .description("Manage stored credentials");
 
 credential
-  .command("set <key>")
-  .description("Store a credential (reads JSON from --value or stdin)")
-  .option("--value <json>", "credential JSON (prefer stdin to avoid process-list exposure)")
-  .action(async (key: string, options: { value?: string }) => {
+  .command("set <key> [value]")
+  .description("Store a credential (plain string, --json for typed, or pipe to stdin)")
+  .option("--json <json>", "typed credential JSON (bearer/oauth2/secret)")
+  .action(async (key: string, value: string | undefined, options: { json?: string }) => {
     try {
-      const json = options.value ?? await readStdin();
-      if (!json) {
-        process.stderr.write("Error: no credential provided (use --value or pipe to stdin)\n");
-        process.exitCode = 1;
-        return;
-      }
+      let cred: Credential;
 
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(json);
-      } catch {
-        process.stderr.write("Error: invalid JSON\n");
-        process.exitCode = 1;
-        return;
-      }
-
-      const result = CredentialSchema.safeParse(parsed);
-      if (!result.success) {
-        process.stderr.write(`Error: invalid credential: ${result.error.message}\n`);
-        process.exitCode = 1;
-        return;
+      if (options.json) {
+        // --json flag: parse as typed credential
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(options.json);
+        } catch {
+          process.stderr.write("Error: invalid JSON\n");
+          process.exitCode = 1;
+          return;
+        }
+        const result = CredentialSchema.safeParse(parsed);
+        if (!result.success) {
+          process.stderr.write(`Error: invalid credential: ${result.error.message}\n`);
+          process.exitCode = 1;
+          return;
+        }
+        cred = result.data;
+      } else if (value) {
+        // Positional arg: store as simple secret
+        cred = { type: "secret", value };
+      } else {
+        // Read from stdin
+        const input = await readStdin();
+        if (!input) {
+          process.stderr.write("Error: no credential provided (pass as argument, use --json, or pipe to stdin)\n");
+          process.exitCode = 1;
+          return;
+        }
+        // Try JSON parse first; if it fails, treat as plain string
+        try {
+          const parsed = JSON.parse(input);
+          const result = CredentialSchema.safeParse(parsed);
+          if (result.success) {
+            cred = result.data;
+          } else {
+            cred = { type: "secret", value: input };
+          }
+        } catch {
+          cred = { type: "secret", value: input };
+        }
       }
 
       const keychain = createKeychainAdapter();
       const store = new CredentialStore({ keychain });
-      await store.set(key, result.data);
+      await store.set(key, cred);
       process.stderr.write(`Credential "${key}" stored\n`);
     } catch (err) {
       const message = err instanceof CredentialError ? err.message : String(err);
