@@ -45,6 +45,7 @@ program
   .version(APP_VERSION)
   .option("-c, --config <path>", "path to config file")
   .option("--validate", "validate config and list upstream servers, then exit")
+  .option("--no-stats", "suppress session_stats from search_tools responses")
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
@@ -94,6 +95,7 @@ program
         toolSearchService,
         policyEngine,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
+        showStats: options.stats,
       });
       await server.start();
 
