@@ -533,7 +533,18 @@ export class ToolSearchService {
   }
 
   getVisibleTools(): Tool[] {
-    const tools: Tool[] = [searchToolDefinition, runToolDefinition];
+    const sources = this.registry.listSources().map((s) => s.name);
+    const searchTool: Tool =
+      sources.length > 0
+        ? {
+            ...searchToolDefinition,
+            description:
+              searchToolDefinition.description +
+              `\n\nAvailable integrations: ${sources.join(", ")}`,
+          }
+        : searchToolDefinition;
+
+    const tools: Tool[] = [searchTool, runToolDefinition];
     for (const name of this.enabledTools) {
       const registered = this.registry.getTool(name);
       if (registered) {
