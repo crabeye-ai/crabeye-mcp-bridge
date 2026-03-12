@@ -124,6 +124,25 @@ The AI assistant calls `search_tools` automatically when it detects a relevant i
 
 When `search_tools` is called, the assistant receives the matching tools and their input schemas. The bridge also directly exposes the searched tools to the assistant so they can be called natively. Some assistants don't refresh their tool list mid-session, so they may not see the newly exposed tools — but they can still call them through `run_tool` and the call is executed exactly as if made directly on the original tool.
 
+Every `search_tools` response includes a `session_stats` object showing how many tokens the bridge is saving compared to exposing all upstream tool definitions directly:
+
+```json
+{
+  "session_stats": {
+    "tokens_saved": 11200,
+    "baseline_tokens": 14200,
+    "bridge_tokens": 3000
+  },
+  "results": [...]
+}
+```
+
+- **`baseline_tokens`** — estimated tokens if all upstream tool definitions were injected into context without the bridge
+- **`bridge_tokens`** — cumulative tokens used by the bridge's two meta-tools plus all search results returned so far
+- **`tokens_saved`** — the difference (baseline − bridge)
+
+Token counts are estimated using a chars/4 heuristic. Suppress this with `--no-stats`.
+
 ## Examples
 
 ### Discovering providers
@@ -461,6 +480,7 @@ npx @crabeye-ai/crabeye-mcp-bridge --config <path>
 |-------------------|-------------|
 | `-c, --config <path>` | Path to config file (required, or set `MCP_BRIDGE_CONFIG`) |
 | `--validate` | Validate config and list upstream servers, then exit |
+| `--no-stats` | Suppress `session_stats` from `search_tools` responses |
 | `-V, --version` | Print version |
 | `-h, --help` | Print help |
 | `credential set <key> [value]` | Store a credential (plain string, `--json` for typed, or pipe stdin) |

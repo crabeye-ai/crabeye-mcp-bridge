@@ -16,9 +16,12 @@ import {
   ToolSearchService,
   SEARCH_TOOL_NAME,
   RUN_TOOL_NAME,
+  searchToolDefinition,
+  runToolDefinition,
 } from "../search/index.js";
 import type { SearchToolsParams } from "../search/index.js";
 import type { PolicyEngine } from "../policy/index.js";
+import { SessionStats } from "./session-stats.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 
 export interface BridgeServerOptions {
@@ -28,6 +31,7 @@ export interface BridgeServerOptions {
   toolSearchService?: ToolSearchService;
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
+  showStats?: boolean;
 }
 
 export class BridgeServer {
@@ -35,6 +39,7 @@ export class BridgeServer {
   private toolRegistry: ToolRegistry;
   private toolSearchService: ToolSearchService | undefined;
   private policyEngine: PolicyEngine | undefined;
+  private sessionStats: SessionStats | undefined;
   private unsubscribe: (() => void) | undefined;
   private options: BridgeServerOptions;
 
@@ -43,6 +48,14 @@ export class BridgeServer {
     this.toolRegistry = options?.toolRegistry ?? new ToolRegistry();
     this.toolSearchService = options?.toolSearchService;
     this.policyEngine = options?.policyEngine;
+
+    const showStats = options?.showStats !== false;
+    if (showStats && this.toolSearchService) {
+      this.sessionStats = new SessionStats(
+        this.toolRegistry,
+        [searchToolDefinition, runToolDefinition],
+      );
+    }
 
     const instructions = [
       "This MCP bridge connects you to many external tools and services.",
@@ -114,8 +127,14 @@ export class BridgeServer {
         }
 
         const result = this.toolSearchService.search(params);
+        let response: object = result;
+        if (this.sessionStats) {
+          const responseJson = JSON.stringify(result);
+          this.sessionStats.recordSearchResponse(responseJson);
+          response = { session_stats: this.sessionStats.getSnapshot(), ...result };
+        }
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
+          content: [{ type: "text" as const, text: JSON.stringify(response) }],
         };
       }
 
@@ -235,6 +254,7 @@ export class BridgeServer {
   async close(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.sessionStats?.dispose();
     await this.server.close();
   }
 
