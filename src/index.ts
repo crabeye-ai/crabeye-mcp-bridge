@@ -9,6 +9,7 @@ import {
 import { resolveUpstreams, isStdioServer } from "./config/schema.js";
 import type { ServerBridgeConfig, ServerConfig, HttpServerConfig } from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
+import { RateLimiter } from "./server/rate-limiter.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { ToolSearchService } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
@@ -51,6 +52,7 @@ program
     let upstreamManager: UpstreamManager | undefined;
     let toolSearchService: ToolSearchService | undefined;
     let configWatcher: ConfigWatcher | undefined;
+    const rateLimiters = new Map<string, RateLimiter>();
 
     try {
       const configPath = resolveConfigPath({ configPath: options.config });
@@ -90,11 +92,18 @@ program
 
       toolSearchService = new ToolSearchService(toolRegistry, policyEngine);
 
+      for (const [name, serverConfig] of Object.entries(upstreams)) {
+        if (serverConfig._bridge?.rateLimit) {
+          rateLimiters.set(name, new RateLimiter(serverConfig._bridge.rateLimit));
+        }
+      }
+
       server = new BridgeServer({
         toolRegistry,
         toolSearchService,
         policyEngine,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
+        getRateLimiter: (name) => rateLimiters.get(name),
         showStats: options.stats,
       });
       await server.start();
@@ -125,11 +134,33 @@ program
         }
 
         // Always update the policy engine with the full new state
-        const newBridgeConfigs = buildServerBridgeConfigs(resolveUpstreams(newConfig));
+        const newUpstreams = resolveUpstreams(newConfig);
+        const newBridgeConfigs = buildServerBridgeConfigs(newUpstreams);
         policyEngine.update(newConfig._bridge.toolPolicy, newBridgeConfigs);
 
         if (diff.bridge.toolPolicy) {
           logger.info(`tool policy changed to ${diff.bridge.toolPolicy}`, { component: "reload" });
+        }
+
+        // Update rate limiters from new config
+        for (const [name, serverConfig] of Object.entries(newUpstreams)) {
+          const rl = serverConfig._bridge?.rateLimit;
+          const existing = rateLimiters.get(name);
+          if (rl && existing) {
+            existing.reconfigure(rl);
+          } else if (rl) {
+            rateLimiters.set(name, new RateLimiter(rl));
+          } else if (existing) {
+            existing.dispose();
+            rateLimiters.delete(name);
+          }
+        }
+        // Remove rate limiters for servers no longer in config
+        for (const name of rateLimiters.keys()) {
+          if (!(name in newUpstreams)) {
+            rateLimiters.get(name)!.dispose();
+            rateLimiters.delete(name);
+          }
         }
 
         // Server-level changes
@@ -188,6 +219,10 @@ program
       try {
         configWatcher?.stop();
         toolSearchService?.dispose();
+        for (const rl of rateLimiters.values()) {
+          rl.dispose();
+        }
+        rateLimiters.clear();
         if (upstreamManager) {
           await upstreamManager.closeAll();
         }

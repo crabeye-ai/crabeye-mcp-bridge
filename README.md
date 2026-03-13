@@ -470,6 +470,31 @@ Policies cascade in this order (first match wins):
 
 In this example, all Linear tools require confirmation except `list_issues` (runs freely) and `delete_issue` (blocked). Tools from other servers use the global default (`"always"`).
 
+### Rate limiting
+
+Prevent the bridge from exceeding upstream API quotas by setting per-server rate limits. When the limit is hit, calls wait in a FIFO queue until the sliding window opens — the LLM just sees slightly higher latency instead of an error.
+
+```json
+{
+  "upstreamMcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/github-mcp-server"],
+      "_bridge": {
+        "rateLimit": {
+          "maxCalls": 30,
+          "windowSeconds": 60
+        }
+      }
+    }
+  }
+}
+```
+
+In this example, the bridge allows at most 30 tool calls to the `github` server per 60-second sliding window. If a 31st call arrives before the window slides, it waits until a slot opens. If the wait exceeds 30 seconds, the call fails with an error.
+
+Rate limit configuration is hot-reloadable — changes take effect without restarting the bridge.
+
 ## CLI
 
 ```
