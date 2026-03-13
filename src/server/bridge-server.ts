@@ -22,6 +22,7 @@ import {
 import type { SearchToolsParams } from "../search/index.js";
 import type { PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
+import type { RateLimiter } from "./rate-limiter.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 
 export interface BridgeServerOptions {
@@ -31,6 +32,7 @@ export interface BridgeServerOptions {
   toolSearchService?: ToolSearchService;
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
+  getRateLimiter?: (name: string) => RateLimiter | undefined;
   showStats?: boolean;
 }
 
@@ -223,6 +225,16 @@ export class BridgeServer {
         ErrorCode.InternalError,
         `Upstream server "${parsed.source}" is not connected (status: ${client.status})`,
       );
+    }
+
+    const rateLimiter = this.options.getRateLimiter?.(parsed.source);
+    if (rateLimiter) {
+      try {
+        await rateLimiter.acquire();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new McpError(ErrorCode.InternalError, message);
+      }
     }
 
     try {

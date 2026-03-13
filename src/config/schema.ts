@@ -17,12 +17,18 @@ export const ServerOAuthConfigSchema = z.object({
   scopes: z.array(z.string()).optional(),
 });
 
+export const RateLimitConfigSchema = z.object({
+  maxCalls: z.number().int().positive(),
+  windowSeconds: z.number().int().positive(),
+});
+
 export const ServerBridgeConfigSchema = z
   .object({
     auth: ServerOAuthConfigSchema.optional(),
     toolPolicy: ToolPolicySchema.optional(),
     tools: z.record(z.string(), ToolPolicySchema).optional(),
     category: z.string().optional(),
+    rateLimit: RateLimitConfigSchema.optional(),
   })
   .strict();
 
@@ -82,6 +88,7 @@ export const BridgeConfigSchema = z.object({
 // --- Inferred types ---
 
 export type ToolPolicy = z.infer<typeof ToolPolicySchema>;
+export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
 export type ServerOAuthConfig = z.infer<typeof ServerOAuthConfigSchema>;
 export type ServerBridgeConfig = z.infer<typeof ServerBridgeConfigSchema>;
 export type StdioServerConfig = z.infer<typeof StdioServerConfigSchema>;
