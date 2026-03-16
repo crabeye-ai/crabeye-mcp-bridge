@@ -22,6 +22,7 @@ import {
 import type { SearchToolsParams } from "../search/index.js";
 import type { PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
+import type { SessionStatsSnapshot } from "./session-stats.js";
 import type { RateLimiter } from "./rate-limiter.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 
@@ -34,6 +35,7 @@ export interface BridgeServerOptions {
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
   getRateLimiter?: (name: string) => RateLimiter | undefined;
   showStats?: boolean;
+  onSearchStats?: (stats: SessionStatsSnapshot) => void;
 }
 
 export class BridgeServer {
@@ -51,8 +53,7 @@ export class BridgeServer {
     this.toolSearchService = options?.toolSearchService;
     this.policyEngine = options?.policyEngine;
 
-    const showStats = options?.showStats !== false;
-    if (showStats && this.toolSearchService) {
+    if (this.toolSearchService) {
       this.sessionStats = new SessionStats(
         this.toolRegistry,
         [searchToolDefinition, runToolDefinition],
@@ -133,7 +134,11 @@ export class BridgeServer {
         if (this.sessionStats) {
           const responseJson = JSON.stringify(result);
           this.sessionStats.recordSearchResponse(responseJson);
-          response = { session_stats: this.sessionStats.getSnapshot(), ...result };
+          const snapshot = this.sessionStats.getSnapshot();
+          if (this.options.showStats) {
+            response = { session_stats: snapshot, ...result };
+          }
+          this.options.onSearchStats?.(snapshot);
         }
         return {
           content: [{ type: "text" as const, text: JSON.stringify(response) }],

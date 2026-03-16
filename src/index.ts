@@ -46,7 +46,7 @@ program
   .version(APP_VERSION)
   .option("-c, --config <path>", "path to config file")
   .option("--validate", "validate config and list upstream servers, then exit")
-  .option("--no-stats", "suppress session_stats from search_tools responses")
+  .option("--stats", "include session_stats in search_tools responses")
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
@@ -104,7 +104,13 @@ program
         policyEngine,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
         getRateLimiter: (name) => rateLimiters.get(name),
-        showStats: options.stats,
+        showStats: options.stats === true,
+        onSearchStats: (stats) => {
+          logger.info(
+            `tokens saved: ${stats.tokens_saved.toLocaleString()} (baseline: ${stats.baseline_tokens.toLocaleString()}, bridge: ${stats.bridge_tokens.toLocaleString()})`,
+            { component: "stats" },
+          );
+        },
       });
       await server.start();
 
