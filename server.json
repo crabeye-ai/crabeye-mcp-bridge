@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.crabeye-ai/crabeye-mcp-bridge",
-  "description": "Aggregate multiple MCP servers behind a single STDIO interface with fuzzy tool search, namespacing, and execution policies. One connection, two meta-tools (search_tools + run_tool), thousands of tools ready without bloating the context window.",
+  "description": "One MCP connection for all your tools — with discovery, namespacing, and execution policies.",
   "repository": {
     "url": "https://github.com/crabeye-ai/crabeye-mcp-bridge",
     "source": "github"
   },
-  "version": "0.5.0",
+  "version": "1.0.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@crabeye-ai/crabeye-mcp-bridge",
-      "version": "0.5.0",
+      "version": "1.0.0",
       "transport": {
         "type": "stdio"
       }
