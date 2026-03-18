@@ -1,7 +1,12 @@
 {
   "name": "@crabeye-ai/crabeye-mcp-bridge",
   "version": "0.5.0",
+  "mcpName": "io.github.crabeye-ai/crabeye-mcp-bridge",
   "description": "Aggregate multiple MCP servers behind a single STDIO interface. Connect your AI assistant to one bridge instead of configuring each server individually. Supports STDIO and HTTP upstream servers with built-in tool search and discovery.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crabeye-ai/crabeye-mcp-bridge.git"
+  },
   "type": "module",
   "bin": {
     "crabeye-mcp-bridge": "./bin/crabeye-mcp-bridge"
