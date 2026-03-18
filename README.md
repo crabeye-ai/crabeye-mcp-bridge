@@ -495,6 +495,18 @@ In this example, the bridge allows at most 30 tool calls to the `github` server 
 
 Rate limit configuration is hot-reloadable — changes take effect without restarting the bridge.
 
+### Discovery mode
+
+Control how searched tools are surfaced to the assistant with `--discovery-mode`:
+
+- **`both`** (default) — Search results include tool names, descriptions, and full input schemas. Matching tools are also added to the MCP tools list so the assistant can call them directly.
+- **`search`** — Search results include full tool details, but tools are NOT added to the MCP tools list. The assistant must use `run_tool` to execute them. Use this when your client doesn't handle dynamic tool list changes well.
+- **`tools_list`** — Matching tools are added to the MCP tools list with full schemas, but search results omit `input_schema` to avoid duplication. The assistant calls discovered tools directly by their namespaced name, or via `run_tool`.
+
+```bash
+npx @crabeye-ai/crabeye-mcp-bridge --config config.json --discovery-mode search
+```
+
 ## CLI
 
 ```
@@ -506,6 +518,7 @@ npx @crabeye-ai/crabeye-mcp-bridge --config <path>
 | `-c, --config <path>` | Path to config file (required, or set `MCP_BRIDGE_CONFIG`) |
 | `--validate` | Validate config and list upstream servers, then exit |
 | `--stats` | Include `session_stats` in `search_tools` responses (always logged to stderr) |
+| `--discovery-mode <mode>` | How searched tools are surfaced: `search`, `tools_list`, or `both` (default) |
 | `-V, --version` | Print version |
 | `-h, --help` | Print help |
 | `credential set <key> [value]` | Store a credential (plain string, `--json` for typed, or pipe stdin) |

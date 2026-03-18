@@ -56,6 +56,8 @@ interface IndexedTool {
   category: string;
 }
 
+export type DiscoveryMode = "search" | "tools_list" | "both";
+
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 10;
 const SCORE_CUTOFF = 0.3;
@@ -217,9 +219,12 @@ export class ToolSearchService {
   private unsubscribeRegistry: () => void;
   private policyEngine: PolicyEngine | undefined;
 
-  constructor(registry: ToolRegistry, policyEngine?: PolicyEngine) {
+  private discoveryMode: DiscoveryMode;
+
+  constructor(registry: ToolRegistry, policyEngine?: PolicyEngine, discoveryMode: DiscoveryMode = "both") {
     this.registry = registry;
     this.policyEngine = policyEngine;
+    this.discoveryMode = discoveryMode;
     this.index = this.createIndex();
     this.rebuildIndex();
     this.unsubscribeRegistry = this.registry.onChanged(() => {
@@ -518,15 +523,31 @@ export class ToolSearchService {
       }
     }
 
-    // Cap total enabled tools at MAX_LIMIT
-    const cappedEnabled = allEnabled.slice(0, MAX_LIMIT);
+    // In "search" mode, don't populate enabledTools (tools only appear in search responses).
+    // In "tools_list" and "both" modes, expose searched tools in the MCP tools list.
+    if (this.discoveryMode !== "search") {
+      const cappedEnabled = allEnabled.slice(0, MAX_LIMIT);
+      const newEnabled = new Set(cappedEnabled);
+      const changed = !setsEqual(this.enabledTools, newEnabled);
+      this.enabledTools = newEnabled;
 
-    const newEnabled = new Set(cappedEnabled);
-    const changed = !setsEqual(this.enabledTools, newEnabled);
-    this.enabledTools = newEnabled;
+      if (changed) {
+        this.notifyVisibleToolsChanged();
+      }
+    }
 
-    if (changed) {
-      this.notifyVisibleToolsChanged();
+    // In "tools_list" mode, strip input_schema from search results
+    // (the assistant gets schemas from the tools list instead).
+    if (this.discoveryMode === "tools_list") {
+      for (const queryResult of results) {
+        for (const provider of queryResult.providers) {
+          for (const tool of provider.tools) {
+            if (!tool.disabled) {
+              tool.input_schema = {};
+            }
+          }
+        }
+      }
     }
 
     return { results };
@@ -544,7 +565,15 @@ export class ToolSearchService {
           }
         : searchToolDefinition;
 
-    const tools: Tool[] = [searchTool, runToolDefinition];
+    const runTool: Tool = this.enabledTools.size > 0
+      ? {
+          ...runToolDefinition,
+          description: runToolDefinition.description +
+            "\nYou can also call the discovered tools directly by their namespaced name.",
+        }
+      : runToolDefinition;
+
+    const tools: Tool[] = [searchTool, runTool];
     for (const name of this.enabledTools) {
       const registered = this.registry.getTool(name);
       if (registered) {

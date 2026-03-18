@@ -1,4 +1,4 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import {
   loadConfig,
   ConfigError,
@@ -12,6 +12,7 @@ import { BridgeServer } from "./server/index.js";
 import { RateLimiter } from "./server/rate-limiter.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { ToolSearchService } from "./search/index.js";
+import type { DiscoveryMode } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
@@ -47,6 +48,12 @@ program
   .option("-c, --config <path>", "path to config file")
   .option("--validate", "validate config and list upstream servers, then exit")
   .option("--stats", "include session_stats in search_tools responses")
+  .addOption(
+    new Option(
+      "--discovery-mode <mode>",
+      "how searched tools are surfaced: search (response only), tools_list (native MCP tools list only), both (default)",
+    ).choices(["search", "tools_list", "both"]).default("both"),
+  )
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
@@ -90,7 +97,8 @@ program
         serverBridgeConfigs,
       );
 
-      toolSearchService = new ToolSearchService(toolRegistry, policyEngine);
+      const discoveryMode = options.discoveryMode as DiscoveryMode;
+      toolSearchService = new ToolSearchService(toolRegistry, policyEngine, discoveryMode);
 
       for (const [name, serverConfig] of Object.entries(upstreams)) {
         if (serverConfig._bridge?.rateLimit) {
