@@ -81,7 +81,7 @@ Then rename `mcpServers` to `upstreamMcpServers`, add the bridge, and replace ha
 
 That's it. Your AI assistant now has access to all tools from all configured servers through a single connection. The bridge automatically excludes itself from `mcpServers` to avoid recursion, so pointing `--config` at the same file is safe.
 
-The bridge also reads `servers` (VS Code Copilot) and `context_servers` (Zed) as input keys. On duplicate names, earlier sources win: `upstreamMcpServers` > `servers` > `context_servers` > `mcpServers`. Self-exclusion applies to `mcpServers` and `context_servers`.
+The bridge also reads `upstreamServers` (shorthand), `servers` (VS Code Copilot), and `context_servers` (Zed) as input keys. On duplicate names, earlier sources win: `upstreamMcpServers` > `upstreamServers` > `servers` > `context_servers` > `mcpServers`. Self-exclusion applies to `mcpServers` and `context_servers`.
 
 Alternatively, you can add the bridge alongside your existing `mcpServers` entries without renaming anything:
 

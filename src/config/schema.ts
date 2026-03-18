@@ -78,6 +78,7 @@ export const GlobalBridgeConfigSchema = z
 export const BridgeConfigSchema = z.object({
   mcpServers: z.record(z.string(), ServerConfigSchema).default({}),
   upstreamMcpServers: z.record(z.string(), ServerConfigSchema).optional(),
+  upstreamServers: z.record(z.string(), ServerConfigSchema).optional(),
   servers: z.record(z.string(), ServerConfigSchema).optional(),
   context_servers: z.record(z.string(), ServerConfigSchema).optional(),
   _bridge: GlobalBridgeConfigSchema.default(
@@ -104,7 +105,7 @@ export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
  *
  * Returns the union of all present config keys. On duplicate names,
  * earlier sources win:
- * `upstreamMcpServers` > `servers` > `context_servers` > `mcpServers`.
+ * `upstreamMcpServers` > `upstreamServers` > `servers` > `context_servers` > `mcpServers`.
  *
  * Self-exclusion: entries from `mcpServers` and `context_servers` whose
  * `command` or `args` contain the app name are filtered out.
@@ -141,6 +142,11 @@ export function resolveUpstreams(
   // servers (above context_servers)
   if (config.servers) {
     Object.assign(result, config.servers);
+  }
+
+  // upstreamServers (above servers)
+  if (config.upstreamServers) {
+    Object.assign(result, config.upstreamServers);
   }
 
   // upstreamMcpServers (highest priority)
