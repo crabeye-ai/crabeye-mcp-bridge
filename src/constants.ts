@@ -3,3 +3,4 @@ export const APP_VERSION = "0.1.0";
 
 export const CREDENTIALS_DIR = `.${APP_NAME}`;
 export const CREDENTIALS_FILENAME = "credentials.enc";
+export const BRIDGE_CONFIG_FILENAME = "config.json";

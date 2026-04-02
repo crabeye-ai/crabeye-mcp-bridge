@@ -35,3 +35,21 @@ export type { ConfigDiff } from "./config-diff.js";
 
 export { ConfigWatcher } from "./config-watcher.js";
 export type { ConfigWatcherOptions } from "./config-watcher.js";
+
+export { parseJsoncString } from "./jsonc.js";
+
+export { deepMerge } from "./deep-merge.js";
+
+export {
+  BridgeOwnedConfigSchema,
+  loadBridgeOwnedConfig,
+  saveBridgeOwnedConfig,
+  getBridgeConfigPath,
+} from "./bridge-config.js";
+export type { BridgeOwnedConfig } from "./bridge-config.js";
+
+export { discoverMcpConfigs } from "./discovery.js";
+export type { McpConfigEntry } from "./discovery.js";
+
+export { loadMergedConfig } from "./merged-loader.js";
+export type { MergedLoaderOptions, MergedLoaderResult } from "./merged-loader.js";

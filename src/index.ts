@@ -6,6 +6,7 @@ import {
   diffConfigs,
   ConfigWatcher,
 } from "./config/index.js";
+import { loadMergedConfig } from "./config/merged-loader.js";
 import { resolveUpstreams, isStdioServer } from "./config/schema.js";
 import type { ServerBridgeConfig, ServerConfig, HttpServerConfig } from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
@@ -62,8 +63,24 @@ program
     const rateLimiters = new Map<string, RateLimiter>();
 
     try {
-      const configPath = resolveConfigPath({ configPath: options.config });
-      let config = await loadConfig({ configPath });
+      // Config resolution: --config / MCP_BRIDGE_CONFIG → single-file load,
+      // otherwise try merged loader (bridge-owned config + client configs).
+      const explicitPath = options.config || process.env.MCP_BRIDGE_CONFIG;
+      let config: Awaited<ReturnType<typeof loadMergedConfig>>["config"];
+      let watchPaths: string[];
+
+      if (explicitPath) {
+        // Backwards-compatible: explicit path provided
+        const configPath = resolveConfigPath({ configPath: options.config });
+        config = await loadConfig({ configPath });
+        watchPaths = [configPath];
+      } else {
+        // Try merged loader (bridge-owned config + client configs)
+        const merged = await loadMergedConfig();
+        config = merged.config;
+        watchPaths = merged.watchPaths;
+      }
+
       const upstreams = resolveUpstreams(config);
 
       const logger = createLogger({
@@ -210,7 +227,17 @@ program
       }).finally(() => {
         // Start config watching after initial connections settle to avoid
         // race conditions between connectAll and applyConfigDiff.
-        configWatcher = new ConfigWatcher({ configPath, logger });
+        configWatcher = new ConfigWatcher({
+          configPaths: watchPaths,
+          loadConfig: async () => {
+            if (explicitPath) {
+              return loadConfig({ configPath: explicitPath });
+            }
+            const merged = await loadMergedConfig();
+            return merged.config;
+          },
+          logger,
+        });
         configWatcher.start(onConfigReload, config);
       });
     } catch (err) {
@@ -430,6 +457,24 @@ credential
       process.stderr.write(`Error: ${message}\n`);
       process.exitCode = 1;
     }
+  });
+
+// --- Init / Restore subcommands ---
+
+program
+  .command("init")
+  .description("Discover MCP client configs and set up the bridge")
+  .action(async () => {
+    const { runInit } = await import("./commands/init.js");
+    await runInit();
+  });
+
+program
+  .command("restore")
+  .description("Remove the bridge from client configs and restore originals")
+  .action(async () => {
+    const { runRestore } = await import("./commands/restore.js");
+    await runRestore();
   });
 
 program.parse();
