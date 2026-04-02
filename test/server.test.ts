@@ -315,11 +315,11 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("throws error when upstream is disconnected", async () => {
+  it("throws immediately when upstream has permanently failed", async () => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
 
-    const mockClient = makeMockUpstreamClient("srv", { status: "disconnected" });
+    const mockClient = makeMockUpstreamClient("srv", { status: "error" });
 
     const { client, cleanup } = await createTestPair({
       registry,
@@ -328,7 +328,76 @@ describe("tools/call", () => {
 
     await expect(
       client.callTool({ name: "srv__my-tool", arguments: {} }),
-    ).rejects.toThrow(/not connected/);
+    ).rejects.toThrow(/failed permanently/);
+
+    await cleanup();
+  });
+
+  it("waits for reconnection and succeeds when server comes back", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+
+    const statusListeners = new Set<(event: { previous: string; current: string }) => void>();
+    const mockClient = makeMockUpstreamClient("srv", {
+      status: "disconnected",
+      callTool: vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "ok" }],
+      }),
+      onStatusChange: vi.fn((cb) => {
+        statusListeners.add(cb);
+        return () => { statusListeners.delete(cb); };
+      }),
+    });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    // Start the tool call — it will wait for reconnection
+    const callPromise = client.callTool({ name: "srv__my-tool", arguments: {} });
+
+    // Simulate reconnection after a short delay
+    await new Promise((r) => setTimeout(r, 50));
+    (mockClient as { status: string }).status = "connected";
+    for (const cb of statusListeners) {
+      cb({ previous: "disconnected", current: "connected" });
+    }
+
+    const result = await callPromise;
+    expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+
+    await cleanup();
+  });
+
+  it("waits for reconnection and fails when server goes to error", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+
+    const statusListeners = new Set<(event: { previous: string; current: string }) => void>();
+    const mockClient = makeMockUpstreamClient("srv", {
+      status: "disconnected",
+      onStatusChange: vi.fn((cb) => {
+        statusListeners.add(cb);
+        return () => { statusListeners.delete(cb); };
+      }),
+    });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    const callPromise = client.callTool({ name: "srv__my-tool", arguments: {} });
+
+    // Simulate permanent failure after a short delay
+    await new Promise((r) => setTimeout(r, 50));
+    (mockClient as { status: string }).status = "error";
+    for (const cb of statusListeners) {
+      cb({ previous: "disconnected", current: "error" });
+    }
+
+    await expect(callPromise).rejects.toThrow(/failed permanently/);
 
     await cleanup();
   });

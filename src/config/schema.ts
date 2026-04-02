@@ -22,6 +22,12 @@ export const RateLimitConfigSchema = z.object({
   windowSeconds: z.number().int().positive(),
 });
 
+export const ReconnectConfigSchema = z.object({
+  maxReconnectAttempts: z.number().int().min(0).optional(),
+  reconnectBaseDelay: z.number().int().positive().optional(),
+  reconnectMaxDelay: z.number().int().positive().optional(),
+});
+
 export const ServerBridgeConfigSchema = z
   .object({
     auth: ServerOAuthConfigSchema.optional(),
@@ -29,6 +35,7 @@ export const ServerBridgeConfigSchema = z
     tools: z.record(z.string(), ToolPolicySchema).optional(),
     category: z.string().optional(),
     rateLimit: RateLimitConfigSchema.optional(),
+    reconnect: ReconnectConfigSchema.optional(),
   })
   .strict();
 
@@ -70,6 +77,7 @@ export const GlobalBridgeConfigSchema = z
     idleTimeout: z.number().int().positive().default(600),
     healthCheckInterval: z.number().int().min(0).default(30),
     toolPolicy: ToolPolicySchema.default("always"),
+    reconnect: ReconnectConfigSchema.optional(),
   })
   .strict();
 
@@ -90,6 +98,7 @@ export const BridgeConfigSchema = z.object({
 
 export type ToolPolicy = z.infer<typeof ToolPolicySchema>;
 export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
+export type ReconnectConfig = z.infer<typeof ReconnectConfigSchema>;
 export type ServerOAuthConfig = z.infer<typeof ServerOAuthConfigSchema>;
 export type ServerBridgeConfig = z.infer<typeof ServerBridgeConfigSchema>;
 export type StdioServerConfig = z.infer<typeof StdioServerConfigSchema>;

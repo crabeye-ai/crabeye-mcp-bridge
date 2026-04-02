@@ -38,6 +38,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   private _reconnectMaxDelay: number;
   private _transportFactory: (() => Transport) | undefined;
   protected _logger: Logger;
+  protected _currentTransport: Transport | undefined;
   private _statusListeners = new Set<StatusChangeCallback>();
   private _toolsListeners = new Set<ToolsChangedCallback>();
 
@@ -76,6 +77,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     if (this._client) {
       const old = this._client;
       this._client = undefined;
+      this._currentTransport = undefined;
       await old.close().catch(() => {});
     }
 
@@ -85,6 +87,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     try {
       await this._prepareConnect();
       const transport = this._createTransport();
+      this._currentTransport = transport;
       const client = new Client(
         { name: `${APP_NAME}/${this.name}`, version: APP_VERSION },
         {
@@ -104,6 +107,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       transport.onclose = () => {
         if (this._closed || this._epoch !== myEpoch) return;
         this._client = undefined;
+        this._currentTransport = undefined;
         this._setStatus("disconnected");
         this._scheduleReconnect();
       };
@@ -113,8 +117,12 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       const result = await client.listTools();
       this._tools = result.tools;
       this._client = client;
+      if (this._reconnectAttempt > 0) {
+        this._logger.info("reconnected", { attempts: this._reconnectAttempt });
+      }
       this._reconnectAttempt = 0;
       this._setStatus("connected");
+      this._afterConnect(transport);
       this._notifyToolsChanged();
     } catch (err) {
       this._logger.debug("connection failed", {
@@ -144,6 +152,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     if (this._client) {
       const client = this._client;
       this._client = undefined;
+      this._currentTransport = undefined;
       await client.close();
     }
 
@@ -198,6 +207,9 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   /** Async hook called before transport creation in _doConnect(). Override for async setup. */
   protected async _prepareConnect(): Promise<void> {}
 
+  /** Hook called after a successful connection. Override in subclasses for post-connect setup. */
+  protected _afterConnect(_transport: Transport): void {}
+
   /** Subclasses create the real transport here. */
   protected abstract _buildTransport(): Transport;
 
@@ -246,7 +258,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._reconnectMaxDelay,
     );
     this._reconnectAttempt++;
-    this._logger.debug(`reconnecting in ${delay}ms`, { attempt: this._reconnectAttempt });
+    this._logger.info(`reconnecting in ${delay}ms`, { attempt: this._reconnectAttempt });
 
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = undefined;

@@ -62,13 +62,20 @@ export class UpstreamManager {
     this._healthCheckInterval =
       options.healthCheckInterval ?? options.config._bridge.healthCheckInterval;
     const credentialStore = options.credentialStore;
+    const globalReconnect = options.config._bridge.reconnect;
     this._clientFactory =
       options._clientFactory ??
       ((name, config, logger) => {
+        const serverReconnect = config._bridge?.reconnect;
+        const reconnectOpts = {
+          maxReconnectAttempts: serverReconnect?.maxReconnectAttempts ?? globalReconnect?.maxReconnectAttempts,
+          reconnectBaseDelay: serverReconnect?.reconnectBaseDelay ?? globalReconnect?.reconnectBaseDelay,
+          reconnectMaxDelay: serverReconnect?.reconnectMaxDelay ?? globalReconnect?.reconnectMaxDelay,
+        };
         if (isStdioServer(config)) {
-          return new StdioUpstreamClient({ name, config, logger, credentialStore });
+          return new StdioUpstreamClient({ name, config, logger, credentialStore, ...reconnectOpts });
         }
-        return new HttpUpstreamClient({ name, config: config as HttpServerConfig, logger, credentialStore });
+        return new HttpUpstreamClient({ name, config: config as HttpServerConfig, logger, credentialStore, ...reconnectOpts });
       });
   }
 
