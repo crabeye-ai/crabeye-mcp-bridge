@@ -24,7 +24,10 @@ import type { PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
 import type { SessionStatsSnapshot } from "./session-stats.js";
 import type { RateLimiter } from "./rate-limiter.js";
+import type { Logger } from "../logging/index.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
+
+const WAIT_FOR_RESPAWN_MS = 60_000;
 
 export interface BridgeServerOptions {
   stdin?: Readable;
@@ -34,6 +37,7 @@ export interface BridgeServerOptions {
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
   getRateLimiter?: (name: string) => RateLimiter | undefined;
+  logger?: Logger;
   showStats?: boolean;
   onSearchStats?: (stats: SessionStatsSnapshot) => void;
 }
@@ -226,10 +230,38 @@ export class BridgeServer {
     }
 
     if (client.status !== "connected") {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Upstream server "${parsed.source}" is not connected (status: ${client.status})`,
-      );
+      if (client.status === "error") {
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
+        );
+      }
+
+      // Server is reconnecting — wait for it
+      this.options.logger?.info("waiting for server to reconnect", {
+        component: "bridge",
+        server: parsed.source,
+      });
+
+      const reconnected = await this.waitForReconnect(client);
+
+      if (!reconnected) {
+        if (client.status === "error") {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
+          );
+        }
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Upstream server "${parsed.source}" did not reconnect within ${WAIT_FOR_RESPAWN_MS / 1000}s. Please retry in 30 seconds.`,
+        );
+      }
+
+      this.options.logger?.info("server reconnected, executing tool call", {
+        component: "bridge",
+        server: parsed.source,
+      });
     }
 
     const rateLimiter = this.options.getRateLimiter?.(parsed.source);
@@ -254,6 +286,37 @@ export class BridgeServer {
         `Upstream server "${parsed.source}" error: ${message}`,
       );
     }
+  }
+
+  private waitForReconnect(client: UpstreamClient): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      // Edge case: status changed between the check and subscribing
+      if (client.status === "connected") {
+        resolve(true);
+        return;
+      }
+      if (client.status === "error") {
+        resolve(false);
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        unsubscribe();
+        resolve(false);
+      }, WAIT_FOR_RESPAWN_MS);
+
+      const unsubscribe = client.onStatusChange((event) => {
+        if (event.current === "connected") {
+          clearTimeout(timeout);
+          unsubscribe();
+          resolve(true);
+        } else if (event.current === "error") {
+          clearTimeout(timeout);
+          unsubscribe();
+          resolve(false);
+        }
+      });
+    });
   }
 
   async connect(transport: Transport): Promise<void> {

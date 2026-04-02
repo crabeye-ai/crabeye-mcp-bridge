@@ -295,6 +295,69 @@ describe("invalid configs", () => {
     const result = BridgeConfigSchema.safeParse(input);
     expect(result.success).toBe(false);
   });
+
+  it("accepts reconnect config in global _bridge", () => {
+    const input = {
+      mcpServers: { s: { command: "node" } },
+      _bridge: { reconnect: { maxReconnectAttempts: 10, reconnectBaseDelay: 2000, reconnectMaxDelay: 60000 } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data._bridge.reconnect).toEqual({
+        maxReconnectAttempts: 10,
+        reconnectBaseDelay: 2000,
+        reconnectMaxDelay: 60000,
+      });
+    }
+  });
+
+  it("accepts reconnect config in server-level _bridge", () => {
+    const input = {
+      mcpServers: {
+        s: {
+          command: "node",
+          _bridge: { reconnect: { maxReconnectAttempts: 3 } },
+        },
+      },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.mcpServers.s._bridge?.reconnect?.maxReconnectAttempts).toBe(3);
+    }
+  });
+
+  it("accepts partial reconnect config", () => {
+    const input = {
+      mcpServers: { s: { command: "node" } },
+      _bridge: { reconnect: { reconnectMaxDelay: 120000 } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data._bridge.reconnect?.reconnectMaxDelay).toBe(120000);
+      expect(result.data._bridge.reconnect?.maxReconnectAttempts).toBeUndefined();
+    }
+  });
+
+  it("rejects negative maxReconnectAttempts", () => {
+    const input = {
+      mcpServers: { s: { command: "node" } },
+      _bridge: { reconnect: { maxReconnectAttempts: -1 } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects zero reconnectBaseDelay", () => {
+    const input = {
+      mcpServers: { s: { command: "node" } },
+      _bridge: { reconnect: { reconnectBaseDelay: 0 } },
+    };
+    const result = BridgeConfigSchema.safeParse(input);
+    expect(result.success).toBe(false);
+  });
 });
 
 // --- Credential template passthrough ---
@@ -525,6 +588,7 @@ describe("resolveConfigPath", () => {
   it("throws ConfigError when no path available", () => {
     delete process.env.MCP_BRIDGE_CONFIG;
     expect(() => resolveConfigPath()).toThrow(ConfigError);
+    expect(() => resolveConfigPath()).toThrow(/init/);
   });
 });
 
