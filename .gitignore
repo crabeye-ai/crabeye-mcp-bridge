@@ -7,3 +7,6 @@ coverage/
 Thumbs.db
 *.tgz
 .mcpregistry*
+.claude-flow/
+.mcp.json
+CLAUDE.md
