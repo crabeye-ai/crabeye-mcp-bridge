@@ -2,20 +2,21 @@ import { watch, type FSWatcher } from "node:fs";
 import { dirname, basename } from "node:path";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
-import { loadConfig } from "./loader.js";
 import type { BridgeConfig } from "./schema.js";
 
 export interface ConfigWatcherOptions {
-  configPath: string;
+  configPaths: string[];
+  loadConfig: () => Promise<BridgeConfig>;
   debounceMs?: number;
   logger?: Logger;
 }
 
 export class ConfigWatcher {
-  private _configPath: string;
+  private _configPaths: string[];
+  private _loadConfig: () => Promise<BridgeConfig>;
   private _debounceMs: number;
   private _logger: Logger;
-  private _watcher: FSWatcher | undefined;
+  private _watchers: FSWatcher[] = [];
   private _timer: ReturnType<typeof setTimeout> | undefined;
   private _listener: ((config: BridgeConfig) => void | Promise<void>) | undefined;
   private _lastJson: string | undefined;
@@ -23,7 +24,8 @@ export class ConfigWatcher {
   private _pendingReload = false;
 
   constructor(options: ConfigWatcherOptions) {
-    this._configPath = options.configPath;
+    this._configPaths = options.configPaths;
+    this._loadConfig = options.loadConfig;
     this._debounceMs = options.debounceMs ?? 500;
     this._logger = options.logger ?? createNoopLogger();
   }
@@ -32,7 +34,7 @@ export class ConfigWatcher {
     listener: (config: BridgeConfig) => void | Promise<void>,
     initialConfig?: BridgeConfig,
   ): void {
-    if (this._watcher) return;
+    if (this._watchers.length > 0) return;
 
     this._listener = listener;
 
@@ -40,22 +42,42 @@ export class ConfigWatcher {
       this._lastJson = JSON.stringify(initialConfig);
     }
 
-    this._logger.debug("watching config file", {
-      component: "config-watcher",
-      path: this._configPath,
-    });
-
-    // Watch the directory — more reliable across platforms when files are
-    // atomically replaced (write-to-temp + rename).
-    const dir = dirname(this._configPath);
-    const fileName = basename(this._configPath);
-
-    this._watcher = watch(dir, (eventType, changedFile) => {
-      // changedFile matches our config, or platform didn't provide a filename
-      if (changedFile === fileName || (eventType === "rename" && !changedFile)) {
-        this._scheduleReload();
+    // Group paths by directory to create one watcher per directory
+    const dirToFiles = new Map<string, Set<string>>();
+    for (const configPath of this._configPaths) {
+      const dir = dirname(configPath);
+      const fileName = basename(configPath);
+      if (!dirToFiles.has(dir)) {
+        dirToFiles.set(dir, new Set());
       }
-    });
+      dirToFiles.get(dir)!.add(fileName);
+    }
+
+    for (const [dir, fileNames] of dirToFiles) {
+      this._logger.debug("watching config directory", {
+        component: "config-watcher",
+        path: dir,
+        files: [...fileNames],
+      });
+
+      try {
+        const watcher = watch(dir, (eventType, changedFile) => {
+          if (
+            (changedFile && fileNames.has(changedFile)) ||
+            (eventType === "rename" && !changedFile)
+          ) {
+            this._scheduleReload();
+          }
+        });
+        this._watchers.push(watcher);
+      } catch (err) {
+        this._logger.warn("failed to watch directory", {
+          component: "config-watcher",
+          path: dir,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   stop(): void {
@@ -63,10 +85,10 @@ export class ConfigWatcher {
       clearTimeout(this._timer);
       this._timer = undefined;
     }
-    if (this._watcher) {
-      this._watcher.close();
-      this._watcher = undefined;
+    for (const watcher of this._watchers) {
+      watcher.close();
     }
+    this._watchers = [];
     this._listener = undefined;
     this._reloading = false;
     this._pendingReload = false;
@@ -87,7 +109,7 @@ export class ConfigWatcher {
     }
     this._reloading = true;
 
-    loadConfig({ configPath: this._configPath }).then(
+    this._loadConfig().then(
       async (config) => {
         const json = JSON.stringify(config);
         if (json === this._lastJson) {

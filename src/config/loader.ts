@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import { BridgeConfigSchema, type BridgeConfig } from "./schema.js";
+import { parseJsoncString } from "./jsonc.js";
 
 export interface ConfigIssue {
   path: string;
@@ -53,7 +54,7 @@ export function resolveConfigPath(options?: LoadConfigOptions): string {
   }
 
   throw new ConfigError(
-    "No config file specified. Use --config <path> or set MCP_BRIDGE_CONFIG.",
+    "No config file specified. Run 'crabeye-mcp-bridge init' to set up, or use --config <path>.",
   );
 }
 
@@ -77,7 +78,7 @@ export async function loadConfig(
 
   let json: unknown;
   try {
-    json = JSON.parse(raw);
+    json = parseJsoncString(raw);
   } catch {
     throw new ConfigError(`Invalid JSON in config file: ${configPath}`);
   }

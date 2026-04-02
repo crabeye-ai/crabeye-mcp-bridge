@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigWatcher } from "../src/config/config-watcher.js";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
+import { loadConfig } from "../src/config/loader.js";
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), "config-watcher-test-"));
@@ -49,7 +50,11 @@ describe("ConfigWatcher", () => {
     writeConfig(configPath, content);
 
     const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({ configPath, debounceMs: 50 });
+    const watcher = new ConfigWatcher({
+      configPaths: [configPath],
+      loadConfig: () => loadConfig({ configPath }),
+      debounceMs: 50,
+    });
     cleanups.push(() => watcher.stop());
 
     // Seed with initial config to avoid false positives from stale fs events
@@ -75,7 +80,11 @@ describe("ConfigWatcher", () => {
     writeConfig(configPath, content);
 
     const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({ configPath, debounceMs: 100 });
+    const watcher = new ConfigWatcher({
+      configPaths: [configPath],
+      loadConfig: () => loadConfig({ configPath }),
+      debounceMs: 100,
+    });
     cleanups.push(() => watcher.stop());
 
     watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(content));
@@ -110,7 +119,11 @@ describe("ConfigWatcher", () => {
     const initialConfig = BridgeConfigSchema.parse(content);
 
     const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({ configPath, debounceMs: 50 });
+    const watcher = new ConfigWatcher({
+      configPaths: [configPath],
+      loadConfig: () => loadConfig({ configPath }),
+      debounceMs: 50,
+    });
     cleanups.push(() => watcher.stop());
 
     // Seed _lastJson via initialConfig — no-op saves should be skipped
@@ -140,7 +153,11 @@ describe("ConfigWatcher", () => {
     writeConfig(configPath, content);
 
     const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({ configPath, debounceMs: 50 });
+    const watcher = new ConfigWatcher({
+      configPaths: [configPath],
+      loadConfig: () => loadConfig({ configPath }),
+      debounceMs: 50,
+    });
     cleanups.push(() => watcher.stop());
 
     watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(content));
@@ -170,7 +187,11 @@ describe("ConfigWatcher", () => {
     writeConfig(configPath, validConfig());
 
     const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({ configPath, debounceMs: 50 });
+    const watcher = new ConfigWatcher({
+      configPaths: [configPath],
+      loadConfig: () => loadConfig({ configPath }),
+      debounceMs: 50,
+    });
 
     watcher.start((config) => { received.push(config); });
     watcher.stop();
@@ -181,5 +202,43 @@ describe("ConfigWatcher", () => {
     await new Promise((r) => setTimeout(r, 200));
 
     expect(received).toHaveLength(0);
+  });
+
+  it("watches multiple config files across directories", async () => {
+    const dir1 = makeTmpDir();
+    const dir2 = makeTmpDir();
+    cleanups.push(() => rmSync(dir1, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(dir2, { recursive: true, force: true }));
+
+    const path1 = join(dir1, "config1.json");
+    const path2 = join(dir2, "config2.json");
+    writeConfig(path1, validConfig());
+    writeConfig(path2, validConfig());
+
+    let reloadCount = 0;
+    const watcher = new ConfigWatcher({
+      configPaths: [path1, path2],
+      loadConfig: async () => {
+        reloadCount++;
+        return BridgeConfigSchema.parse(validConfig({
+          svc: { type: "streamable-http", url: `http://localhost:${3000 + reloadCount}` },
+        }));
+      },
+      debounceMs: 50,
+    });
+    cleanups.push(() => watcher.stop());
+
+    const received: BridgeConfig[] = [];
+    watcher.start((config) => { received.push(config); });
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Change the second file — should trigger reload
+    writeConfig(path2, validConfig({
+      other: { type: "streamable-http", url: "http://localhost:9999" },
+    }));
+
+    await waitFor(() => received.length >= 1);
+    expect(received.length).toBeGreaterThanOrEqual(1);
   });
 });
