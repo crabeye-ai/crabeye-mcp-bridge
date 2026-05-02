@@ -108,11 +108,18 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         if (this._closed || this._epoch !== myEpoch) return;
         this._client = undefined;
         this._currentTransport = undefined;
+        this._onTransportClosed();
         this._setStatus("disconnected");
         this._scheduleReconnect();
       };
 
       await client.connect(transport);
+
+      // Hook for subclasses to record per-connection state (e.g. spawned PID)
+      // _before_ we make any further calls that could fail and leak the
+      // subprocess. listTools() below can throw — if we record post-listTools
+      // we lose the pid and can't reap on retry.
+      await this._onTransportStarted(transport);
 
       const result = await client.listTools();
       this._tools = result.tools;
@@ -128,6 +135,16 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._logger.debug("connection failed", {
         error: err instanceof Error ? err.message : String(err),
       });
+      // Close the transport so we don't leak a spawned subprocess. SDK
+      // Client.connect handles the case where initialize itself failed, but
+      // if listTools() (or any other post-init step) throws, the transport
+      // is still open and the subprocess is still running.
+      const failed = this._currentTransport;
+      this._currentTransport = undefined;
+      if (failed) {
+        await failed.close().catch(() => {});
+      }
+      this._onTransportClosed();
       this._setStatus("disconnected");
       throw err;
     }
@@ -154,7 +171,16 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._client = undefined;
       this._currentTransport = undefined;
       await client.close();
+    } else if (this._currentTransport) {
+      // Race: shutdown fired while _doConnect was mid-flight (transport
+      // started, _client not yet assigned). Close the transport directly so
+      // the subprocess is killed.
+      const transport = this._currentTransport;
+      this._currentTransport = undefined;
+      await transport.close().catch(() => {});
     }
+
+    await this._onClose();
 
     this._tools = [];
     this._setStatus("disconnected");
@@ -207,8 +233,25 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   /** Async hook called before transport creation in _doConnect(). Override for async setup. */
   protected async _prepareConnect(): Promise<void> {}
 
+  /**
+   * Async hook called immediately after `transport.start()` succeeds, before
+   * the first request. Subclasses use this to record per-connection state
+   * (e.g. spawned PID) so that any subsequent failure can still be cleaned up.
+   */
+  protected async _onTransportStarted(transport: Transport): Promise<void> {
+    void transport;
+  }
+
   /** Hook called after a successful connection. Override in subclasses for post-connect setup. */
-  protected _afterConnect(_transport: Transport): void {}
+  protected _afterConnect(transport: Transport): void {
+    void transport;
+  }
+
+  /** Hook called when the transport closes (subprocess exit, peer disconnect, retry, etc). */
+  protected _onTransportClosed(): void {}
+
+  /** Hook called from close() so subclasses can release per-client resources. */
+  protected async _onClose(): Promise<void> {}
 
   /** Subclasses create the real transport here. */
   protected abstract _buildTransport(): Transport;

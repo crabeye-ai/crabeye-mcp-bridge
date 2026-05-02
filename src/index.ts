@@ -25,6 +25,7 @@ import {
   createKeychainAdapter,
   type Credential,
 } from "./credentials/index.js";
+import { ProcessTracker, getProcessTrackerPath } from "./process/index.js";
 
 function buildServerBridgeConfigs(
   upstreams: Record<string, ServerConfig>,
@@ -60,6 +61,7 @@ program
     let upstreamManager: UpstreamManager | undefined;
     let toolSearchService: ToolSearchService | undefined;
     let configWatcher: ConfigWatcher | undefined;
+    let processTracker: ProcessTracker | undefined;
     const rateLimiters = new Map<string, RateLimiter>();
 
     try {
@@ -105,7 +107,36 @@ program
 
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
-      upstreamManager = new UpstreamManager({ config, toolRegistry, logger, credentialStore });
+
+      // Reap any subprocesses left behind by a previous run (crash, SIGKILL,
+      // power loss) BEFORE we connect anything new. Otherwise we would stack
+      // duplicate upstream subprocesses every time the bridge restarts.
+      processTracker = new ProcessTracker({
+        filePath: getProcessTrackerPath(),
+        logger: logger.child({ component: "process-tracker" }),
+      });
+      try {
+        const reaped = await processTracker.reapStale();
+        if (reaped.killed > 0 || reaped.skipped > 0) {
+          logger.info(
+            `reaped ${reaped.killed} leaked subprocess${reaped.killed === 1 ? "" : "es"} from previous run` +
+              (reaped.skipped > 0 ? ` (${reaped.skipped} skipped due to PID reuse)` : ""),
+            { component: "bridge" },
+          );
+        }
+      } catch (err) {
+        logger.warn(`failed to reap stale subprocesses: ${err instanceof Error ? err.message : String(err)}`, {
+          component: "bridge",
+        });
+      }
+
+      upstreamManager = new UpstreamManager({
+        config,
+        toolRegistry,
+        logger,
+        credentialStore,
+        processTracker,
+      });
 
       const serverBridgeConfigs = buildServerBridgeConfigs(upstreams);
 
@@ -254,7 +285,7 @@ program
     }
 
     let shuttingDown = false;
-    const shutdown = async () => {
+    const shutdown = async (exitCode = 0) => {
       if (shuttingDown) return;
       shuttingDown = true;
       try {
@@ -273,11 +304,39 @@ program
       } catch {
         // Don't prevent exit on close error
       }
-      process.exit(0);
+
+      // Belt-and-suspenders: even if individual clients failed to clean up
+      // their subprocess, sweep anything still tracked on disk.
+      try {
+        await processTracker?.reapStale();
+      } catch {
+        // Best-effort.
+      }
+
+      process.exit(exitCode);
     };
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", () => void shutdown(0));
+    process.on("SIGTERM", () => void shutdown(0));
+    process.on("SIGHUP", () => void shutdown(0));
+    // If we crash, still try to cleanly shut down — at the very least the
+    // process tracker reap will kill orphaned subprocesses on the way out.
+    process.on("uncaughtException", (err) => {
+      try {
+        process.stderr.write(`uncaughtException: ${err?.stack ?? err}\n`);
+      } catch {
+        // ignore
+      }
+      void shutdown(1);
+    });
+    process.on("unhandledRejection", (reason) => {
+      try {
+        process.stderr.write(`unhandledRejection: ${reason instanceof Error ? reason.stack : String(reason)}\n`);
+      } catch {
+        // ignore
+      }
+      void shutdown(1);
+    });
   });
 
 // --- Credential helpers ---

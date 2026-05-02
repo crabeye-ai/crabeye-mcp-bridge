@@ -4,6 +4,7 @@ import type { ConfigDiff } from "../config/config-diff.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
+import type { ProcessTracker } from "../process/index.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { namespaceTool } from "../server/tool-namespacing.js";
 import { HttpUpstreamClient } from "./http-client.js";
@@ -15,6 +16,7 @@ export interface UpstreamManagerOptions {
   toolRegistry: ToolRegistry;
   logger?: Logger;
   credentialStore?: CredentialStore;
+  processTracker?: ProcessTracker;
   /** Health check interval in seconds. 0 to disable. Overrides config value. */
   healthCheckInterval?: number;
   /** Injectable client factory for testing. */
@@ -62,6 +64,7 @@ export class UpstreamManager {
     this._healthCheckInterval =
       options.healthCheckInterval ?? options.config._bridge.healthCheckInterval;
     const credentialStore = options.credentialStore;
+    const processTracker = options.processTracker;
     const globalReconnect = options.config._bridge.reconnect;
     this._clientFactory =
       options._clientFactory ??
@@ -73,7 +76,7 @@ export class UpstreamManager {
           reconnectMaxDelay: serverReconnect?.reconnectMaxDelay ?? globalReconnect?.reconnectMaxDelay,
         };
         if (isStdioServer(config)) {
-          return new StdioUpstreamClient({ name, config, logger, credentialStore, ...reconnectOpts });
+          return new StdioUpstreamClient({ name, config, logger, credentialStore, processTracker, ...reconnectOpts });
         }
         return new HttpUpstreamClient({ name, config: config as HttpServerConfig, logger, credentialStore, ...reconnectOpts });
       });
