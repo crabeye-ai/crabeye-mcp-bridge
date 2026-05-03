@@ -141,6 +141,9 @@ describe("schema validation", () => {
         idleTimeout: 600,
         healthCheckInterval: 30,
         toolPolicy: "always",
+        daemon: {
+          idleMs: 60000,
+        },
       });
     }
   });

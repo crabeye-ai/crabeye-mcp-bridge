@@ -65,6 +65,12 @@ export const ServerConfigSchema = z.union([
 
 // --- Global bridge config ---
 
+export const DaemonConfigSchema = z
+  .object({
+    idleMs: z.number().int().positive().default(60_000),
+  })
+  .strict();
+
 export const GlobalBridgeConfigSchema = z
   .object({
     port: z.number().int().min(1).max(65535).default(19875),
@@ -78,6 +84,7 @@ export const GlobalBridgeConfigSchema = z
     healthCheckInterval: z.number().int().min(0).default(30),
     toolPolicy: ToolPolicySchema.default("always"),
     reconnect: ReconnectConfigSchema.optional(),
+    daemon: DaemonConfigSchema.default(DaemonConfigSchema.parse({})),
   })
   .strict();
 
@@ -105,6 +112,7 @@ export type StdioServerConfig = z.infer<typeof StdioServerConfigSchema>;
 export type HttpServerConfig = z.infer<typeof HttpServerConfigSchema>;
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 export type GlobalBridgeConfig = z.infer<typeof GlobalBridgeConfigSchema>;
+export type DaemonConfig = z.infer<typeof DaemonConfigSchema>;
 export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
 
 // --- Upstream resolution ---

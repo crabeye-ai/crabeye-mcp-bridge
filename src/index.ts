@@ -536,4 +536,35 @@ program
     await runRestore();
   });
 
+program
+  .command("daemon [action]")
+  .description("Manage the per-user manager daemon (start | stop | status | restart)")
+  .addOption(
+    new Option("--internal-launch", "internal: run as the daemon process itself")
+      .hideHelp(),
+  )
+  .action(async (action: string | undefined, options: { internalLaunch?: boolean }) => {
+    try {
+      const { runDaemonCommand, runDaemonInternal } = await import("./commands/daemon.js");
+
+      if (options.internalLaunch) {
+        const code = await runDaemonInternal();
+        process.exit(code);
+      }
+
+      const allowed = ["start", "stop", "status", "restart"] as const;
+      if (action === undefined || !allowed.includes(action as typeof allowed[number])) {
+        process.stderr.write(`Usage: ${APP_NAME} daemon <start | stop | status | restart>\n`);
+        process.exitCode = 2;
+        return;
+      }
+
+      const code = await runDaemonCommand(action as typeof allowed[number]);
+      if (code !== 0) process.exitCode = code;
+    } catch (err) {
+      process.stderr.write(`daemon command failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exitCode = 1;
+    }
+  });
+
 program.parse();

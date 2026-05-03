@@ -5,3 +5,10 @@ export const CREDENTIALS_DIR = `.${APP_NAME}`;
 export const CREDENTIALS_FILENAME = "credentials.enc";
 export const BRIDGE_CONFIG_FILENAME = "config.json";
 export const PROCESS_TRACKER_FILENAME = "processes.json";
+
+export const DAEMON_BASE = "crabeye";
+export const DAEMON_DIR = `.${DAEMON_BASE}`;
+export const DAEMON_RUN_SUBDIR = "run";
+export const DAEMON_SOCKET_FILENAME = "manager.sock";
+export const DAEMON_PID_FILENAME = "manager.pid";
+export const DAEMON_LOCK_FILENAME = "manager.lock";
