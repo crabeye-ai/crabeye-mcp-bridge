@@ -5,6 +5,7 @@ import { createNoopLogger, type Logger } from "../logging/index.js";
 import { upstreamHash } from "../upstream/upstream-hash.js";
 import { acquireLock, LockBusyError, type LockHandle } from "./lockfile.js";
 import { ChildHandle, BackpressureError } from "./child-handle.js";
+import type { CachedInit } from "./child-handle.js";
 import { getProcessTrackerPath } from "./paths.js";
 import { ProcessTracker } from "./process-tracker.js";
 import {
@@ -462,6 +463,37 @@ export class ManagerDaemon {
       return;
     }
     const group = att.group;
+
+    // Daemon-side initialize short-circuit.
+    if (isInitializeRequest(params.payload) && group.child.cachedInit !== null) {
+      const reqId = pickInnerId(params.payload);
+      if (reqId !== null) {
+        const initResult = group.child.cachedInit;
+        channel.send({
+          method: "RPC",
+          params: {
+            sessionId: params.sessionId,
+            payload: {
+              jsonrpc: "2.0",
+              id: reqId,
+              result: {
+                protocolVersion: initResult.protocolVersion,
+                serverInfo: initResult.serverInfo,
+                capabilities: initResult.capabilities,
+              },
+            },
+          },
+        });
+      }
+      return;
+    }
+    // Drop subsequent notifications/initialized.
+    if (isInitializedNotification(params.payload)) {
+      if (group.initializedSeen) return;
+      group.initializedSeen = true;
+      // Fall through — first one forwards to child.
+    }
+
     let rewritten: unknown;
     try {
       rewritten = group.rewriter.outboundForChild(params.payload, params.sessionId);
@@ -659,7 +691,35 @@ export class ManagerDaemon {
   private routeChildMessage(group: ChildGroup, payload: unknown): void {
     const routing = group.rewriter.inboundFromChild(payload);
     if (routing.kind === "drop") return;
-    if (routing.kind === "response" || routing.kind === "progress" || routing.kind === "cancelled") {
+    if (routing.kind === "response") {
+      // Capture cachedInit from the first initialize response.
+      // Heuristic: any first response with protocolVersion+serverInfo+capabilities triple is treated as the
+      // initialize result. This is safe because initialize is the only request-with-result of this shape
+      // sent before any other traffic in the MCP protocol. False-positive risk is negligible.
+      if (group.child.cachedInit === null) {
+        const restored = routing.payload as { id?: unknown; result?: unknown };
+        const result = restored.result as
+          | { protocolVersion?: unknown; serverInfo?: unknown; capabilities?: unknown }
+          | undefined;
+        if (
+          result !== undefined &&
+          typeof result.protocolVersion === "string" &&
+          typeof result.serverInfo === "object" &&
+          result.serverInfo !== null &&
+          typeof result.capabilities === "object" &&
+          result.capabilities !== null
+        ) {
+          group.child.setCachedInit({
+            protocolVersion: result.protocolVersion,
+            serverInfo: result.serverInfo as CachedInit["serverInfo"],
+            capabilities: result.capabilities as Record<string, unknown>,
+          });
+        }
+      }
+      this.deliver(group, routing.sessionIds, routing.payload);
+      return;
+    }
+    if (routing.kind === "progress" || routing.kind === "cancelled") {
       this.deliver(group, routing.sessionIds, routing.payload);
       return;
     }
@@ -960,6 +1020,18 @@ function pickInnerId(payload: unknown): InnerId | null {
   const p = payload as { id?: unknown };
   if (typeof p.id === "string" || typeof p.id === "number") return p.id;
   return null;
+}
+
+function isInitializeRequest(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as { method?: unknown; id?: unknown };
+  return p.method === "initialize" && (typeof p.id === "string" || typeof p.id === "number");
+}
+
+function isInitializedNotification(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as { method?: unknown };
+  return p.method === "notifications/initialized";
 }
 
 /**
