@@ -1,0 +1,50 @@
+import { describe, it, expect } from "vitest";
+import { TokenRewriter } from "../../src/daemon/token-rewriter.js";
+
+describe("TokenRewriter — opaque-int id rewriting", () => {
+  it("two sessions sending id=1 get distinct outer ids", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    r.attachSession("B");
+
+    const aOut = r.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call" }, "A") as { id: unknown };
+    const bOut = r.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call" }, "B") as { id: unknown };
+
+    expect(typeof aOut.id).toBe("number");
+    expect(typeof bOut.id).toBe("number");
+    expect(aOut.id).not.toBe(bOut.id);
+  });
+
+  it("inbound response restores original id and routes to originating session", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    r.attachSession("B");
+    const aOut = r.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call" }, "A") as { id: number };
+    const bOut = r.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call" }, "B") as { id: number };
+
+    const aResp = r.inboundFromChild({ jsonrpc: "2.0", id: aOut.id, result: { ok: "A" } });
+    const bResp = r.inboundFromChild({ jsonrpc: "2.0", id: bOut.id, result: { ok: "B" } });
+
+    expect(aResp.kind).toBe("response");
+    expect(aResp.sessionIds).toEqual(["A"]);
+    expect((aResp.payload as { id: unknown }).id).toBe(1);
+    expect(bResp.sessionIds).toEqual(["B"]);
+    expect((bResp.payload as { id: unknown }).id).toBe(1);
+  });
+
+  it("string original id round-trips correctly", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    const out = r.outboundForChild({ jsonrpc: "2.0", id: "req-abc", method: "ping" }, "A") as { id: number };
+    const back = r.inboundFromChild({ jsonrpc: "2.0", id: out.id, result: { ok: true } });
+    expect((back.payload as { id: unknown }).id).toBe("req-abc");
+  });
+
+  it("response with unknown outer id is dropped (sessionIds empty)", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    const back = r.inboundFromChild({ jsonrpc: "2.0", id: 99999, result: {} });
+    expect(back.sessionIds).toEqual([]);
+    expect(back.kind).toBe("drop");
+  });
+});

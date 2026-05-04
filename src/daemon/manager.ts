@@ -453,16 +453,22 @@ export class ManagerDaemon {
       }
       throw err;
     }
+    // Capture the outer id allocated by outboundForChild so we can remove it
+    // from inflight tracking if the child stdin write fails (Phase C: outer id
+    // is a fresh integer, not the original inner id).
+    const allocatedOuterId = (rewritten as { id?: unknown })?.id;
     try {
       session.child.send(rewritten);
     } catch (err) {
       if (err instanceof BackpressureError) {
         const innerId = pickInnerId(params.payload);
         if (innerId !== null) {
-          // The id was added to inflight tracking by outboundForChild but
-          // the child never received it — pop the id so the tracking Set
-          // doesn't leak it forever.
-          session.rewriter.removeInflight(session.sessionId, innerId);
+          // The outer id was added to inflight tracking by outboundForChild but
+          // the child never received it — pop it so the tracking Set doesn't
+          // leak it forever.
+          if (typeof allocatedOuterId === "number") {
+            session.rewriter.removeInflight(session.sessionId, allocatedOuterId);
+          }
           this.sendInnerError(channel, session.sessionId, innerId, INNER_ERROR_CODE_BACKPRESSURE, err.message);
         }
         return;
@@ -605,10 +611,19 @@ export class ManagerDaemon {
   /**
    * Route an inbound child→bridge message to its session(s). For phase B
    * this is always the single session attached to the child.
+   *
+   * Phase C routing:
+   * - "response": sessionIds resolved from outer-id map; payload has original
+   *   id restored. Deliver to the single resolved session.
+   * - "other": notifications and other unrecognised frames — broadcast to the
+   *   owning session (phase B: 1:1; phase C Task 6 replaces this with the
+   *   NotificationRouter fan-out).
+   * - "drop": no mapping found; silently discard.
    */
   private routeChildMessage(sessionId: string, rewriter: TokenRewriter, payload: unknown): void {
     const routing = rewriter.inboundFromChild(payload);
-    for (const sid of routing.sessionIds) {
+    const targetIds = routing.kind === "other" ? [sessionId] : routing.sessionIds;
+    for (const sid of targetIds) {
       const session = this.sessions.get(sid);
       if (session === undefined) continue;
       const ok = session.channel.send({
@@ -650,11 +665,18 @@ export class ManagerDaemon {
 
     // Synthetic errors first so the bridge MCP client clears its pending
     // promises before the channel maybe goes away.
-    const inflight = session.rewriter.inflightForSession(sessionId);
-    for (const innerId of inflight) {
-      this.sendInnerError(session.channel, sessionId, innerId, INNER_ERROR_CODE_SESSION_CLOSED, reason);
+    // Resolve original inner ids BEFORE detachSession (which clears the origin map),
+    // then send errors AFTER detach so the rewriter state is clean before any callbacks fire.
+    const inflightOuters = session.rewriter.inflightForSession(sessionId);
+    const originals: InnerId[] = [];
+    for (const outerId of inflightOuters) {
+      const origin = session.rewriter.peekOrigin(outerId);
+      if (origin !== undefined) originals.push(origin.originalId);
     }
     session.rewriter.detachSession(sessionId);
+    for (const innerId of originals) {
+      this.sendInnerError(session.channel, sessionId, innerId, INNER_ERROR_CODE_SESSION_CLOSED, reason);
+    }
 
     const pid = session.child.pid;
     try {

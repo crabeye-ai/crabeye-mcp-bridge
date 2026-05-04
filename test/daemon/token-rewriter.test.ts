@@ -1,13 +1,18 @@
 import { describe, it, expect } from "vitest";
 import { InflightOverflowError, TokenRewriter } from "../../src/daemon/token-rewriter.js";
 
-describe("TokenRewriter (phase B identity)", () => {
-  it("attaches a session and routes inbound payloads to it", () => {
+describe("TokenRewriter (phase C opaque-int)", () => {
+  it("notification from child is kind=other with empty sessionIds and payload passed through", () => {
+    // Phase C: routing of notifications (no id) is left to the caller — the
+    // rewriter only resolves responses by outer id. Caller fans out to all
+    // sessions attached to the child.
     const rw = new TokenRewriter();
     rw.attachSession("s1");
-    const out = rw.inboundFromChild({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
-    expect(out.sessionIds).toEqual(["s1"]);
-    expect(out.payload).toEqual({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    const notif = { jsonrpc: "2.0", method: "notifications/tools/list_changed" };
+    const out = rw.inboundFromChild(notif);
+    expect(out.kind).toBe("other");
+    expect(out.sessionIds).toEqual([]);
+    expect(out.payload).toBe(notif);
   });
 
   it("returns no sessions when none are attached", () => {
@@ -19,12 +24,12 @@ describe("TokenRewriter (phase B identity)", () => {
   it("tracks outbound request ids and clears them on inbound response", () => {
     const rw = new TokenRewriter();
     rw.attachSession("s1");
-    rw.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} }, "s1");
-    rw.outboundForChild({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {} }, "s1");
-    expect(rw.inflightForSession("s1").sort()).toEqual([1, 2]);
+    const out1 = rw.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} }, "s1") as { id: number };
+    const out2 = rw.outboundForChild({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {} }, "s1") as { id: number };
+    expect(rw.inflightForSession("s1").sort((a, b) => a - b)).toEqual([out1.id, out2.id].sort((a, b) => a - b));
 
-    rw.inboundFromChild({ jsonrpc: "2.0", id: 1, result: {} });
-    expect(rw.inflightForSession("s1")).toEqual([2]);
+    rw.inboundFromChild({ jsonrpc: "2.0", id: out1.id, result: {} });
+    expect(rw.inflightForSession("s1")).toEqual([out2.id]);
   });
 
   it("ignores notifications without inner id (no inflight tracking)", () => {
@@ -59,13 +64,27 @@ describe("TokenRewriter (phase B identity)", () => {
   it("removeInflight pops a single id without delivering a response", () => {
     const rw = new TokenRewriter();
     rw.attachSession("s1");
-    rw.outboundForChild({ jsonrpc: "2.0", id: 1, method: "x" }, "s1");
-    rw.outboundForChild({ jsonrpc: "2.0", id: 2, method: "x" }, "s1");
-    rw.removeInflight("s1", 1);
-    expect(rw.inflightForSession("s1")).toEqual([2]);
+    const out1 = rw.outboundForChild({ jsonrpc: "2.0", id: 1, method: "x" }, "s1") as { id: number };
+    const out2 = rw.outboundForChild({ jsonrpc: "2.0", id: 2, method: "x" }, "s1") as { id: number };
+    rw.removeInflight("s1", out1.id);
+    expect(rw.inflightForSession("s1")).toEqual([out2.id]);
     // Idempotent — popping an id that isn't tracked does nothing.
     rw.removeInflight("s1", 999);
-    expect(rw.inflightForSession("s1")).toEqual([2]);
+    expect(rw.inflightForSession("s1")).toEqual([out2.id]);
+  });
+
+  it("peekOrigin returns the original inner id for an allocated outer id, then detach clears mapping", () => {
+    const rw = new TokenRewriter();
+    rw.attachSession("s1");
+    const out = rw.outboundForChild({ jsonrpc: "2.0", id: "req-abc", method: "x" }, "s1") as { id: number };
+    const origin = rw.peekOrigin(out.id);
+    expect(origin).toBeDefined();
+    expect(origin!.originalId).toBe("req-abc");
+    expect(origin!.sessionId).toBe("s1");
+
+    const { cancelledOuterIds } = rw.detachSession("s1");
+    expect(cancelledOuterIds).toEqual([out.id]);
+    expect(rw.peekOrigin(out.id)).toBeUndefined();
   });
 
   it(
