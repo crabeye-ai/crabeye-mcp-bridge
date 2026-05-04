@@ -16,6 +16,7 @@ import { ToolSearchService } from "./search/index.js";
 import type { DiscoveryMode } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
+import { ensureDaemonRunning } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
 import {
@@ -25,7 +26,6 @@ import {
   createKeychainAdapter,
   type Credential,
 } from "./credentials/index.js";
-import { ProcessTracker, getProcessTrackerPath } from "./process/index.js";
 
 function buildServerBridgeConfigs(
   upstreams: Record<string, ServerConfig>,
@@ -61,7 +61,6 @@ program
     let upstreamManager: UpstreamManager | undefined;
     let toolSearchService: ToolSearchService | undefined;
     let configWatcher: ConfigWatcher | undefined;
-    let processTracker: ProcessTracker | undefined;
     const rateLimiters = new Map<string, RateLimiter>();
 
     try {
@@ -108,26 +107,20 @@ program
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
-      // Reap any subprocesses left behind by a previous run (crash, SIGKILL,
-      // power loss) BEFORE we connect anything new. Otherwise we would stack
-      // duplicate upstream subprocesses every time the bridge restarts.
-      processTracker = new ProcessTracker({
-        filePath: getProcessTrackerPath(),
-        logger: logger.child({ component: "process-tracker" }),
-      });
-      try {
-        const reaped = await processTracker.reapStale();
-        if (reaped.killed > 0 || reaped.skipped > 0) {
-          logger.info(
-            `reaped ${reaped.killed} leaked subprocess${reaped.killed === 1 ? "" : "es"} from previous run` +
-              (reaped.skipped > 0 ? ` (${reaped.skipped} skipped due to PID reuse)` : ""),
-            { component: "bridge" },
-          );
+      // Bootstrap the manager daemon ahead of upstream connects so parallel
+      // STDIO sessions don't race on lockfile acquisition. HTTP-only configs
+      // skip this; the daemon is a no-op for them.
+      const hasStdio = Object.values(upstreams).some(isStdioServer);
+      if (hasStdio) {
+        try {
+          await ensureDaemonRunning();
+        } catch (err) {
+          logger.error(`failed to start manager daemon: ${err instanceof Error ? err.message : String(err)}`, {
+            component: "bridge",
+          });
+          process.exitCode = 1;
+          return;
         }
-      } catch (err) {
-        logger.warn(`failed to reap stale subprocesses: ${err instanceof Error ? err.message : String(err)}`, {
-          component: "bridge",
-        });
       }
 
       upstreamManager = new UpstreamManager({
@@ -135,7 +128,6 @@ program
         toolRegistry,
         logger,
         credentialStore,
-        processTracker,
       });
 
       const serverBridgeConfigs = buildServerBridgeConfigs(upstreams);
@@ -303,14 +295,6 @@ program
         }
       } catch {
         // Don't prevent exit on close error
-      }
-
-      // Belt-and-suspenders: even if individual clients failed to clean up
-      // their subprocess, sweep anything still tracked on disk.
-      try {
-        await processTracker?.reapStale();
-      } catch {
-        // Best-effort.
       }
 
       process.exit(exitCode);

@@ -9,7 +9,7 @@ import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
-import { StdioUpstreamClient } from "../src/upstream/stdio-client.js";
+import { DaemonStdioClient } from "../src/upstream/daemon-stdio-client.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import type { StatusChangeEvent } from "../src/upstream/types.js";
@@ -80,13 +80,14 @@ function createLinkedClient(
 function createLinkedStdioClient(
   name: string,
   mockServer: Server,
-  options?: Partial<ConstructorParameters<typeof StdioUpstreamClient>[0]>,
-): { client: StdioUpstreamClient; serverTransport: Transport } {
+  options?: Partial<ConstructorParameters<typeof DaemonStdioClient>[0]>,
+): { client: DaemonStdioClient; serverTransport: Transport } {
   let serverTransport: Transport;
 
-  const client = new StdioUpstreamClient({
+  const client = new DaemonStdioClient({
     name,
     config: { command: "node", args: ["server.js"] },
+    resolvedEnv: {},
     ...options,
     _transportFactory: () => {
       const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -841,11 +842,11 @@ describe("UpstreamManager", () => {
   });
 });
 
-// --- StdioUpstreamClient ---
+// --- DaemonStdioClient ---
 
-describe("StdioUpstreamClient", () => {
+describe("DaemonStdioClient", () => {
   let mockServerHandle: ReturnType<typeof createMockServer>;
-  let upstreamClient: StdioUpstreamClient;
+  let upstreamClient: DaemonStdioClient;
 
   beforeEach(() => {
     mockServerHandle = createMockServer([
@@ -984,9 +985,10 @@ describe("StdioUpstreamClient", () => {
     let shouldFail = false;
     let clientTransport: Transport | undefined;
 
-    const client = new StdioUpstreamClient({
+    const client = new DaemonStdioClient({
       name: "test",
       config: { command: "node", args: ["server.js"] },
+      resolvedEnv: {},
       maxReconnectAttempts: 2,
       reconnectBaseDelay: 50,
       reconnectMaxDelay: 200,
@@ -1039,9 +1041,10 @@ describe("StdioUpstreamClient", () => {
   it("concurrent connect() calls coalesce into a single connection", async () => {
     let factoryCalls = 0;
 
-    const client = new StdioUpstreamClient({
+    const client = new DaemonStdioClient({
       name: "test",
       config: { command: "node", args: ["server.js"] },
+      resolvedEnv: {},
       _transportFactory: () => {
         factoryCalls++;
         const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -1061,9 +1064,10 @@ describe("StdioUpstreamClient", () => {
   });
 
   it("connect() failure sets status to disconnected, not stuck on connecting", async () => {
-    const client = new StdioUpstreamClient({
+    const client = new DaemonStdioClient({
       name: "test",
       config: { command: "node", args: ["server.js"] },
+      resolvedEnv: {},
       maxReconnectAttempts: 0,
       _transportFactory: () => ({
         async start() { throw new Error("Connection refused"); },

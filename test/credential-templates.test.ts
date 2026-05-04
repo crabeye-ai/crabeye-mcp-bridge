@@ -13,7 +13,6 @@ import { CredentialStore } from "../src/credentials/credential-store.js";
 import { CredentialError } from "../src/credentials/errors.js";
 import type { Credential } from "../src/credentials/types.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
-import { StdioUpstreamClient } from "../src/upstream/stdio-client.js";
 
 // --- Mock credential store ---
 
@@ -264,71 +263,6 @@ describe("integration: HTTP client with credential templates", () => {
   });
 });
 
-describe("integration: STDIO client with credential templates", () => {
-  it("throws on missing credential during connect", async () => {
-    const store = createMockStore({}); // empty store
-
-    const client = new StdioUpstreamClient({
-      name: "test-stdio",
-      config: {
-        command: "echo",
-        args: ["hello"],
-        env: { API_KEY: "${credential:missing-key}" },
-      },
-      credentialStore: store,
-      _transportFactory: () => {
-        // We expect _prepareConnect to throw before transport creation,
-        // but provide a factory just in case
-        const [clientSide] = InMemoryTransport.createLinkedPair();
-        return clientSide;
-      },
-    });
-
-    await expect(client.connect()).rejects.toThrow(CredentialError);
-    await client.close();
-  });
-
-  it("connects normally without templates", async () => {
-    const mockServer = createMockServer();
-
-    const client = new StdioUpstreamClient({
-      name: "test-stdio",
-      config: {
-        command: "echo",
-        args: ["hello"],
-        env: { PLAIN_KEY: "static-value" },
-      },
-      credentialStore: createMockStore({}),
-      _transportFactory: () => {
-        const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-        mockServer.connect(serverSide);
-        return clientSide;
-      },
-    });
-
-    await client.connect();
-    expect(client.status).toBe("connected");
-    await client.close();
-  });
-
-  it("connects normally without credential store", async () => {
-    const mockServer = createMockServer();
-
-    const client = new StdioUpstreamClient({
-      name: "test-stdio",
-      config: {
-        command: "echo",
-        args: ["hello"],
-      },
-      _transportFactory: () => {
-        const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-        mockServer.connect(serverSide);
-        return clientSide;
-      },
-    });
-
-    await client.connect();
-    expect(client.status).toBe("connected");
-    await client.close();
-  });
-});
+// STDIO credential expansion is now performed by `UpstreamManager` before
+// instantiating `DaemonStdioClient`, so its coverage lives in the manager
+// tests in `test/upstream.test.ts` (UpstreamManager describe block).

@@ -9,7 +9,7 @@ import {
   readProcessInfo as defaultReadProcessInfo,
   type KillProcessTreeOptions,
   type ProcessInfo,
-} from "./process-utils.js";
+} from "../process/process-utils.js";
 
 /**
  * Tolerance applied when comparing a live process's kernel start time against
@@ -123,31 +123,35 @@ export class ProcessTracker {
       return "dead";
     }
 
-    // PID-reuse safety: prefer the kernel-reported start time, which is
-    // exact and tamper-resistant. A live process whose lstart is later than
-    // our recorded startedAt cannot be the one we spawned — the original
-    // had to die first to free the PID.
+    // PID-reuse safety: belt-and-suspenders. We require BOTH the kernel
+    // start time to be within tolerance of the recorded `startedAt` AND the
+    // live cmdline to plausibly match the recorded command + args. Either
+    // signal alone is spoofable by an attacker who controls the on-disk
+    // tracker file (same UID can rewrite it): start-time-only would let a
+    // file with `startedAt: now()` SIGKILL any user-owned PID started in
+    // the last few seconds (e.g. `npm test`). cmdline-only is defeated by
+    // setproctitle / exec replacement. Demanding both raises the bar.
     const info = await this._readInfo(entry.pid).catch(() => null);
 
     if (info) {
       if (info.startTime !== null) {
-        if (info.startTime > entry.startedAt + PID_REUSE_TOLERANCE_MS) {
+        const skew = info.startTime - entry.startedAt;
+        if (Math.abs(skew) > PID_REUSE_TOLERANCE_MS) {
           this._logger.warn(
-            "skipping reap (PID reused; live process started after we recorded)",
+            "skipping reap (PID start time inconsistent with recorded value)",
             {
               pid: entry.pid,
               server: entry.server,
               recordedStartedAt: entry.startedAt,
               liveStartTime: info.startTime,
+              skewMs: skew,
               cmdline: info.cmdline,
             },
           );
           return "skipped";
         }
-        // Start time confirms it's our process; cmdline can lie (npx
-        // wrappers, exec replacement). Skip cmdline check.
-      } else if (!cmdlineMatches(info.cmdline, entry)) {
-        // Start time unavailable; fall back to cmdline. Be conservative.
+      }
+      if (!cmdlineMatches(info.cmdline, entry)) {
         this._logger.warn(
           "skipping reap (cmdline does not match recorded command)",
           {

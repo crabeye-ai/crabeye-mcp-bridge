@@ -1,12 +1,10 @@
-import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   DaemonClient,
   DaemonRpcError,
   ManagerDaemon,
+  ensureDaemonRunning,
   getDaemonLockPath,
   getDaemonPidPath,
   getDaemonSocketPath,
@@ -19,7 +17,6 @@ import { DaemonConfigSchema } from "../config/schema.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
 
-const CONNECT_BACKOFF_MS = [50, 200, 500, 1000, 1000] as const;
 const STOP_TIMEOUT_MS = 2_000;
 const STOP_POLL_MS = 50;
 
@@ -58,7 +55,12 @@ export async function runDaemonInternal(): Promise<number> {
   } catch (err) {
     if (err instanceof LockBusyError) {
       // Another daemon is already running. Concurrent launchers fall through
-      // to "connect to the survivor".
+      // to "connect to the survivor". Surface a diagnostic so a stale-lock
+      // condition (PID file points at a dead pid that lockfile mis-detected
+      // as live) is debuggable instead of silently exiting 0.
+      process.stderr.write(
+        `daemon: lock held by pid ${err.heldByPid ?? "?"} at ${err.path}; deferring to existing daemon\n`,
+      );
       return 0;
     }
     process.stderr.write(`daemon failed to start: ${errMsg(err)}\n`);
@@ -87,27 +89,14 @@ async function runStart(): Promise<number> {
     return 0;
   }
 
-  const entry = await resolveEntryScript();
-  const child = spawn(process.execPath, [entry, "daemon", "--internal-launch"], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
-  });
-  child.unref();
-  child.on("error", (err) => {
-    process.stderr.write(`failed to spawn daemon: ${err.message}\n`);
-  });
-
-  for (const wait of CONNECT_BACKOFF_MS) {
-    await delay(wait);
-    if (await isDaemonReachable()) {
-      process.stderr.write("daemon started\n");
-      return 0;
-    }
+  try {
+    await ensureDaemonRunning();
+    process.stderr.write("daemon started\n");
+    return 0;
+  } catch (err) {
+    process.stderr.write(`${errMsg(err)}\n`);
+    return 1;
   }
-
-  process.stderr.write("daemon did not become reachable within timeout\n");
-  return 1;
 }
 
 async function runStop(): Promise<number> {
@@ -256,28 +245,4 @@ async function waitForDeath(pid: number, timeoutMs: number): Promise<void> {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/**
- * Find the CLI entry script for self-spawning. Pinning this to a file we
- * resolve from our own module location defeats argv[1] substitution. Falls
- * back to argv[1] if our heuristic can't find the entry (dev shells, etc.),
- * but logs the fallback so it's visible.
- */
-async function resolveEntryScript(): Promise<string> {
-  const here = fileURLToPath(import.meta.url);
-  // Production / bundled: this file is `dist/daemon-XYZ.js`; the CLI entry
-  // is `dist/index.js` next to it.
-  const sibling = join(dirname(here), "index.js");
-  try {
-    if ((await stat(sibling)).isFile()) return sibling;
-  } catch {
-    /* fall through */
-  }
-
-  const argv1 = process.argv[1];
-  if (!argv1) {
-    throw new Error("cannot self-spawn daemon: no entry script could be resolved");
-  }
-  return argv1;
 }

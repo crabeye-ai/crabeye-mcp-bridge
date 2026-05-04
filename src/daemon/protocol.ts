@@ -2,11 +2,15 @@
  * Manager-daemon wire protocol.
  *
  * Frames: 4-byte big-endian uint32 length, followed by UTF-8 JSON payload.
- * Payload: request `{ id, method, params? }` or response `{ id, result?, error? }`.
  *
- * Phase A defines the shape; only STATUS and SHUTDOWN are implemented. Other
- * methods return a `not_implemented` error so later phases can wire them in
- * without protocol churn.
+ * Three frame shapes (JSON-RPC 2.0 inspired):
+ *   request:      { id, method, params? }       expects matching response
+ *   response:     { id, result | error }        reply to request
+ *   notification: { method, params? }           no `id`, no reply expected
+ *
+ * The frame envelope is the same across phases B → C → D; phase B adds
+ * notification frames so daemon and bridge can pipe MCP JSON-RPC messages
+ * over `RPC` notifications without a per-message ack roundtrip.
  */
 
 export const PROTOCOL_VERSION = 1;
@@ -30,6 +34,11 @@ export interface DaemonRequest {
   params?: unknown;
 }
 
+export interface DaemonNotification {
+  method: DaemonMethod | string;
+  params?: unknown;
+}
+
 export interface DaemonError {
   code: string;
   message: string;
@@ -41,13 +50,76 @@ export interface DaemonResponse {
   error?: DaemonError;
 }
 
+export type DaemonFrame = DaemonRequest | DaemonResponse | DaemonNotification;
+
+/** Spec passed in `OPEN.params`. `cwd` is empty-string when the bridge has none. */
+export interface OpenParams {
+  sessionId: string;
+  spec: {
+    serverName: string;
+    command: string;
+    args: string[];
+    resolvedEnv: Record<string, string>;
+    cwd: string;
+  };
+}
+
+export interface OpenResult {
+  ok: true;
+}
+
+export interface CloseParams {
+  sessionId: string;
+}
+
+export interface CloseResult {
+  ok: true;
+}
+
+/**
+ * RPC notification: bridge↔daemon transparent JSON-RPC pipe. `payload` is the
+ * raw MCP JSON-RPC message (request, response, or notification) verbatim.
+ */
+export interface RpcNotificationParams {
+  sessionId: string;
+  payload: unknown;
+}
+
+export interface StatusChild {
+  pid: number;
+  upstreamHash: string;
+  startedAt: number;
+}
+
+export interface StatusSession {
+  sessionId: string;
+  upstreamHash: string;
+  serverName: string;
+}
+
 export interface StatusResult {
   uptime: number;
   pid: number;
   version: number;
-  children: never[];
-  sessions: never[];
+  children: StatusChild[];
+  sessions: StatusSession[];
 }
+
+// Typed error codes. Listed here so call sites and tests share the literal.
+export const ERROR_CODE_INVALID_REQUEST = "invalid_request";
+export const ERROR_CODE_UNKNOWN_METHOD = "unknown_method";
+export const ERROR_CODE_NOT_IMPLEMENTED = "not_implemented";
+export const ERROR_CODE_TOO_MANY_CONNECTIONS = "too_many_connections";
+export const ERROR_CODE_RPC_TIMEOUT = "rpc_timeout";
+export const ERROR_CODE_BACKPRESSURE = "backpressure";
+export const ERROR_CODE_SESSION_NOT_FOUND = "session_not_found";
+export const ERROR_CODE_SPAWN_FAILED = "spawn_failed";
+export const ERROR_CODE_INVALID_PARAMS = "invalid_params";
+export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
+/** Synthetic JSON-RPC error code emitted to inner requests when the session closes. */
+export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
+/** Synthetic JSON-RPC error code emitted when the per-child stdin queue overflows. */
+export const INNER_ERROR_CODE_BACKPRESSURE = -32001;
 
 const HEADER_BYTES = 4;
 
@@ -123,8 +195,35 @@ export function notImplementedResponse(id: string, method: string): DaemonRespon
   return {
     id,
     error: {
-      code: "not_implemented",
+      code: ERROR_CODE_NOT_IMPLEMENTED,
       message: `method "${method}" is not implemented in this phase`,
     },
   };
+}
+
+/**
+ * A frame is a notification when it has no `id` field (or `id` is null) AND
+ * carries a `method`. Anything with `id + method` is a request; `id + result`
+ * or `id + error` is a response. Frames missing both `id` and `method` are
+ * malformed and should be rejected by the receiver.
+ */
+export function isNotification(frame: unknown): frame is DaemonNotification {
+  if (typeof frame !== "object" || frame === null) return false;
+  const f = frame as { id?: unknown; method?: unknown };
+  if (f.id !== undefined && f.id !== null) return false;
+  return typeof f.method === "string";
+}
+
+export function isRequest(frame: unknown): frame is DaemonRequest {
+  if (typeof frame !== "object" || frame === null) return false;
+  const f = frame as { id?: unknown; method?: unknown };
+  return typeof f.id === "string" && typeof f.method === "string";
+}
+
+export function isResponse(frame: unknown): frame is DaemonResponse {
+  if (typeof frame !== "object" || frame === null) return false;
+  const f = frame as { id?: unknown; method?: unknown; result?: unknown; error?: unknown };
+  if (typeof f.id !== "string") return false;
+  if (typeof f.method === "string") return false;
+  return f.result !== undefined || f.error !== undefined;
 }

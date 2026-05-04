@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import {
   ProcessTracker,
   type TrackedProcess,
-} from "../src/process/process-tracker.js";
+} from "../../src/daemon/process-tracker.js";
 import type {
   KillProcessTreeOptions,
   ProcessInfo,
-} from "../src/process/process-utils.js";
+} from "../../src/process/process-utils.js";
 
 function tempPath(): string {
   return join(
@@ -247,10 +247,11 @@ describe("ProcessTracker", () => {
       expect(result.killed).toBe(1);
     });
 
-    it("trusts start time over cmdline (npx wrapper case)", async () => {
+    it("npx exec-replacement: kills when both start time AND cmdline plausibly match", async () => {
       const fake = new FakeProcessTable();
       // Recorded as npx but live cmdline shows node + npx-cli.js (after exec).
-      // Start time confirms it's ours, so cmdline mismatch is ignored.
+      // The basename "npx" still appears as a substring of "npx-cli.js" and
+      // the inner arg appears verbatim, so cmdlineMatches is true.
       fake.spawn(
         100,
         "node /usr/local/lib/node_modules/npm/bin/npx-cli.js @some/mcp-server",
@@ -270,6 +271,56 @@ describe("ProcessTracker", () => {
       const result = await tracker.reapStale();
       expect(result.killed).toBe(1);
     });
+
+    it(
+      "skips when start time matches but cmdline does NOT (forged-record defense)",
+      async () => {
+        const fake = new FakeProcessTable();
+        // Attacker writes a tracker file with `startedAt: now()` for a victim
+        // PID. Live process is unrelated (a shell, an editor) and its cmdline
+        // doesn't match the recorded command/args.
+        fake.spawn(100, "/Applications/Firefox.app/Contents/MacOS/firefox", 1_700_000_000_500);
+
+        const tracker = makeTracker(filePath, fake);
+        await tracker.register(
+          makeEntry({
+            pid: 100,
+            command: "node",
+            args: ["/server.js"],
+            startedAt: 1_700_000_000_000,
+          }),
+        );
+
+        const result = await tracker.reapStale();
+        expect(result.skipped).toBe(1);
+        expect(fake.killCalls).toHaveLength(0);
+        expect(fake.procs.get(100)!.alive).toBe(true);
+      },
+    );
+
+    it(
+      "skips when start time is EARLIER than recorded by more than tolerance",
+      async () => {
+        const fake = new FakeProcessTable();
+        // Live process started 30 s before the record — cannot be ours, the
+        // record was made after spawn resolved.
+        fake.spawn(100, "node /server.js", 1_699_999_970_000);
+
+        const tracker = makeTracker(filePath, fake);
+        await tracker.register(
+          makeEntry({
+            pid: 100,
+            command: "node",
+            args: ["/server.js"],
+            startedAt: 1_700_000_000_000,
+          }),
+        );
+
+        const result = await tracker.reapStale();
+        expect(result.skipped).toBe(1);
+        expect(fake.procs.get(100)!.alive).toBe(true);
+      },
+    );
 
     it("falls back to cmdline match when start time unavailable", async () => {
       const fake = new FakeProcessTable();

@@ -45,6 +45,12 @@ export const StdioServerConfigSchema = z.object({
   command: z.string(),
   args: z.array(z.string()).optional(),
   env: z.record(z.string(), z.string()).optional(),
+  /**
+   * Working directory for the spawned child. When unset, the daemon inherits
+   * its own cwd. Captured in `upstreamHash` so two upstreams that differ only
+   * in cwd hash differently (and don't share a child in phase C).
+   */
+  cwd: z.string().optional(),
   _bridge: ServerBridgeConfigSchema.optional(),
 });
 

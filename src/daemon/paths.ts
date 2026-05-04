@@ -8,6 +8,7 @@ import {
   DAEMON_PID_FILENAME,
   DAEMON_RUN_SUBDIR,
   DAEMON_SOCKET_FILENAME,
+  PROCESS_TRACKER_FILENAME,
 } from "../constants.js";
 
 function windowsRunDir(): string {
@@ -38,6 +39,10 @@ export function getDaemonPidPath(): string {
 
 export function getDaemonLockPath(): string {
   return join(getDaemonRunDir(), DAEMON_LOCK_FILENAME);
+}
+
+export function getProcessTrackerPath(): string {
+  return join(getDaemonRunDir(), PROCESS_TRACKER_FILENAME);
 }
 
 function sanitizeUser(name: string): string {

@@ -72,13 +72,14 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
     }
   });
 
-  it("OPEN returns not_implemented", async () => {
+  it("OPEN with malformed params returns invalid_params", async () => {
     manager = new ManagerDaemon({
       socketPath: paths.sock,
       pidPath: paths.pid,
       lockPath: paths.lock,
       idleMs: 60_000,
       transport: netTransport,
+      processTrackerPath: join(paths.dir, "processes.json"),
     });
     await manager.start();
 
@@ -90,6 +91,32 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
     });
     try {
       await expect(client.call("OPEN", { hash: "x" })).rejects.toMatchObject({
+        code: "invalid_params",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  it("RESTART still returns not_implemented in phase B", async () => {
+    manager = new ManagerDaemon({
+      socketPath: paths.sock,
+      pidPath: paths.pid,
+      lockPath: paths.lock,
+      idleMs: 60_000,
+      transport: netTransport,
+      processTrackerPath: join(paths.dir, "processes.json"),
+    });
+    await manager.start();
+
+    const client = new DaemonClient({
+      socketPath: paths.sock,
+      transport: netTransport,
+      rpcTimeoutMs: 1_000,
+      connectTimeoutMs: 1_000,
+    });
+    try {
+      await expect(client.call("RESTART", {})).rejects.toMatchObject({
         code: "not_implemented",
       });
     } finally {
@@ -201,7 +228,7 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
     });
     await manager.start();
 
-    const res = manager.handleRequest({} as never);
+    const res = (await manager.handleRequest({} as never)) as { error?: { code?: string } };
     expect(res.error?.code).toBe("invalid_request");
   });
 
