@@ -143,6 +143,8 @@ describe("schema validation", () => {
         toolPolicy: "always",
         daemon: {
           idleMs: 60000,
+          graceMs: 60000,
+          killGraceMs: 2000,
         },
       });
     }

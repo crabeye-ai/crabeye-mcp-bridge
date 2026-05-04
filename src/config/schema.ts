@@ -74,6 +74,10 @@ export const ServerConfigSchema = z.union([
 export const DaemonConfigSchema = z
   .object({
     idleMs: z.number().int().positive().default(60_000),
+    /** Idle-child grace before SIGTERM. Starts when a child's refcount drops to 0. Cancelled on new attach. */
+    graceMs: z.number().int().nonnegative().default(60_000),
+    /** SIGTERM→SIGKILL window once kill is dispatched. */
+    killGraceMs: z.number().int().nonnegative().default(2_000),
   })
   .strict();
 
