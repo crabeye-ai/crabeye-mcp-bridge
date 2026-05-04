@@ -45,7 +45,7 @@ describe.skipIf(isWindows)("ManagerDaemon — subscribe/unsubscribe dedupe", () 
       idleMs: 60_000,
       transport: netTransport,
       processTrackerPath: paths.proc,
-      _spawnChild: (_spec, _cb) => {
+      _spawnChild: () => {
         const handle = {
           startedAt: Date.now(),
           pid: 99999,
