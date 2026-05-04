@@ -464,6 +464,98 @@ export class ManagerDaemon {
     }
     const group = att.group;
 
+    // Dedupe resources/subscribe and resources/unsubscribe.
+    if (isResourceSubscribeRequest(params.payload)) {
+      const reqId = pickInnerId(params.payload);
+      const uri = subscribeUri(params.payload);
+      if (uri === null) {
+        if (reqId !== null) {
+          channel.send({
+            method: "RPC",
+            params: {
+              sessionId: params.sessionId,
+              payload: {
+                jsonrpc: "2.0",
+                id: reqId,
+                error: { code: -32602, message: "resources/subscribe missing or invalid 'uri' param" },
+              },
+            },
+          });
+        }
+        return;
+      }
+      const isFirst = group.subscriptions.subscribe(params.sessionId, uri);
+      if (reqId !== null) {
+        channel.send({
+          method: "RPC",
+          params: {
+            sessionId: params.sessionId,
+            payload: { jsonrpc: "2.0", id: reqId, result: {} },
+          },
+        });
+      }
+      if (isFirst) {
+        try {
+          group.child.send({
+            jsonrpc: "2.0",
+            method: "resources/subscribe",
+            params: { uri },
+          });
+        } catch (err) {
+          this.logger.debug(
+            `subscribe forward failed: ${err instanceof Error ? err.message : String(err)}`,
+            { component: "daemon", upstreamHash: group.upstreamHash, uri },
+          );
+        }
+      }
+      return;
+    }
+    if (isResourceUnsubscribeRequest(params.payload)) {
+      const reqId = pickInnerId(params.payload);
+      const uri = subscribeUri(params.payload);
+      if (uri === null) {
+        if (reqId !== null) {
+          channel.send({
+            method: "RPC",
+            params: {
+              sessionId: params.sessionId,
+              payload: {
+                jsonrpc: "2.0",
+                id: reqId,
+                error: { code: -32602, message: "resources/unsubscribe missing or invalid 'uri' param" },
+              },
+            },
+          });
+        }
+        return;
+      }
+      const isLast = group.subscriptions.unsubscribe(params.sessionId, uri);
+      if (reqId !== null) {
+        channel.send({
+          method: "RPC",
+          params: {
+            sessionId: params.sessionId,
+            payload: { jsonrpc: "2.0", id: reqId, result: {} },
+          },
+        });
+      }
+      if (isLast) {
+        try {
+          group.child.send({
+            jsonrpc: "2.0",
+            method: "resources/unsubscribe",
+            params: { uri },
+          });
+        } catch (err) {
+          this.logger.debug(
+            `unsubscribe forward failed: ${err instanceof Error ? err.message : String(err)}`,
+            { component: "daemon", upstreamHash: group.upstreamHash, uri },
+          );
+        }
+      }
+      return;
+    }
+
     // Daemon-side initialize short-circuit.
     if (isInitializeRequest(params.payload) && group.child.cachedInit !== null) {
       const reqId = pickInnerId(params.payload);
@@ -1032,6 +1124,26 @@ function isInitializedNotification(payload: unknown): boolean {
   if (typeof payload !== "object" || payload === null) return false;
   const p = payload as { method?: unknown };
   return p.method === "notifications/initialized";
+}
+
+function isResourceSubscribeRequest(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as { method?: unknown };
+  return p.method === "resources/subscribe";
+}
+
+function isResourceUnsubscribeRequest(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as { method?: unknown };
+  return p.method === "resources/unsubscribe";
+}
+
+function subscribeUri(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as { params?: unknown };
+  if (typeof p.params !== "object" || p.params === null) return null;
+  const params = p.params as { uri?: unknown };
+  return typeof params.uri === "string" ? params.uri : null;
 }
 
 /**
