@@ -951,20 +951,24 @@ export class ManagerDaemon {
     }
   }
 
-  private unregisterGroup(group: ChildGroup): Promise<void> {
-    this.groups.delete(group.upstreamHash);
+  private async unregisterGroup(group: ChildGroup): Promise<void> {
+    if (this.groups.get(group.upstreamHash) === group) {
+      this.groups.delete(group.upstreamHash);
+    }
     this.cancelGraceTimer(group);
     const pid = group.child.pid;
-    const killPromise = group.child.kill(this.killGraceMs()).catch(() => {
+    try {
+      await group.child.kill(this.killGraceMs());
+    } catch {
       /* best-effort */
-    });
-    const unregisterPromise =
-      pid !== null
-        ? this.tracker.unregister(pid).catch(() => {
-            /* best-effort */
-          })
-        : Promise.resolve();
-    return Promise.all([killPromise, unregisterPromise]).then(() => {});
+    }
+    if (pid !== null) {
+      try {
+        await this.tracker.unregister(pid);
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 
   private killGraceMs(): number {
