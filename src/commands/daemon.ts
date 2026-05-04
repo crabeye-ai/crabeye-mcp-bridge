@@ -47,6 +47,8 @@ export async function runDaemonInternal(): Promise<number> {
     pidPath: getDaemonPidPath(),
     lockPath: getDaemonLockPath(),
     idleMs: cfg.idleMs,
+    graceMs: cfg.graceMs,
+    killGraceMs: cfg.killGraceMs,
     transport: netTransport,
   });
 
