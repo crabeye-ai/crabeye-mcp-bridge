@@ -88,3 +88,26 @@ describe("TokenRewriter — progressToken", () => {
     expect(back.sessionIds).toEqual([]);
   });
 });
+
+describe("TokenRewriter — cancelled.requestId", () => {
+  it("rewrites outbound cancelled.requestId to the outer id of the cancelled request", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    const aReq = r.outboundForChild({ jsonrpc: "2.0", id: 7, method: "tools/call" }, "A") as { id: number };
+    const cancel = r.outboundForChild(
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7, reason: "user" } },
+      "A",
+    ) as { params: { requestId: unknown } };
+    expect(cancel.params.requestId).toBe(aReq.id);
+  });
+
+  it("drops outbound cancelled.requestId for an unknown id (defensive — id never sent)", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    const cancel = r.outboundForChild(
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 999, reason: "user" } },
+      "A",
+    );
+    expect(cancel).toBeNull();
+  });
+});

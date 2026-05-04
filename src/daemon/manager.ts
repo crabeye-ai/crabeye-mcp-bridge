@@ -453,6 +453,7 @@ export class ManagerDaemon {
       }
       throw err;
     }
+    if (rewritten === null) return; // drop unrouted/silent frames (e.g. cancelled for unknown id)
     // Capture the outer id allocated by outboundForChild so we can remove it
     // from inflight tracking if the child stdin write fails (Phase C: outer id
     // is a fresh integer, not the original inner id).

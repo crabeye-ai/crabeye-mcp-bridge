@@ -83,9 +83,26 @@ export class TokenRewriter {
   }
 
   /** Bridge → child rewrite. Allocates a fresh outer id for requests; passes notifications through (subject to per-method rules in later tasks). */
-  outboundForChild(payload: unknown, sessionId: string): unknown {
+  outboundForChild(payload: unknown, sessionId: string): unknown | null {
     if (!isJsonObject(payload)) return payload;
     const p = payload as Record<string, unknown>;
+
+    // notifications/cancelled rewrite: look up the outer id by (sessionId, originalId).
+    if (typeof p.method === "string" && p.method === "notifications/cancelled") {
+      const params = isJsonObject(p.params) ? (p.params as Record<string, unknown>) : undefined;
+      const reqId = params?.requestId;
+      if (typeof reqId !== "string" && typeof reqId !== "number") return null;
+      let outerId: number | undefined;
+      for (const [outer, origin] of this.outerIdToOrigin) {
+        if (origin.sessionId === sessionId && origin.originalId === reqId) {
+          outerId = outer;
+          break;
+        }
+      }
+      if (outerId === undefined) return null;
+      return { ...p, params: { ...(params ?? {}), requestId: outerId } };
+    }
+
     const isReq = typeof p.method === "string" && (typeof p.id === "string" || typeof p.id === "number");
     if (!isReq) return payload;
     const set = this.inflightBySession.get(sessionId);
