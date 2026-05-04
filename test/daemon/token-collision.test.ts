@@ -48,3 +48,43 @@ describe("TokenRewriter — opaque-int id rewriting", () => {
     expect(back.kind).toBe("drop");
   });
 });
+
+describe("TokenRewriter — progressToken", () => {
+  it("rewrites outbound progressToken and routes inbound progress to origin", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    r.attachSession("B");
+    const aReq = r.outboundForChild(
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { _meta: { progressToken: "tok-A" } } },
+      "A",
+    ) as { params: { _meta: { progressToken: unknown } } };
+    const bReq = r.outboundForChild(
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { _meta: { progressToken: "tok-B" } } },
+      "B",
+    ) as { params: { _meta: { progressToken: unknown } } };
+
+    expect(typeof aReq.params._meta.progressToken).toBe("number");
+    expect(aReq.params._meta.progressToken).not.toBe(bReq.params._meta.progressToken);
+
+    const aProg = r.inboundFromChild({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: aReq.params._meta.progressToken, progress: 50, total: 100 },
+    });
+    expect(aProg.kind).toBe("progress");
+    expect(aProg.sessionIds).toEqual(["A"]);
+    expect((aProg.payload as { params: { progressToken: unknown } }).params.progressToken).toBe("tok-A");
+  });
+
+  it("inbound progress with unknown token is dropped", () => {
+    const r = new TokenRewriter();
+    r.attachSession("A");
+    const back = r.inboundFromChild({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: 99999, progress: 1 },
+    });
+    expect(back.kind).toBe("drop");
+    expect(back.sessionIds).toEqual([]);
+  });
+});

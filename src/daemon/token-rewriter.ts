@@ -100,7 +100,24 @@ export class TokenRewriter {
     const outerId = this.nextOuterId++;
     this.outerIdToOrigin.set(outerId, { sessionId, originalId: p.id as InnerId });
     set.add(outerId);
-    return { ...p, id: outerId };
+
+    const rewritten: Record<string, unknown> = { ...p, id: outerId };
+    const params = isJsonObject(p.params) ? (p.params as Record<string, unknown>) : undefined;
+    if (params !== undefined) {
+      const meta = isJsonObject(params._meta) ? (params._meta as Record<string, unknown>) : undefined;
+      if (
+        meta !== undefined &&
+        (typeof meta.progressToken === "string" || typeof meta.progressToken === "number")
+      ) {
+        const outerProg = this.nextOuterProgress++;
+        this.outerProgressToOrigin.set(outerProg, {
+          sessionId,
+          originalToken: meta.progressToken as InnerId,
+        });
+        rewritten.params = { ...params, _meta: { ...meta, progressToken: outerProg } };
+      }
+    }
+    return rewritten;
   }
 
   /** Pop a single outer id without delivering a response. Used when a bridge→child write fails (backpressure). */
@@ -128,6 +145,21 @@ export class TokenRewriter {
         payload: { ...p, id: origin.originalId },
         kind: "response",
       };
+    }
+    if (typeof p.method === "string" && p.method === "notifications/progress") {
+      const params = isJsonObject(p.params) ? (p.params as Record<string, unknown>) : undefined;
+      const tok = params?.progressToken;
+      if (typeof tok === "number") {
+        const origin = this.outerProgressToOrigin.get(tok);
+        if (origin === undefined) return { sessionIds: [], payload, kind: "drop" };
+        // progressToken survives across multiple progress notifications, do NOT delete on each update.
+        const restoredParams = { ...(params ?? {}), progressToken: origin.originalToken };
+        return {
+          sessionIds: [origin.sessionId],
+          payload: { ...p, params: restoredParams },
+          kind: "progress",
+        };
+      }
     }
     return { sessionIds: [], payload, kind: "other" };
   }
