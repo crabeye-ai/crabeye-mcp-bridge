@@ -127,6 +127,10 @@ export interface ManagerOptions {
   lockPath: string;
   /** Daemon self-exits after `idleMs` of having no children/sessions. */
   idleMs: number;
+  /** Idle-child grace before kill is dispatched. Default 60_000ms. */
+  graceMs?: number;
+  /** SIGTERM→SIGKILL window. Default 2_000ms. */
+  killGraceMs?: number;
   transport: Transport;
   /** Override pid for tests. */
   pid?: number;
@@ -179,6 +183,8 @@ export class ManagerDaemon {
   private readonly maxConnections: number;
   private readonly maxSessionsPerChannel: number;
   private readonly maxSessionsTotal: number;
+  private readonly graceMs: number;
+  private readonly killGraceMsValue: number;
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
   private readonly exitedPromise: Promise<number>;
@@ -190,6 +196,8 @@ export class ManagerDaemon {
     this.maxConnections = opts.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
     this.maxSessionsPerChannel = opts.maxSessionsPerChannel ?? DEFAULT_MAX_SESSIONS_PER_CHANNEL;
     this.maxSessionsTotal = opts.maxSessionsTotal ?? DEFAULT_MAX_SESSIONS_TOTAL;
+    this.graceMs = opts.graceMs ?? 60_000;
+    this.killGraceMsValue = opts.killGraceMs ?? 2_000;
     this.logger = opts.logger ?? createNoopLogger();
     this.tracker =
       opts.processTracker ??
@@ -914,10 +922,26 @@ export class ManagerDaemon {
     }
   }
 
-  /** Arm idle-child grace timer. Stub — Task 13 implements. */
   private armGraceTimer(group: ChildGroup): void {
-    // TODO Task 13: real timer
-    void group;
+    this.cancelGraceTimer(group);
+    if (this.graceMs === 0) {
+      void this.expireGroup(group);
+      return;
+    }
+    group.graceTimer = setTimeout(() => {
+      void this.expireGroup(group);
+    }, this.graceMs);
+    if (typeof group.graceTimer.unref === "function") group.graceTimer.unref();
+  }
+
+  private async expireGroup(group: ChildGroup): Promise<void> {
+    if (group.sessions.size > 0) return; // re-attached during the window
+    group.dying = true;
+    group.graceTimer = null;
+    await this.unregisterGroup(group).catch(() => {});
+    if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
+      this.armIdleTimer();
+    }
   }
 
   private cancelGraceTimer(group: ChildGroup): void {
@@ -944,8 +968,7 @@ export class ManagerDaemon {
   }
 
   private killGraceMs(): number {
-    // Pull from opts when wired; for now the field doesn't exist on ManagerOptions, so default to 2000.
-    return (this.opts as { killGraceMs?: number }).killGraceMs ?? 2000;
+    return this.killGraceMsValue;
   }
 
   /**
