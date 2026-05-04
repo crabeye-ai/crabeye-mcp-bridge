@@ -25,6 +25,14 @@ export class BackpressureError extends Error {
   }
 }
 
+export interface CachedInit {
+  /** Echoed back to subsequent sessions verbatim — daemon does not re-negotiate. */
+  protocolVersion: string;
+  /** From the child's `initialize` response. */
+  serverInfo: { name: string; version: string; [k: string]: unknown };
+  capabilities: Record<string, unknown>;
+}
+
 export interface ChildHandleOptions {
   command: string;
   args: string[];
@@ -62,6 +70,7 @@ export class ChildHandle {
   private readonly queueMaxBytes: number;
   private readonly stdoutMaxBytes: number;
   private readonly opts: ChildHandleOptions;
+  private _cachedInit: CachedInit | null = null;
 
   constructor(opts: ChildHandleOptions) {
     this.opts = opts;
@@ -121,6 +130,16 @@ export class ChildHandle {
     return !this.closed && this.child.exitCode === null;
   }
 
+  get cachedInit(): CachedInit | null {
+    return this._cachedInit;
+  }
+
+  /** First writer wins. Subsequent calls are no-ops. */
+  setCachedInit(init: CachedInit): void {
+    if (this._cachedInit !== null) return;
+    this._cachedInit = init;
+  }
+
   /**
    * Append one MCP JSON-RPC message to the child's stdin. Throws
    * `BackpressureError` (code: backpressure) when the cumulative outstanding
@@ -145,10 +164,10 @@ export class ChildHandle {
   }
 
   /**
-   * Kill the child with SIGTERM, then SIGKILL after `graceMs`. Resolves once
+   * Kill the child with SIGTERM, then SIGKILL after `killGraceMs`. Resolves once
    * the child has exited or the kill window has elapsed.
    */
-  async kill(graceMs = 2000): Promise<void> {
+  async kill(killGraceMs = 2000): Promise<void> {
     if (this.closed || this.child.exitCode !== null) {
       this.closed = true;
       return;
@@ -161,7 +180,7 @@ export class ChildHandle {
       /* already gone */
     }
 
-    const exited = await waitForExit(this.child, graceMs);
+    const exited = await waitForExit(this.child, killGraceMs);
     if (exited) return;
 
     try {
@@ -169,7 +188,7 @@ export class ChildHandle {
     } catch {
       /* gone between checks */
     }
-    await waitForExit(this.child, graceMs);
+    await waitForExit(this.child, killGraceMs);
   }
 
   private _onStdout(chunk: string): void {
