@@ -32,6 +32,8 @@ import {
   type StatusSession,
 } from "./protocol.js";
 import { InflightOverflowError, TokenRewriter, type InnerId } from "./token-rewriter.js";
+import { SubscriptionTracker } from "./subscription-tracker.js";
+import { NotificationRouter } from "./notification-router.js";
 import type { DaemonServer, FrameChannel, Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
@@ -92,13 +94,29 @@ const PROTOCOL_MISSING_FIELD: DaemonError = {
   message: "request missing required fields { id, method }",
 };
 
-interface SessionState {
-  sessionId: string;
-  channel: FrameChannel;
+interface ChildGroup {
+  upstreamHash: string;
   child: ChildHandle;
   rewriter: TokenRewriter;
+  subscriptions: SubscriptionTracker;
+  router: NotificationRouter;
+  /** Sessions attached to this child. */
+  sessions: Set<string>;
+  /** Metadata captured at first spawn. */
   serverName: string;
-  upstreamHash: string;
+  startedAt: number;
+  /** Idle-child grace timer; non-null only when refcount==0. */
+  graceTimer: NodeJS.Timeout | null;
+  /** True once SIGTERM has been dispatched; new attaches must spawn fresh. */
+  dying: boolean;
+  /** True once the daemon has seen `notifications/initialized` from any session for this group. */
+  initializedSeen: boolean;
+}
+
+interface SessionAttachment {
+  sessionId: string;
+  channel: FrameChannel;
+  group: ChildGroup;
   startedAt: number;
 }
 
@@ -151,7 +169,8 @@ export class ManagerDaemon {
   private lock: LockHandle | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   private connections = new Set<FrameChannel>();
-  private sessions = new Map<string, SessionState>();
+  private groups = new Map<string, ChildGroup>();
+  private sessions = new Map<string, SessionAttachment>();
   private sessionsByChannel = new Map<FrameChannel, Set<string>>();
   private startedAt = 0;
   private stopping = false;
@@ -258,9 +277,11 @@ export class ManagerDaemon {
     // a clean kill and the tracker is up-to-date.
     const sessionIds = Array.from(this.sessions.keys());
     for (const sid of sessionIds) {
-      await this.closeSession(sid, "session closed").catch(() => {
-        /* swallow during shutdown */
-      });
+      await this.detachSession(sid, "daemon shutdown").catch(() => {});
+    }
+    const groups = Array.from(this.groups.values());
+    for (const g of groups) {
+      await this.unregisterGroup(g).catch(() => {});
     }
 
     for (const ch of this.connections) {
@@ -388,13 +409,13 @@ export class ManagerDaemon {
       this.sessionsByChannel.delete(channel);
       if (ownedSessions) {
         for (const sid of ownedSessions) {
-          // Channel died: emit synthetic errors and reap.
-          void this.closeSession(sid, "session closed").catch(() => {
+          // Channel died: emit synthetic errors and detach.
+          void this.detachSession(sid, "session closed").catch(() => {
             /* logged inside */
           });
         }
       }
-      if (this.connections.size === 0 && this.sessions.size === 0 && !this.stopping) {
+      if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
         this.armIdleTimer();
       }
     });
@@ -430,9 +451,9 @@ export class ManagerDaemon {
       this.logger.warn("RPC notification with invalid params", { component: "daemon" });
       return;
     }
-    const session = this.sessions.get(params.sessionId);
-    if (session === undefined || session.channel !== channel) {
-      // Cross-channel session access is never legal in B; silently drop to
+    const att = this.sessions.get(params.sessionId);
+    if (att === undefined || att.channel !== channel) {
+      // Cross-channel session access is never legal; silently drop to
       // avoid leaking session existence.
       this.logger.debug("RPC for unknown session", {
         component: "daemon",
@@ -440,43 +461,38 @@ export class ManagerDaemon {
       });
       return;
     }
+    const group = att.group;
     let rewritten: unknown;
     try {
-      rewritten = session.rewriter.outboundForChild(params.payload, session.sessionId);
+      rewritten = group.rewriter.outboundForChild(params.payload, params.sessionId);
     } catch (err) {
       if (err instanceof InflightOverflowError) {
         const innerId = pickInnerId(params.payload);
         if (innerId !== null) {
-          this.sendInnerError(channel, session.sessionId, innerId, INNER_ERROR_CODE_BACKPRESSURE, err.message);
+          this.sendInnerError(channel, params.sessionId, innerId, INNER_ERROR_CODE_BACKPRESSURE, err.message);
         }
         return;
       }
       throw err;
     }
-    if (rewritten === null) return; // drop unrouted/silent frames (e.g. cancelled for unknown id)
-    // Capture the outer id allocated by outboundForChild so we can remove it
-    // from inflight tracking if the child stdin write fails (Phase C: outer id
-    // is a fresh integer, not the original inner id).
+    if (rewritten === null) return;
     const allocatedOuterId = (rewritten as { id?: unknown })?.id;
     try {
-      session.child.send(rewritten);
+      group.child.send(rewritten);
     } catch (err) {
       if (err instanceof BackpressureError) {
         const innerId = pickInnerId(params.payload);
         if (innerId !== null) {
-          // The outer id was added to inflight tracking by outboundForChild but
-          // the child never received it — pop it so the tracking Set doesn't
-          // leak it forever.
           if (typeof allocatedOuterId === "number") {
-            session.rewriter.removeInflight(session.sessionId, allocatedOuterId);
+            group.rewriter.removeInflight(params.sessionId, allocatedOuterId);
           }
-          this.sendInnerError(channel, session.sessionId, innerId, INNER_ERROR_CODE_BACKPRESSURE, err.message);
+          this.sendInnerError(channel, params.sessionId, innerId, INNER_ERROR_CODE_BACKPRESSURE, err.message);
         }
         return;
       }
       this.logger.warn(
         `child stdin write failed: ${err instanceof Error ? err.message : String(err)}`,
-        { component: "daemon", sessionId: session.sessionId },
+        { component: "daemon", sessionId: params.sessionId },
       );
     }
   }
@@ -517,83 +533,109 @@ export class ManagerDaemon {
       cwd: params.spec.cwd,
     });
 
-    const rewriter = new TokenRewriter();
-    rewriter.attachSession(params.sessionId);
-
-    const sessionLogger = this.logger.child({
-      component: "daemon",
-      server: params.spec.serverName,
-      sessionId: params.sessionId,
-    });
-
-    let child: ChildHandle;
-    try {
-      const callbacks = {
-        onMessage: (payload: unknown): void => {
-          this.routeChildMessage(params.sessionId, rewriter, payload);
-        },
-        onClose: (): void => {
-          this.handleChildExit(params.sessionId);
-        },
-        onError: (err: Error): void => {
-          sessionLogger.warn(`child error: ${err.message}`);
-        },
-        onStderr: (line: string): void => {
-          sessionLogger.debug(line, { stream: "stderr" });
-        },
-      };
-
-      child = this.opts._spawnChild
-        ? this.opts._spawnChild(params.spec, callbacks)
-        : new ChildHandle({
-            command: params.spec.command,
-            args: params.spec.args,
-            env: buildSpawnEnv(params.spec.resolvedEnv),
-            cwd: params.spec.cwd === "" ? undefined : params.spec.cwd,
-            ...callbacks,
-          });
-    } catch (err) {
-      return errorResponse(
-        requestId,
-        ERROR_CODE_SPAWN_FAILED,
-        err instanceof Error ? err.message : String(err),
-      );
+    const existing = this.groups.get(hash);
+    let group: ChildGroup;
+    if (existing !== undefined && !existing.dying) {
+      group = existing;
+      this.cancelGraceTimer(group);
+    } else {
+      const spawned = this.spawnGroup(hash, params.spec);
+      if (spawned instanceof Error) {
+        return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
+      }
+      group = spawned;
+      this.groups.set(hash, group);
     }
 
-    const state: SessionState = {
+    group.rewriter.attachSession(params.sessionId);
+    group.sessions.add(params.sessionId);
+
+    const attachment: SessionAttachment = {
       sessionId: params.sessionId,
       channel,
-      child,
-      rewriter,
-      serverName: params.spec.serverName,
-      upstreamHash: hash,
-      startedAt: child.startedAt,
+      group,
+      startedAt: Date.now(),
     };
-    this.sessions.set(params.sessionId, state);
+    this.sessions.set(params.sessionId, attachment);
     const owned = this.sessionsByChannel.get(channel) ?? new Set<string>();
     owned.add(params.sessionId);
     this.sessionsByChannel.set(channel, owned);
     this.cancelIdleTimer();
 
-    if (child.pid !== null) {
-      try {
-        await this.tracker.register({
-          pid: child.pid,
-          command: params.spec.command,
-          args: params.spec.args,
-          server: params.spec.serverName,
-          startedAt: child.startedAt,
-        });
-      } catch (err) {
-        this.logger.warn(`failed to record spawned subprocess: ${err instanceof Error ? err.message : String(err)}`, {
-          component: "daemon",
-          sessionId: params.sessionId,
-          pid: child.pid,
-        });
-      }
+    return { id: requestId, result: { ok: true } };
+  }
+
+  private spawnGroup(hash: string, spec: OpenParams["spec"]): ChildGroup | Error {
+    const rewriter = new TokenRewriter();
+    const subscriptions = new SubscriptionTracker();
+    const router = new NotificationRouter();
+    const groupRef: { value: ChildGroup | null } = { value: null };
+
+    const callbacks = {
+      onMessage: (payload: unknown): void => {
+        const g = groupRef.value;
+        if (g !== null) this.routeChildMessage(g, payload);
+      },
+      onClose: (): void => {
+        const g = groupRef.value;
+        if (g !== null) this.handleChildExit(g);
+      },
+      onError: (err: Error): void => {
+        this.logger.warn(`child error: ${err.message}`, { component: "daemon", upstreamHash: hash });
+      },
+      onStderr: (line: string): void => {
+        this.logger.debug(line, { component: "daemon", upstreamHash: hash, stream: "stderr" });
+      },
+    };
+
+    let child: ChildHandle;
+    try {
+      child = this.opts._spawnChild
+        ? this.opts._spawnChild(spec, callbacks)
+        : new ChildHandle({
+            command: spec.command,
+            args: spec.args,
+            env: buildSpawnEnv(spec.resolvedEnv),
+            cwd: spec.cwd === "" ? undefined : spec.cwd,
+            ...callbacks,
+          });
+    } catch (err) {
+      return err instanceof Error ? err : new Error(String(err));
     }
 
-    return { id: requestId, result: { ok: true } };
+    const group: ChildGroup = {
+      upstreamHash: hash,
+      child,
+      rewriter,
+      subscriptions,
+      router,
+      sessions: new Set(),
+      serverName: spec.serverName,
+      startedAt: child.startedAt,
+      graceTimer: null,
+      dying: false,
+      initializedSeen: false,
+    };
+    groupRef.value = group;
+
+    if (child.pid !== null) {
+      void this.tracker
+        .register({
+          pid: child.pid,
+          command: spec.command,
+          args: spec.args,
+          server: spec.serverName,
+          startedAt: child.startedAt,
+        })
+        .catch((err) => {
+          this.logger.warn(
+            `failed to record spawned subprocess: ${err instanceof Error ? err.message : String(err)}`,
+            { component: "daemon", pid: child.pid },
+          );
+        });
+    }
+
+    return group;
   }
 
   private async handleClose(requestId: string, rawParams: unknown): Promise<DaemonResponse> {
@@ -601,101 +643,157 @@ export class ManagerDaemon {
     if (params === null) {
       return errorResponse(requestId, ERROR_CODE_INVALID_PARAMS, "CLOSE params malformed");
     }
-    const session = this.sessions.get(params.sessionId);
-    if (session === undefined) {
+    if (!this.sessions.has(params.sessionId)) {
       return errorResponse(requestId, ERROR_CODE_SESSION_NOT_FOUND, "no such session");
     }
-    await this.closeSession(params.sessionId, "session closed");
+    await this.detachSession(params.sessionId, "session closed");
     return { id: requestId, result: { ok: true } };
   }
 
   /**
-   * Route an inbound child→bridge message to its session(s). For phase B
-   * this is always the single session attached to the child.
-   *
-   * Phase C routing:
-   * - "response": sessionIds resolved from outer-id map; payload has original
-   *   id restored. Deliver to the single resolved session.
-   * - "other": notifications and other unrecognised frames — broadcast to the
-   *   owning session (phase B: 1:1; phase C Task 6 replaces this with the
-   *   NotificationRouter fan-out).
-   * - "drop": no mapping found; silently discard.
+   * Route an inbound child→bridge message to the correct session(s).
+   * - "response" / "progress" / "cancelled": sessionIds from rewriter (originating session)
+   * - "drop": silently discard
+   * - "other": defer to NotificationRouter for fan-out across all attached sessions
    */
-  private routeChildMessage(sessionId: string, rewriter: TokenRewriter, payload: unknown): void {
-    const routing = rewriter.inboundFromChild(payload);
-    const targetIds = routing.kind === "other" ? [sessionId] : routing.sessionIds;
-    for (const sid of targetIds) {
-      const session = this.sessions.get(sid);
-      if (session === undefined) continue;
-      const ok = session.channel.send({
-        method: "RPC",
-        params: { sessionId: sid, payload: routing.payload },
-      });
+  private routeChildMessage(group: ChildGroup, payload: unknown): void {
+    const routing = group.rewriter.inboundFromChild(payload);
+    if (routing.kind === "drop") return;
+    if (routing.kind === "response" || routing.kind === "progress" || routing.kind === "cancelled") {
+      this.deliver(group, routing.sessionIds, routing.payload);
+      return;
+    }
+    // "other" — defer to NotificationRouter.
+    const sessions = group.router.route(routing.payload, Array.from(group.sessions), group.subscriptions);
+    if (sessions.length > 0) this.deliver(group, sessions, routing.payload);
+  }
+
+  private deliver(group: ChildGroup, sessionIds: string[], payload: unknown): void {
+    for (const sid of sessionIds) {
+      const att = this.sessions.get(sid);
+      if (att === undefined) continue;
+      const ok = att.channel.send({ method: "RPC", params: { sessionId: sid, payload } });
       if (!ok) {
         this.logger.debug("RPC notification dropped (backpressure)", {
           component: "daemon",
-          sessionId,
+          sessionId: sid,
+          upstreamHash: group.upstreamHash,
         });
       }
     }
   }
 
-  private handleChildExit(sessionId: string): void {
-    // Child died on its own (crash, exit). Run synthetic-error cleanup and
-    // drop session state. The bridge will see the channel still open but
-    // its in-flight requests resolve with `session closed`.
-    void this.closeSession(sessionId, "child process exited").catch(() => {
-      /* logged inside */
-    });
+  private handleChildExit(group: ChildGroup): void {
+    const sessionIds = Array.from(group.sessions);
+    for (const sid of sessionIds) {
+      void this.detachSession(sid, "child process exited").catch(() => {});
+    }
+    this.unregisterGroup(group);
   }
 
   /**
-   * Close a session: emit synthetic JSON-RPC error responses for any
-   * in-flight inner request `id`s, kill the child, unregister from the
-   * process tracker, and drop the session state.
+   * Detach a session from its group. Emits synthetic session_closed errors
+   * for in-flight requests, decrements refcount, arms the grace timer at 0.
+   * Does NOT kill the child unless the grace timer expires.
    */
-  private async closeSession(sessionId: string, reason: string): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (session === undefined) return;
+  private async detachSession(sessionId: string, reason: string): Promise<void> {
+    const att = this.sessions.get(sessionId);
+    if (att === undefined) return;
     this.sessions.delete(sessionId);
 
-    const owned = this.sessionsByChannel.get(session.channel);
-    if (owned) {
-      owned.delete(sessionId);
-    }
+    const owned = this.sessionsByChannel.get(att.channel);
+    if (owned) owned.delete(sessionId);
 
-    // Synthetic errors first so the bridge MCP client clears its pending
-    // promises before the channel maybe goes away.
-    // Resolve original inner ids BEFORE detachSession (which clears the origin map),
-    // then send errors AFTER detach so the rewriter state is clean before any callbacks fire.
-    const inflightOuters = session.rewriter.inflightForSession(sessionId);
+    const group = att.group;
+    group.sessions.delete(sessionId);
+
+    // Synthetic errors for inflight requests.
+    // Peek originals BEFORE detachSession (which clears the origin map).
+    const inflight = group.rewriter.inflightForSession(sessionId);
     const originals: InnerId[] = [];
-    for (const outerId of inflightOuters) {
-      const origin = session.rewriter.peekOrigin(outerId);
+    for (const outerId of inflight) {
+      const origin = group.rewriter.peekOrigin(outerId);
       if (origin !== undefined) originals.push(origin.originalId);
     }
-    session.rewriter.detachSession(sessionId);
+
+    // Drop subscriptions; collect URIs that lost their last subscriber.
+    const droppedUris = group.subscriptions.removeSession(sessionId);
+
+    // Detach session from rewriter; collect outer ids to cancel on the child.
+    const { cancelledOuterIds } = group.rewriter.detachSession(sessionId);
+
+    // Send synthetic errors AFTER detach so rewriter state is clean.
     for (const innerId of originals) {
-      this.sendInnerError(session.channel, sessionId, innerId, INNER_ERROR_CODE_SESSION_CLOSED, reason);
+      this.sendInnerError(att.channel, sessionId, innerId, INNER_ERROR_CODE_SESSION_CLOSED, reason);
     }
 
-    const pid = session.child.pid;
-    try {
-      await session.child.kill();
-    } catch {
-      /* best-effort */
-    }
-    if (pid !== null) {
+    // Forward `notifications/cancelled` to the child for each outstanding outer id.
+    for (const outerId of cancelledOuterIds) {
       try {
-        await this.tracker.unregister(pid);
+        group.child.send({
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: outerId, reason: "session detached" },
+        });
+      } catch {
+        /* child may be dying; best-effort */
+      }
+    }
+
+    // Forward `resources/unsubscribe` to the child for each URI that lost all subscribers.
+    for (const uri of droppedUris) {
+      try {
+        group.child.send({
+          jsonrpc: "2.0",
+          method: "resources/unsubscribe",
+          params: { uri },
+        });
       } catch {
         /* best-effort */
       }
     }
 
-    if (this.connections.size === 0 && this.sessions.size === 0 && !this.stopping) {
+    if (group.sessions.size === 0) {
+      this.armGraceTimer(group);
+    }
+
+    if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
       this.armIdleTimer();
     }
+  }
+
+  /** Arm idle-child grace timer. Stub — Task 13 implements. */
+  private armGraceTimer(group: ChildGroup): void {
+    // TODO Task 13: real timer
+    void group;
+  }
+
+  private cancelGraceTimer(group: ChildGroup): void {
+    if (group.graceTimer !== null) {
+      clearTimeout(group.graceTimer);
+      group.graceTimer = null;
+    }
+  }
+
+  private unregisterGroup(group: ChildGroup): Promise<void> {
+    this.groups.delete(group.upstreamHash);
+    this.cancelGraceTimer(group);
+    const pid = group.child.pid;
+    const killPromise = group.child.kill(this.killGraceMs()).catch(() => {
+      /* best-effort */
+    });
+    const unregisterPromise =
+      pid !== null
+        ? this.tracker.unregister(pid).catch(() => {
+            /* best-effort */
+          })
+        : Promise.resolve();
+    return Promise.all([killPromise, unregisterPromise]).then(() => {});
+  }
+
+  private killGraceMs(): number {
+    // Pull from opts when wired; for now the field doesn't exist on ManagerOptions, so default to 2000.
+    return (this.opts as { killGraceMs?: number }).killGraceMs ?? 2000;
   }
 
   /**
@@ -721,31 +819,33 @@ export class ManagerDaemon {
   }
 
   private statusChildren(): StatusChild[] {
-    const seen = new Map<string, StatusChild>();
-    for (const session of this.sessions.values()) {
-      const pid = session.child.pid;
-      if (pid === null) continue;
-      seen.set(`${pid}`, {
-        pid,
-        upstreamHash: session.upstreamHash,
-        startedAt: session.startedAt,
-      });
-    }
-    return Array.from(seen.values());
+    return Array.from(this.groups.values()).map((g) => ({
+      pid: g.child.pid ?? -1,
+      upstreamHash: g.upstreamHash,
+      startedAt: g.startedAt,
+      refcount: g.sessions.size,
+      sessions: Array.from(g.sessions),
+      subscriptionCount: g.subscriptions.subscriptionCount(),
+      mode: "shared",
+      cachedInit:
+        g.child.cachedInit === null
+          ? null
+          : { protocolVersion: g.child.cachedInit.protocolVersion },
+    }));
   }
 
   private statusSessions(): StatusSession[] {
-    return Array.from(this.sessions.values()).map((s) => ({
-      sessionId: s.sessionId,
-      upstreamHash: s.upstreamHash,
-      serverName: s.serverName,
+    return Array.from(this.sessions.values()).map((a) => ({
+      sessionId: a.sessionId,
+      upstreamHash: a.group.upstreamHash,
+      serverName: a.group.serverName,
     }));
   }
 
   private armIdleTimer(): void {
     this.cancelIdleTimer();
     this.idleTimer = setTimeout(() => {
-      if (!this.stopping && this.connections.size === 0 && this.sessions.size === 0) {
+      if (!this.stopping && this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0) {
         void this.stop(0);
       }
     }, this.opts.idleMs);

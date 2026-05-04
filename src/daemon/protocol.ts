@@ -89,6 +89,11 @@ export interface StatusChild {
   pid: number;
   upstreamHash: string;
   startedAt: number;
+  refcount: number;
+  sessions: string[];
+  subscriptionCount: number;
+  mode: "shared";
+  cachedInit: { protocolVersion: string } | null;
 }
 
 export interface StatusSession {
