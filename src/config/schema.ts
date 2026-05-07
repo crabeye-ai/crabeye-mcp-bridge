@@ -36,6 +36,7 @@ export const ServerBridgeConfigSchema = z
     category: z.string().optional(),
     rateLimit: RateLimitConfigSchema.optional(),
     reconnect: ReconnectConfigSchema.optional(),
+    sharing: z.enum(["auto", "shared", "dedicated"]).optional(),
   })
   .strict();
 
@@ -78,6 +79,8 @@ export const DaemonConfigSchema = z
     graceMs: z.number().int().nonnegative().default(60_000),
     /** SIGTERM→SIGKILL window once kill is dispatched. */
     killGraceMs: z.number().int().nonnegative().default(2_000),
+    autoForkDrainTimeoutMs: z.number().int().nonnegative().default(60_000),
+    autoForkInitializeTimeoutMs: z.number().int().nonnegative().default(10_000),
   })
   .strict();
 

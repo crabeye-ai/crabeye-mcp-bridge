@@ -145,6 +145,8 @@ describe("schema validation", () => {
           idleMs: 60000,
           graceMs: 60000,
           killGraceMs: 2000,
+          autoForkDrainTimeoutMs: 60000,
+          autoForkInitializeTimeoutMs: 10000,
         },
       });
     }
