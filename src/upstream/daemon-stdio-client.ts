@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import {
+  LATEST_PROTOCOL_VERSION,
+  type JSONRPCMessage,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { StdioServerConfig } from "../config/schema.js";
+import { APP_NAME, APP_VERSION } from "../constants.js";
 import {
   DaemonClient,
   ensureDaemonRunning,
@@ -77,6 +81,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
       args: this._config.args ?? [],
       resolvedEnv: this._currentEnv,
       cwd: this._config.cwd ?? "",
+      sharing: this._config._bridge?.sharing ?? "auto",
       socketPath: this._socketPath,
       ensureDaemon: this._ensureDaemon,
     });
@@ -89,6 +94,7 @@ interface DaemonStdioTransportOpts {
   args: string[];
   resolvedEnv: Record<string, string>;
   cwd: string;
+  sharing: "auto" | "shared" | "dedicated";
   socketPath: string;
   ensureDaemon: () => Promise<void>;
 }
@@ -140,13 +146,17 @@ class DaemonStdioTransport implements Transport {
           args: this.opts.args,
           resolvedEnv: this.opts.resolvedEnv,
           cwd: this.opts.cwd,
-          // Phase D fields — the daemon validates these in parseOpenParams.
-          // Real config wiring lands in AIT-248 task 4; for now we ship
-          // sensible defaults so the daemon accepts the OPEN.
-          sharing: "auto",
-          clientInfo: { name: "crabeye-mcp-bridge", version: "0.0.0" },
+          sharing: this.opts.sharing,
+          // `${APP_NAME}/${serverName}` matches the per-upstream Client
+          // identity in BaseUpstreamClient — the daemon-spawned child sees
+          // the same `clientInfo.name` it would see if the bridge spawned
+          // it directly.
+          clientInfo: { name: `${APP_NAME}/${this.opts.serverName}`, version: APP_VERSION },
+          // The bridge currently advertises no client-side MCP features
+          // (no sampling, roots, or elicitation handlers), so we ship `{}`.
+          // Update this when the bridge starts handling any of those.
           clientCapabilities: {},
-          protocolVersion: "2025-06-18",
+          protocolVersion: LATEST_PROTOCOL_VERSION,
         },
       });
     } catch (err) {
