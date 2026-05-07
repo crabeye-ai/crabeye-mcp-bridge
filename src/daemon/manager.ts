@@ -186,6 +186,10 @@ export class ManagerDaemon {
   private idleTimer: NodeJS.Timeout | null = null;
   private connections = new Set<FrameChannel>();
   private groups = new Map<string, ChildGroup>();
+  /** Phase D: index of currently-shareable groups, keyed by `${hash}:${sharing}`. dedicated entries never appear here. */
+  private shareableIndex = new Map<string, ChildGroup>();
+  /** Phase D: hashes where `auto` mode has triggered a fork. Future auto OPENs for these hashes spawn fresh dedicated. */
+  private autoTainted = new Set<string>();
   private sessions = new Map<string, SessionAttachment>();
   private sessionsByChannel = new Map<FrameChannel, Set<string>>();
   private startedAt = 0;
@@ -680,26 +684,24 @@ export class ManagerDaemon {
     const sharing = params.spec.sharing;
     let group: ChildGroup;
 
-    if (sharing === "dedicated") {
-      // Always spawn fresh; never share with another session.
-      const spawned = this.spawnGroup(hash, params.spec, "dedicated");
+    const existing = this.findShareableGroup(hash, sharing);
+    if (existing !== undefined) {
+      group = existing;
+      this.cancelGraceTimer(group);
+    } else {
+      // Determine spawn mode:
+      // - sharing === "dedicated" → mode = "dedicated"
+      // - sharing === "auto" && hash is tainted → mode = "dedicated" (no sharing allowed)
+      // - otherwise → mode = "shared"
+      const spawnMode: "shared" | "dedicated" =
+        sharing === "dedicated" || (sharing === "auto" && this.autoTainted.has(hash))
+          ? "dedicated"
+          : "shared";
+      const spawned = this.spawnGroup(hash, params.spec, spawnMode);
       if (spawned instanceof Error) {
         return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
       }
       group = spawned;
-    } else {
-      // Existing dedupe by hash for "auto" and "shared"
-      const existing = this.findShareableGroupByHash(hash);
-      if (existing !== undefined) {
-        group = existing;
-        this.cancelGraceTimer(group);
-      } else {
-        const spawned = this.spawnGroup(hash, params.spec, "shared");
-        if (spawned instanceof Error) {
-          return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
-        }
-        group = spawned;
-      }
     }
     this.groups.set(group.groupId, group);
 
@@ -722,16 +724,27 @@ export class ManagerDaemon {
   }
 
   /**
-   * Find a shareable (mode=shared, not dying) group by upstreamHash.
-   * Task 5 uses linear iteration; Task 6 introduces the proper index.
+   * Find the currently shareable group for (hash, sharing). Returns undefined if
+   * no shareable group exists, or if `sharing === "dedicated"` (dedicated groups
+   * are never indexed), or if `sharing === "auto"` and the hash is tainted.
    */
-  private findShareableGroupByHash(hash: string): ChildGroup | undefined {
-    for (const g of this.groups.values()) {
-      if (g.upstreamHash === hash && g.mode === "shared" && !g.dying) {
-        return g;
-      }
-    }
-    return undefined;
+  private findShareableGroup(
+    hash: string,
+    sharing: "auto" | "shared" | "dedicated",
+  ): ChildGroup | undefined {
+    if (sharing === "dedicated") return undefined;
+    if (sharing === "auto" && this.autoTainted.has(hash)) return undefined;
+    const key = `${hash}:${sharing}`;
+    const group = this.shareableIndex.get(key);
+    if (group === undefined || group.dying) return undefined;
+    return group;
+  }
+
+  /** Mark a hash as auto-tainted; future auto OPENs spawn fresh dedicated. */
+  private taintAuto(hash: string): void {
+    this.autoTainted.add(hash);
+    // Clear from shareable index so further attaches don't find it.
+    this.shareableIndex.delete(`${hash}:auto`);
   }
 
   private spawnGroup(
@@ -794,6 +807,10 @@ export class ManagerDaemon {
       forked: false,
     };
     groupRef.value = group;
+
+    if (mode === "shared") {
+      this.shareableIndex.set(`${hash}:${spec.sharing}`, group);
+    }
 
     if (child.pid !== null) {
       void this.tracker
@@ -999,6 +1016,11 @@ export class ManagerDaemon {
   private async unregisterGroup(group: ChildGroup): Promise<void> {
     if (this.groups.get(group.groupId) === group) {
       this.groups.delete(group.groupId);
+    }
+    // Remove from shareable index if this group is the indexed one.
+    const indexKey = `${group.upstreamHash}:${group.sharing}`;
+    if (this.shareableIndex.get(indexKey) === group) {
+      this.shareableIndex.delete(indexKey);
     }
     this.cancelGraceTimer(group);
     const pid = group.child.pid;
