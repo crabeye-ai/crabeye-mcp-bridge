@@ -6,6 +6,11 @@ import {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   notImplementedResponse,
+  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
+  INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
+  INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
+  type SessionEvictedParams,
+  type DaemonMethod,
 } from "../../src/daemon/protocol.js";
 
 describe("daemon protocol", () => {
@@ -118,6 +123,24 @@ describe("daemon protocol", () => {
     it("PROTOCOL_VERSION is a positive int", () => {
       expect(Number.isInteger(PROTOCOL_VERSION)).toBe(true);
       expect(PROTOCOL_VERSION).toBeGreaterThan(0);
+    });
+  });
+
+  describe("protocol — Phase D additions", () => {
+    it("exports auto-fork error codes with correct shapes", () => {
+      expect(ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED).toBe("auto_fork_initialize_failed");
+      expect(INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT).toBe(-32002);
+      expect(INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE).toBe(-32003);
+    });
+
+    it("typechecks SESSION_EVICTED method and params", () => {
+      const m: DaemonMethod = "SESSION_EVICTED";
+      const p: SessionEvictedParams = {
+        sessionId: "11111111-1111-1111-1111-111111111111",
+        reason: "auto_fork_drain_timeout",
+      };
+      expect(m).toBe("SESSION_EVICTED");
+      expect(p.reason).toBe("auto_fork_drain_timeout");
     });
   });
 });

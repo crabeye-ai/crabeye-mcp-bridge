@@ -26,7 +26,8 @@ export type DaemonMethod =
   | "OPENED"
   | "RPC"
   | "CLOSE"
-  | "RESTART";
+  | "RESTART"
+  | "SESSION_EVICTED";
 
 export interface DaemonRequest {
   id: string;
@@ -85,6 +86,11 @@ export interface RpcNotificationParams {
   payload: unknown;
 }
 
+export interface SessionEvictedParams {
+  sessionId: string;
+  reason: "auto_fork_initialize_failed" | "auto_fork_drain_timeout";
+}
+
 export interface StatusChild {
   pid: number;
   upstreamHash: string;
@@ -125,6 +131,12 @@ export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
 export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
 /** Synthetic JSON-RPC error code emitted when the per-child stdin queue overflows. */
 export const INNER_ERROR_CODE_BACKPRESSURE = -32001;
+/** Daemon-protocol-level error: failed to replay `initialize` against a forked child. */
+export const ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED = "auto_fork_initialize_failed";
+/** Inner JSON-RPC error: drain window exceeded autoForkDrainTimeoutMs with old-child requests still pending. */
+export const INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT = -32002;
+/** Inner JSON-RPC error: per-session drain queue overflowed during fork. */
+export const INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE = -32003;
 
 const HEADER_BYTES = 4;
 

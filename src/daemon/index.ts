@@ -18,6 +18,7 @@ export type {
   OpenParams,
   CloseParams,
   RpcNotificationParams,
+  SessionEvictedParams,
   StatusChild,
   StatusSession,
   StatusResult,
@@ -36,8 +37,11 @@ export {
   ERROR_CODE_TOO_MANY_CONNECTIONS,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
+  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
   INNER_ERROR_CODE_BACKPRESSURE,
   INNER_ERROR_CODE_SESSION_CLOSED,
+  INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
+  INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
 } from "./protocol.js";
 export {
   getDaemonRunDir,
