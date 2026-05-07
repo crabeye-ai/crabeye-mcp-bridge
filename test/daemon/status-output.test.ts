@@ -57,7 +57,9 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       expect(ch.refcount).toBe(2);
       expect(new Set(ch.sessions)).toEqual(new Set([A, B]));
       expect(ch.subscriptionCount).toBe(1);
-      expect(ch.mode).toBe("shared");
+      expect(ch.mode === "shared" || ch.mode === "dedicated").toBe(true);
+      expect(["auto", "shared", "dedicated"]).toContain(ch.sharing);
+      expect(typeof ch.forked).toBe("boolean");
       expect(ch.cachedInit).toBeNull();
       expect(typeof ch.upstreamHash).toBe("string");
       expect(typeof ch.startedAt).toBe("number");

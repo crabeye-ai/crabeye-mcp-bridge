@@ -100,6 +100,7 @@ const PROTOCOL_MISSING_FIELD: DaemonError = {
 };
 
 interface ChildGroup {
+  groupId: string;
   upstreamHash: string;
   child: ChildHandle;
   rewriter: TokenRewriter;
@@ -116,6 +117,12 @@ interface ChildGroup {
   dying: boolean;
   /** True once the daemon has seen `notifications/initialized` from any session for this group. */
   initializedSeen: boolean;
+  /** Phase D: runtime state — "shared" or "dedicated". */
+  mode: "shared" | "dedicated";
+  /** Phase D: config intent at OPEN time — "auto", "shared", or "dedicated". */
+  sharing: "auto" | "shared" | "dedicated";
+  /** Phase D: true once this group has triggered an auto-fork. Always false in Task 5. */
+  forked: boolean;
 }
 
 interface SessionAttachment {
@@ -184,6 +191,7 @@ export class ManagerDaemon {
   private startedAt = 0;
   private stopping = false;
   private exited = false;
+  private nextGroupCounter = 1;
   private readonly maxConnections: number;
   private readonly maxSessionsPerChannel: number;
   private readonly maxSessionsTotal: number;
@@ -669,19 +677,31 @@ export class ManagerDaemon {
       cwd: params.spec.cwd,
     });
 
-    const existing = this.groups.get(hash);
+    const sharing = params.spec.sharing;
     let group: ChildGroup;
-    if (existing !== undefined && !existing.dying) {
-      group = existing;
-      this.cancelGraceTimer(group);
-    } else {
-      const spawned = this.spawnGroup(hash, params.spec);
+
+    if (sharing === "dedicated") {
+      // Always spawn fresh; never share with another session.
+      const spawned = this.spawnGroup(hash, params.spec, "dedicated");
       if (spawned instanceof Error) {
         return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
       }
       group = spawned;
-      this.groups.set(hash, group);
+    } else {
+      // Existing dedupe by hash for "auto" and "shared"
+      const existing = this.findShareableGroupByHash(hash);
+      if (existing !== undefined) {
+        group = existing;
+        this.cancelGraceTimer(group);
+      } else {
+        const spawned = this.spawnGroup(hash, params.spec, "shared");
+        if (spawned instanceof Error) {
+          return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
+        }
+        group = spawned;
+      }
     }
+    this.groups.set(group.groupId, group);
 
     group.rewriter.attachSession(params.sessionId);
     group.sessions.add(params.sessionId);
@@ -701,7 +721,24 @@ export class ManagerDaemon {
     return { id: requestId, result: { ok: true } };
   }
 
-  private spawnGroup(hash: string, spec: OpenParams["spec"]): ChildGroup | Error {
+  /**
+   * Find a shareable (mode=shared, not dying) group by upstreamHash.
+   * Task 5 uses linear iteration; Task 6 introduces the proper index.
+   */
+  private findShareableGroupByHash(hash: string): ChildGroup | undefined {
+    for (const g of this.groups.values()) {
+      if (g.upstreamHash === hash && g.mode === "shared" && !g.dying) {
+        return g;
+      }
+    }
+    return undefined;
+  }
+
+  private spawnGroup(
+    hash: string,
+    spec: OpenParams["spec"],
+    mode: "shared" | "dedicated",
+  ): ChildGroup | Error {
     const rewriter = new TokenRewriter();
     const subscriptions = new SubscriptionTracker();
     const router = new NotificationRouter();
@@ -740,6 +777,7 @@ export class ManagerDaemon {
     }
 
     const group: ChildGroup = {
+      groupId: `${hash}:${spec.sharing}:${this.nextGroupCounter++}`,
       upstreamHash: hash,
       child,
       rewriter,
@@ -751,6 +789,9 @@ export class ManagerDaemon {
       graceTimer: null,
       dying: false,
       initializedSeen: false,
+      mode,
+      sharing: spec.sharing,
+      forked: false,
     };
     groupRef.value = group;
 
@@ -956,8 +997,8 @@ export class ManagerDaemon {
   }
 
   private async unregisterGroup(group: ChildGroup): Promise<void> {
-    if (this.groups.get(group.upstreamHash) === group) {
-      this.groups.delete(group.upstreamHash);
+    if (this.groups.get(group.groupId) === group) {
+      this.groups.delete(group.groupId);
     }
     this.cancelGraceTimer(group);
     const pid = group.child.pid;
@@ -1009,7 +1050,9 @@ export class ManagerDaemon {
       refcount: g.sessions.size,
       sessions: Array.from(g.sessions),
       subscriptionCount: g.subscriptions.subscriptionCount(),
-      mode: "shared",
+      mode: g.mode,
+      sharing: g.sharing,
+      forked: g.forked,
       cachedInit:
         g.child.cachedInit === null
           ? null

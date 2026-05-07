@@ -102,7 +102,9 @@ export interface StatusChild {
   refcount: number;
   sessions: string[];
   subscriptionCount: number;
-  mode: "shared";
+  mode: "shared" | "dedicated";
+  sharing: "auto" | "shared" | "dedicated";
+  forked: boolean;
   cachedInit: { protocolVersion: string } | null;
 }
 
