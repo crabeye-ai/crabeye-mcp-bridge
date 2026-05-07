@@ -35,6 +35,7 @@ import {
 import { InflightOverflowError, TokenRewriter, type InnerId } from "./token-rewriter.js";
 import { SubscriptionTracker } from "./subscription-tracker.js";
 import { NotificationRouter } from "./notification-router.js";
+import { AutoForkOrchestrator } from "./auto-fork.js";
 import type { DaemonServer, FrameChannel, Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
@@ -203,6 +204,7 @@ export class ManagerDaemon {
   private readonly killGraceMsValue: number;
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
+  private readonly autoFork: AutoForkOrchestrator;
   private readonly exitedPromise: Promise<number>;
   private exitedResolve: (code: number) => void = () => {
     /* replaced in constructor */
@@ -221,6 +223,9 @@ export class ManagerDaemon {
         filePath: opts.processTrackerPath ?? getProcessTrackerPath(),
         logger: this.logger.child({ component: "process-tracker" }),
       });
+    this.autoFork = new AutoForkOrchestrator({
+      logger: this.logger.child({ component: "auto-fork" }),
+    });
     this.exitedPromise = new Promise<number>((resolve) => {
       this.exitedResolve = resolve;
     });
@@ -885,7 +890,28 @@ export class ManagerDaemon {
       this.deliver(group, routing.sessionIds, routing.payload);
       return;
     }
-    // "other" — defer to NotificationRouter.
+    // Phase D: daemon-issued internal requests resolve via the per-group
+    // registry (added in Task 11). For Task 8, log + drop.
+    if (routing.kind === "internal") {
+      this.logger.debug("dropping internal-id response (no registry yet)", {
+        component: "daemon",
+        upstreamHash: group.upstreamHash,
+      });
+      return;
+    }
+    // "other" — could be a server→client request or a notification.
+    if (this.autoFork.isDangerousServerRequest(routing.payload)) {
+      // For Task 8, log and drop. Real handling (shared/dedicated/auto fork)
+      // lands in Tasks 9–13.
+      this.logger.warn(
+        `auto-fork: dangerous server→client request detected (method ${
+          (routing.payload as { method?: string }).method ?? "<unknown>"
+        })`,
+        { component: "daemon", upstreamHash: group.upstreamHash },
+      );
+      return;
+    }
+    // Notification — fan out via NotificationRouter (existing behavior).
     const sessions = group.router.route(routing.payload, Array.from(group.sessions), group.subscriptions);
     if (sessions.length > 0) this.deliver(group, sessions, routing.payload);
   }
