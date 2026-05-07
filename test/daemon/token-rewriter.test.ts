@@ -110,3 +110,30 @@ describe("TokenRewriter (phase C opaque-int)", () => {
     },
   );
 });
+
+describe("TokenRewriter — internal-id classifier (Phase D)", () => {
+  it("classifies negative-id success responses as internal", () => {
+    const rw = new TokenRewriter();
+    const routing = rw.inboundFromChild({ jsonrpc: "2.0", id: -1, result: {} });
+    expect(routing.kind).toBe("internal");
+    expect(routing.sessionIds).toEqual([]);
+  });
+
+  it("classifies negative-id error responses as internal", () => {
+    const rw = new TokenRewriter();
+    const routing = rw.inboundFromChild({
+      jsonrpc: "2.0",
+      id: -2,
+      error: { code: -32601, message: "Method not found" },
+    });
+    expect(routing.kind).toBe("internal");
+    expect(routing.sessionIds).toEqual([]);
+  });
+
+  it("preserves positive-id responses as kind: response (drop if not in flight)", () => {
+    const rw = new TokenRewriter();
+    // Positive id with no inflight registration → drop (existing behavior).
+    const routing = rw.inboundFromChild({ jsonrpc: "2.0", id: 99999, result: {} });
+    expect(routing.kind).toBe("drop");
+  });
+});

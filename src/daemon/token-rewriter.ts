@@ -22,7 +22,7 @@ export class InflightOverflowError extends Error {
   }
 }
 
-export type InboundKind = "response" | "progress" | "cancelled" | "other" | "drop";
+export type InboundKind = "response" | "progress" | "cancelled" | "other" | "drop" | "internal";
 
 export interface InboundRouting {
   /** Session(s) to deliver this payload to. Empty for "drop"; "other" leaves routing to caller. */
@@ -147,6 +147,16 @@ export class TokenRewriter {
   inboundFromChild(payload: unknown): InboundRouting {
     if (!isJsonObject(payload)) return { sessionIds: [], payload, kind: "other" };
     const p = payload as Record<string, unknown>;
+    // Phase D: daemon-issued internal requests use negative ids.
+    // These never collide with the positive outerIds allocated for session→child traffic.
+    if (
+      typeof p.method !== "string" &&
+      (p.result !== undefined || p.error !== undefined) &&
+      typeof p.id === "number" &&
+      p.id < 0
+    ) {
+      return { sessionIds: [], payload, kind: "internal" };
+    }
     // Response: id present, no method, has result or error.
     if (
       typeof p.method !== "string" &&
