@@ -1,5 +1,5 @@
 export { ManagerDaemon } from "./manager.js";
-export type { ManagerOptions } from "./manager.js";
+export type { ManagerOptions, ChildGroup, SessionAttachment } from "./manager.js";
 export { DaemonClient, DaemonRpcError } from "./client.js";
 export type { DaemonClientOpts } from "./client.js";
 export {

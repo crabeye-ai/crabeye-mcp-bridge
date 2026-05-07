@@ -48,4 +48,14 @@ describe("SubscriptionTracker", () => {
     t.subscribe("A", "mem://bar");
     expect(t.subscriptionCount()).toBe(2);
   });
+
+  it("urisForSession returns the session's subscribed URIs", () => {
+    const t = new SubscriptionTracker();
+    t.subscribe("s1", "file://a");
+    t.subscribe("s1", "file://b");
+    t.subscribe("s2", "file://a");
+    expect(new Set(t.urisForSession("s1"))).toEqual(new Set(["file://a", "file://b"]));
+    expect(t.urisForSession("s2")).toEqual(["file://a"]);
+    expect(t.urisForSession("nonexistent")).toEqual([]);
+  });
 });

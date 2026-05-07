@@ -200,6 +200,15 @@ class DaemonStdioTransport implements Transport {
   }
 
   private _onNotification(notif: DaemonNotification): void {
+    if (notif.method === "SESSION_EVICTED") {
+      const params = notif.params as { sessionId?: string; reason?: string } | undefined;
+      if (params && params.sessionId === this._daemonSessionId) {
+        const reasonErr = new Error(`daemon evicted session: ${params.reason ?? "unknown"}`);
+        this.onerror?.(reasonErr);
+        this._onSocketClose();
+      }
+      return;
+    }
     if (notif.method !== "RPC") return;
     const params = notif.params as { sessionId?: string; payload?: unknown } | undefined;
     if (!params || params.sessionId !== this._daemonSessionId) return;

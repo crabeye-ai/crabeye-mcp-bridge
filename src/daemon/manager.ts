@@ -16,6 +16,8 @@ import {
   ERROR_CODE_TOO_MANY_CONNECTIONS,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
+  INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
+  INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
   INNER_ERROR_CODE_BACKPRESSURE,
   INNER_ERROR_CODE_SESSION_CLOSED,
   PROTOCOL_VERSION,
@@ -28,6 +30,7 @@ import {
   type DaemonResponse,
   type OpenParams,
   type RpcNotificationParams,
+  type SessionEvictedParams,
   type StatusChild,
   type StatusResult,
   type StatusSession,
@@ -68,6 +71,15 @@ const MAX_PROTOCOL_VERSION_BYTES = 64;
 const MAX_CLIENT_INFO_NAME_BYTES = 256;
 const MAX_CLIENT_INFO_VERSION_BYTES = 64;
 
+/**
+ * Phase D: cap on outbound bridge→child payloads buffered while a session is
+ * in `draining` migration state. Beyond this, the daemon returns
+ * `INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE` to the bridge so the client
+ * can surface a retryable error rather than have the daemon's RAM grow
+ * unbounded.
+ */
+const MAX_QUEUE_PER_SESSION = 256;
+
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -100,7 +112,7 @@ const PROTOCOL_MISSING_FIELD: DaemonError = {
   message: "request missing required fields { id, method }",
 };
 
-interface ChildGroup {
+export interface ChildGroup {
   groupId: string;
   upstreamHash: string;
   child: ChildHandle;
@@ -124,13 +136,64 @@ interface ChildGroup {
   sharing: "auto" | "shared" | "dedicated";
   /** Phase D: true once this group has triggered an auto-fork. Always false in Task 5. */
   forked: boolean;
+  /**
+   * Phase D (Task 11): pending daemon-issued internal-request callbacks,
+   * keyed by the negative id allocated for the request. The auto-fork
+   * orchestrator uses this for `initialize`/`resources/subscribe` replay
+   * against newly-spawned children.
+   */
+  internalRequests: Map<number, (payload: unknown) => void>;
+  /**
+   * Phase D (Task 11): next id to hand out for a daemon-issued request.
+   * Starts at -1 and decrements (so first id is -1, then -2, …). Negative
+   * ids are routed back through the registry by `TokenRewriter` returning
+   * `kind: "internal"`.
+   */
+  nextInternalId: number;
 }
 
-interface SessionAttachment {
+/**
+ * Phase D: per-session migration state machine for auto-fork.
+ *
+ * - `idle` — normal steady state; outbound traffic flows through the
+ *   `group.child`.
+ * - `draining` — a fork has been triggered. New outbound bridge→child traffic
+ *   is queued in `queuedOutbound` (capped at `MAX_QUEUE_PER_SESSION`); the
+ *   existing in-flight requests on the OLD child are allowed to drain. Once
+ *   the new child is ready and replay completes, the queued payloads are
+ *   sent and the session transitions to `migrated`.
+ * - `migrated` — the session has switched over to its new group; this state
+ *   is terminal for the migration cycle.
+ *
+ * Task 10 only exercises `idle` and `draining`. The `migrated` variant and
+ * the `replayDone` flag are added now to keep the union complete; Tasks
+ * 11–13 wire up the actual transitions.
+ */
+type MigrationState =
+  | { kind: "idle" }
+  | {
+      kind: "draining";
+      newGroup: ChildGroup;
+      queuedOutbound: unknown[];
+      drainDeadline: number;
+      drainTimer: NodeJS.Timeout | null;
+      replayDone: boolean;
+    }
+  | { kind: "migrated" };
+
+export interface SessionAttachment {
   sessionId: string;
   channel: FrameChannel;
   group: ChildGroup;
   startedAt: number;
+  // Phase D additions:
+  clientInfo: { name: string; version: string };
+  clientCapabilities: Record<string, unknown>;
+  protocolVersion: string;
+  sharing: "auto" | "shared" | "dedicated";
+  /** Original OPEN spec — needed by AutoForkOrchestrator to spawn replacement children. */
+  openSpec: OpenParams["spec"];
+  migration: MigrationState;
 }
 
 export interface ManagerOptions {
@@ -143,6 +206,19 @@ export interface ManagerOptions {
   graceMs?: number;
   /** SIGTERM→SIGKILL window. Default 2_000ms. */
   killGraceMs?: number;
+  /**
+   * Phase D (Task 11): drain window for non-originating sessions during
+   * an auto-fork migration, in ms. After this elapses with the OLD child
+   * still busy, the session is evicted. Default 60_000ms.
+   */
+  autoForkDrainTimeoutMs?: number;
+  /**
+   * Phase D (Task 11): timeout for the daemon-issued initialize replay
+   * against a fresh child during auto-fork migration, in ms. After this
+   * elapses without a response, the new child is killed and the session
+   * is evicted. Default 10_000ms.
+   */
+  autoForkInitializeTimeoutMs?: number;
   transport: Transport;
   /** Override pid for tests. */
   pid?: number;
@@ -202,6 +278,8 @@ export class ManagerDaemon {
   private readonly maxSessionsTotal: number;
   private readonly graceMs: number;
   private readonly killGraceMsValue: number;
+  private readonly autoForkDrainTimeoutMs: number;
+  private readonly autoForkInitializeTimeoutMs: number;
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
   private readonly autoFork: AutoForkOrchestrator;
@@ -216,6 +294,8 @@ export class ManagerDaemon {
     this.maxSessionsTotal = opts.maxSessionsTotal ?? DEFAULT_MAX_SESSIONS_TOTAL;
     this.graceMs = opts.graceMs ?? 60_000;
     this.killGraceMsValue = opts.killGraceMs ?? 2_000;
+    this.autoForkDrainTimeoutMs = opts.autoForkDrainTimeoutMs ?? 60_000;
+    this.autoForkInitializeTimeoutMs = opts.autoForkInitializeTimeoutMs ?? 10_000;
     this.logger = opts.logger ?? createNoopLogger();
     this.tracker =
       opts.processTracker ??
@@ -225,6 +305,111 @@ export class ManagerDaemon {
       });
     this.autoFork = new AutoForkOrchestrator({
       logger: this.logger.child({ component: "auto-fork" }),
+      sendToChild: (group, payload) => {
+        try {
+          group.child.send(payload);
+        } catch (err) {
+          this.logger.warn(
+            `auto-fork sendToChild failed: ${err instanceof Error ? err.message : String(err)}`,
+            { component: "auto-fork", upstreamHash: group.upstreamHash },
+          );
+        }
+      },
+      sendToSession: (group, sessionId, payload) => this.deliver(group, [sessionId], payload),
+      warnedShared: new Set<string>(),
+      taintAuto: (hash) => {
+        this.autoTainted.add(hash);
+        this.shareableIndex.delete(`${hash}:auto`);
+      },
+      delistShareable: (group, sharing) => {
+        const key = `${group.upstreamHash}:${sharing}`;
+        if (this.shareableIndex.get(key) === group) {
+          this.shareableIndex.delete(key);
+        }
+      },
+      spawnDedicatedForSession: (forSessionId) => {
+        const att = this.sessions.get(forSessionId);
+        if (att === undefined) return null;
+        const spawned = this.spawnGroup(att.group.upstreamHash, att.openSpec, "dedicated");
+        if (spawned instanceof Error) return null;
+        this.groups.set(spawned.groupId, spawned);
+        // Phase D (Task 11): move the session into the new group's `sessions`
+        // set so STATUS reflects ownership of the new dedicated child, but
+        // intentionally leave the OLD group's rewriter / subscriptions
+        // untouched. Task 12's drain-detection hook waits for
+        // `oldGroup.rewriter.inflightForSession(sid)` to reach zero before
+        // the migration completes; if we tore down the old rewriter state
+        // here, drain would be a no-op. `att.group` likewise stays pointing
+        // at the OLD group until migration completes — outbound is buffered
+        // in `att.migration.queuedOutbound` while draining, so it doesn't
+        // route through `att.group` anyway.
+        spawned.sessions.add(forSessionId);
+        att.group.sessions.delete(forSessionId);
+        // Don't register in shareableIndex — dedicated is never shareable.
+        return spawned;
+      },
+      getAttachment: (sessionId) => this.sessions.get(sessionId),
+      nextInternalId: (group) => {
+        const id = group.nextInternalId;
+        group.nextInternalId -= 1;
+        return id;
+      },
+      registerInternal: (group, id, cb) => {
+        group.internalRequests.set(id, cb);
+      },
+      unregisterInternal: (group, id) => {
+        group.internalRequests.delete(id);
+      },
+      killGroup: (group) => {
+        void this.unregisterGroup(group).catch(() => {});
+      },
+      evictSession: (sessionId, reason) => {
+        const att = this.sessions.get(sessionId);
+        if (att === undefined) return;
+        // Send SESSION_EVICTED notification to bridge first; if we detached
+        // first the channel cleanup could race the bridge's read of the frame.
+        att.channel.send({
+          method: "SESSION_EVICTED",
+          params: { sessionId, reason } satisfies SessionEvictedParams,
+        });
+        // Force-detach via the standard path so rewriter / subscription /
+        // grace-timer cleanup all run.
+        void this.detachSession(sessionId, `auto-fork eviction: ${reason}`).catch(() => {});
+      },
+      urisForSession: (group, sessionId) => group.subscriptions.urisForSession(sessionId),
+      registerSubscription: (group, sessionId, uri) => {
+        group.subscriptions.subscribe(sessionId, uri);
+      },
+      attemptCompleteMigration: (oldGroup, newGroup, sessionId) => {
+        const att = this.sessions.get(sessionId);
+        if (att === undefined) return;
+        if (att.migration.kind !== "draining") return;
+        if (!att.migration.replayDone) return;
+        const inflight = oldGroup.rewriter.inflightForSession(sessionId);
+        if (inflight.length > 0) return;
+        this.completeMigration(oldGroup, newGroup, sessionId);
+      },
+      completeMigration: (oldGroup, newGroup, sessionId) => {
+        this.completeMigration(oldGroup, newGroup, sessionId);
+      },
+      synthDrainTimeoutErrors: (oldGroup, sessionId) => {
+        const att = this.sessions.get(sessionId);
+        if (att === undefined) return;
+        const inflight = oldGroup.rewriter.inflightForSession(sessionId);
+        for (const outerId of inflight) {
+          const origin = oldGroup.rewriter.peekOrigin(outerId);
+          if (origin === undefined) continue;
+          this.sendInnerError(
+            att.channel,
+            sessionId,
+            origin.originalId,
+            INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
+            "auto-fork drain timeout",
+          );
+        }
+      },
+      autoForkDrainTimeoutMs: this.autoForkDrainTimeoutMs,
+      autoForkInitializeTimeoutMs: this.autoForkInitializeTimeoutMs,
     });
     this.exitedPromise = new Promise<number>((resolve) => {
       this.exitedResolve = resolve;
@@ -353,6 +538,33 @@ export class ManagerDaemon {
 
   uptimeMs(): number {
     return this.startedAt === 0 ? 0 : Date.now() - this.startedAt;
+  }
+
+  /**
+   * @internal Test seam for AIT-248 auto-fork. Sets a session's migration
+   * state directly without going through the auto-fork orchestrator. DO NOT
+   * call this from production code — it bypasses the spawn/replay machinery
+   * and is only safe in unit tests that explicitly want to drive the
+   * migration state machine by hand. No-ops if the session is unknown.
+   */
+  setMigrationStateForTest(sessionId: string, state: MigrationState): void {
+    const att = this.sessions.get(sessionId);
+    if (att !== undefined) att.migration = state;
+  }
+
+  /**
+   * @internal Test seam for AIT-248 auto-fork. Emits a server→child message
+   * from the (single) currently-shared child as if it had arrived on the
+   * child's stdout. Used by fork tests to synthesize server→client requests
+   * without standing up a real upstream MCP server. Throws if no shared
+   * group exists or if multiple shared groups are present (ambiguous).
+   */
+  spawnedChildEmitForTest(payload: unknown): void {
+    const sharedGroups = Array.from(this.groups.values()).filter((g) => g.mode === "shared");
+    if (sharedGroups.length === 0) throw new Error("no shared group to emit from");
+    if (sharedGroups.length > 1) throw new Error("multiple shared groups; ambiguous");
+    const group = sharedGroups[0]!;
+    this.routeChildMessage(group, payload);
   }
 
   /** Manager-side request dispatch. Pure for STATUS and unknown_method. */
@@ -492,6 +704,30 @@ export class ManagerDaemon {
       return;
     }
     const group = att.group;
+
+    // Phase D auto-fork: while migrating, buffer outbound bridge→child
+    // traffic on the OLD child. The new child takes over once initialize
+    // replay completes (Task 12). Subscribe/unsubscribe and other dedupe
+    // logic is intentionally deferred until after the buffer flush — we
+    // want every payload (including subscribe replays from the bridge) to
+    // queue uniformly while draining.
+    if (att.migration.kind === "draining") {
+      const innerId = pickInnerId(params.payload);
+      if (att.migration.queuedOutbound.length >= MAX_QUEUE_PER_SESSION) {
+        if (innerId !== null) {
+          this.sendInnerError(
+            channel,
+            params.sessionId,
+            innerId,
+            INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
+            "session migration buffer full",
+          );
+        }
+        return;
+      }
+      att.migration.queuedOutbound.push(params.payload);
+      return;
+    }
 
     // Dedupe resources/subscribe and resources/unsubscribe.
     if (isResourceSubscribeRequest(params.payload)) {
@@ -718,6 +954,12 @@ export class ManagerDaemon {
       channel,
       group,
       startedAt: Date.now(),
+      clientInfo: params.spec.clientInfo,
+      clientCapabilities: params.spec.clientCapabilities,
+      protocolVersion: params.spec.protocolVersion,
+      sharing: params.spec.sharing,
+      openSpec: params.spec,
+      migration: { kind: "idle" },
     };
     this.sessions.set(params.sessionId, attachment);
     const owned = this.sessionsByChannel.get(channel) ?? new Set<string>();
@@ -810,6 +1052,8 @@ export class ManagerDaemon {
       mode,
       sharing: spec.sharing,
       forked: false,
+      internalRequests: new Map(),
+      nextInternalId: -1,
     };
     groupRef.value = group;
 
@@ -884,36 +1128,116 @@ export class ManagerDaemon {
         }
       }
       this.deliver(group, routing.sessionIds, routing.payload);
+      // Phase D (Task 12): after delivering a response, check whether any of
+      // these sessions are in a draining migration with this group as their
+      // OLD group. If so, attempt completion now that another inflight has
+      // resolved.
+      for (const sid of routing.sessionIds) {
+        const att = this.sessions.get(sid);
+        if (att === undefined) continue;
+        if (att.migration.kind !== "draining") continue;
+        const newGroup = att.migration.newGroup;
+        this.autoFork.onSessionInflightChanged(group, newGroup, sid);
+      }
       return;
     }
     if (routing.kind === "progress" || routing.kind === "cancelled") {
       this.deliver(group, routing.sessionIds, routing.payload);
       return;
     }
-    // Phase D: daemon-issued internal requests resolve via the per-group
-    // registry (added in Task 11). For Task 8, log + drop.
+    // Phase D (Task 11): daemon-issued internal requests resolve via the
+    // per-group registry. Lookup the pending callback by negative id and
+    // remove it from the map (callbacks fire exactly once).
     if (routing.kind === "internal") {
-      this.logger.debug("dropping internal-id response (no registry yet)", {
-        component: "daemon",
-        upstreamHash: group.upstreamHash,
-      });
+      const id = (routing.payload as { id?: number }).id;
+      if (typeof id === "number") {
+        const cb = group.internalRequests.get(id);
+        if (cb !== undefined) {
+          group.internalRequests.delete(id);
+          cb(routing.payload);
+        }
+      }
       return;
     }
     // "other" — could be a server→client request or a notification.
-    if (this.autoFork.isDangerousServerRequest(routing.payload)) {
-      // For Task 8, log and drop. Real handling (shared/dedicated/auto fork)
-      // lands in Tasks 9–13.
-      this.logger.warn(
-        `auto-fork: dangerous server→client request detected (method ${
-          (routing.payload as { method?: string }).method ?? "<unknown>"
-        })`,
-        { component: "daemon", upstreamHash: group.upstreamHash },
-      );
+    if (this.autoFork.isServerRequest(routing.payload)) {
+      void this.autoFork.handleServerRequest(group, routing.payload);
       return;
     }
     // Notification — fan out via NotificationRouter (existing behavior).
     const sessions = group.router.route(routing.payload, Array.from(group.sessions), group.subscriptions);
     if (sessions.length > 0) this.deliver(group, sessions, routing.payload);
+  }
+
+  /**
+   * Phase D (Task 12): finalize a session's auto-fork migration. Drops old
+   * group's subscription/rewriter state for the session, swings `att.group`
+   * to the new group, attaches to the new rewriter, and flushes the queued
+   * outbound buffer through the new child. Idempotent in the sense that it
+   * no-ops if the session is no longer draining.
+   */
+  private completeMigration(oldGroup: ChildGroup, newGroup: ChildGroup, sessionId: string): void {
+    const att = this.sessions.get(sessionId);
+    if (att === undefined) return;
+    if (att.migration.kind !== "draining") return;
+
+    // Drop subscriptions on old group, send unsubscribes for URIs that lose last subscriber.
+    const droppedUris = oldGroup.subscriptions.removeSession(sessionId);
+    for (const uri of droppedUris) {
+      try {
+        oldGroup.child.send({
+          jsonrpc: "2.0",
+          method: "resources/unsubscribe",
+          params: { uri },
+        });
+      } catch {
+        /* best-effort */
+      }
+    }
+
+    // Detach from old group's rewriter (cancels any outstanding outerIds — but we
+    // expect inflight to be empty at this point).
+    oldGroup.rewriter.detachSession(sessionId);
+
+    // Note: Task 11's fork already moved sessionId from oldGroup.sessions to newGroup.sessions
+    // (for STATUS visibility). Don't re-do that. Just attach to the new rewriter.
+    newGroup.rewriter.attachSession(sessionId);
+    att.group = newGroup;
+
+    // Flush queued outbound to new child.
+    const queue = att.migration.queuedOutbound;
+    const drainTimer = att.migration.drainTimer;
+    if (drainTimer !== null) clearTimeout(drainTimer);
+    att.migration = { kind: "migrated" };
+
+    for (const payload of queue) {
+      // Re-enter the outbound path on the new group via a synthetic local handler.
+      // We can't recursively call handleNotification here (it expects an RPC notif
+      // wrapper). Instead, replicate the core: rewriter.outboundForChild + child.send.
+      let rewritten: unknown;
+      try {
+        rewritten = newGroup.rewriter.outboundForChild(payload, sessionId);
+      } catch (err) {
+        this.logger.warn(
+          `auto-fork: failed to rewrite queued payload after migration: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          { component: "auto-fork", sessionId, upstreamHash: newGroup.upstreamHash },
+        );
+        continue;
+      }
+      if (rewritten === null) continue;
+      try {
+        newGroup.child.send(rewritten);
+      } catch (err) {
+        this.logger.warn(
+          `auto-fork: queued payload send failed after migration: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          { component: "auto-fork", sessionId, upstreamHash: newGroup.upstreamHash },
+        );
+      }
+    }
   }
 
   private deliver(group: ChildGroup, sessionIds: string[], payload: unknown): void {
@@ -932,11 +1256,45 @@ export class ManagerDaemon {
   }
 
   private handleChildExit(group: ChildGroup): void {
+    // Phase D (Task 16): sessions whose old group is dying may be mid-migration.
+    // For each draining session, give the orchestrator a chance to finalize
+    // against the new child (treating old-child inflight as terminated).
+    // Sessions still in idle on this group take the standard detach path.
     const sessionIds = Array.from(group.sessions);
+
+    // Snapshot draining sessions whose OLD group is the one that just died.
+    // Note: at fork time (Task 11) we moved migrating sessions OUT of
+    // `oldGroup.sessions` and INTO `newGroup.sessions`, so iterating
+    // `group.sessions` won't surface them. We instead scan `this.sessions` for
+    // any draining attachment whose `att.group` (still pointing at old group
+    // during draining) equals the dying group.
+    const drainingSessions: Array<{ sessionId: string; newGroup: ChildGroup }> = [];
+    for (const att of this.sessions.values()) {
+      if (att.migration.kind !== "draining") continue;
+      if (att.group !== group) continue;
+      drainingSessions.push({ sessionId: att.sessionId, newGroup: att.migration.newGroup });
+    }
+
+    // For each draining session, attempt completion. If replay is done and
+    // old-child inflight is now treated as zero (rewriter detach hasn't run
+    // yet, but we attempt anyway — the manager-side hook checks inflight on
+    // the old rewriter), it'll finalize. If not, the session stays draining;
+    // it'll either complete when replay finishes or hit the drain timeout.
+    for (const { sessionId, newGroup } of drainingSessions) {
+      this.autoFork.onSessionInflightChanged(group, newGroup, sessionId);
+    }
+
+    // Detach all sessions still attached to this old group (originating session
+    // and any non-draining sessions). Draining sessions that already migrated
+    // away (att.group === newGroup after completeMigration) are skipped.
     for (const sid of sessionIds) {
+      const att = this.sessions.get(sid);
+      if (att === undefined) continue;
+      if (att.group !== group) continue; // already migrated away
       void this.detachSession(sid, "child process exited").catch(() => {});
     }
-    this.unregisterGroup(group);
+
+    void this.unregisterGroup(group).catch(() => {});
   }
 
   /**
@@ -947,6 +1305,30 @@ export class ManagerDaemon {
   private async detachSession(sessionId: string, reason: string): Promise<void> {
     const att = this.sessions.get(sessionId);
     if (att === undefined) return;
+
+    // Phase D (Task 13): if the session was mid-migration, clean up the new
+    // group and its drain timer before the standard detach path runs. The
+    // standard path operates on `att.group`, which is still the OLD group
+    // until completeMigration swings it — so the new group won't get cleaned
+    // up otherwise.
+    if (att.migration.kind === "draining") {
+      if (att.migration.drainTimer !== null) {
+        clearTimeout(att.migration.drainTimer);
+        att.migration.drainTimer = null;
+      }
+      // Drop any unflushed payloads — bridge will reconnect.
+      att.migration.queuedOutbound.length = 0;
+      // Kill the not-yet-attached new child if it has no other sessions
+      // (or only this one).
+      const newGroup = att.migration.newGroup;
+      if (
+        newGroup.sessions.size === 0 ||
+        (newGroup.sessions.size === 1 && newGroup.sessions.has(sessionId))
+      ) {
+        void this.unregisterGroup(newGroup).catch(() => {});
+      }
+    }
+
     this.sessions.delete(sessionId);
 
     const owned = this.sessionsByChannel.get(att.channel);
@@ -1325,3 +1707,4 @@ async function writePidfile(path: string, pid: number): Promise<void> {
 }
 
 export { LockBusyError };
+export type { MigrationState };

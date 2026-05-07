@@ -49,6 +49,8 @@ export async function runDaemonInternal(): Promise<number> {
     idleMs: cfg.idleMs,
     graceMs: cfg.graceMs,
     killGraceMs: cfg.killGraceMs,
+    autoForkDrainTimeoutMs: cfg.autoForkDrainTimeoutMs,
+    autoForkInitializeTimeoutMs: cfg.autoForkInitializeTimeoutMs,
     transport: netTransport,
   });
 

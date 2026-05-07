@@ -54,6 +54,12 @@ export class SubscriptionTracker {
     return set === undefined ? [] : Array.from(set);
   }
 
+  /** URIs the session is currently subscribed to. */
+  urisForSession(sessionId: string): string[] {
+    const set = this.bySession.get(sessionId);
+    return set === undefined ? [] : Array.from(set);
+  }
+
   /** Drop all subscriptions held by the session. Returns URIs that lost their last subscriber. */
   removeSession(sessionId: string): string[] {
     const uris = this.bySession.get(sessionId);

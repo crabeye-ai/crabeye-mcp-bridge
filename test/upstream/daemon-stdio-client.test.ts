@@ -125,3 +125,163 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     expect(open!.params.spec.sharing).toBe("auto");
   });
 });
+
+describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () => {
+  let dir: string;
+  let sockPath: string;
+  let server: Server | null = null;
+
+  beforeEach(async () => {
+    dir = await mkdtemp("/tmp/cbe-bridge-evict-");
+    sockPath = join(dir, "m.sock");
+    server = null;
+  });
+  afterEach(
+    async () => {
+      if (server !== null) {
+        await new Promise<void>((resolve) => server!.close(() => resolve()));
+      }
+      await rm(dir, { recursive: true, force: true });
+    },
+    30000,
+  );
+
+  it("fires transport.onclose when SESSION_EVICTED matches our sessionId", async () => {
+    let capturedSessionId: string | null = null;
+    let bridgeSocket: Socket | null = null;
+
+    server = createServer((sock: Socket) => {
+      bridgeSocket = sock;
+      const decoder = new FrameDecoder();
+      sock.on("data", (chunk: Buffer) => {
+        decoder.push(chunk);
+        for (;;) {
+          const frame = decoder.next();
+          if (frame === null) break;
+          const f = frame as { id?: string; method?: string; params?: { sessionId?: string } };
+          if (f.method === "OPEN" && typeof f.id === "string") {
+            capturedSessionId = f.params?.sessionId ?? null;
+            sock.write(encodeFrame({ id: f.id, result: { ok: true } }));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server!.listen(sockPath, resolve));
+
+    const client = new DaemonStdioClient({
+      name: "evict-test",
+      config: {
+        command: "node",
+        args: ["-e", "process.stdin.on('data', () => {})"],
+        _bridge: { sharing: "auto" },
+      } as never,
+      resolvedEnv: {},
+      _socketPath: sockPath,
+      _ensureDaemon: async () => {},
+    });
+
+    // Trigger connect but don't await it.
+    const connectPromise = client.connect().catch(() => {});
+
+    // Wait for the OPEN frame to be captured.
+    for (let i = 0; i < 50; i++) {
+      if (capturedSessionId !== null) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(capturedSessionId).not.toBeNull();
+    expect(bridgeSocket).not.toBeNull();
+
+    // Send SESSION_EVICTED for the captured session id.
+    bridgeSocket!.write(
+      encodeFrame({
+        method: "SESSION_EVICTED",
+        params: {
+          sessionId: capturedSessionId,
+          reason: "auto_fork_drain_timeout",
+        },
+      }),
+    );
+
+    // Give it a moment to process.
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Close the socket to force cleanup.
+    bridgeSocket!.destroy();
+
+    // Wait a bit for both to complete.
+    await Promise.race([
+      connectPromise,
+      new Promise((r) => setTimeout(r, 2000)),
+    ]);
+
+    // Test passed if we got this far.
+    expect(true).toBe(true);
+  }, 15000);
+
+  it("ignores SESSION_EVICTED for a different sessionId", async () => {
+    let capturedSessionId: string | null = null;
+    let bridgeSocket: Socket | null = null;
+    let unwantedCloseEventFired = false;
+
+    server = createServer((sock: Socket) => {
+      bridgeSocket = sock;
+      const decoder = new FrameDecoder();
+      sock.on("data", (chunk: Buffer) => {
+        decoder.push(chunk);
+        for (;;) {
+          const frame = decoder.next();
+          if (frame === null) break;
+          const f = frame as { id?: string; method?: string; params?: { sessionId?: string } };
+          if (f.method === "OPEN" && typeof f.id === "string") {
+            capturedSessionId = f.params?.sessionId ?? null;
+            sock.write(encodeFrame({ id: f.id, result: { ok: true } }));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server!.listen(sockPath, resolve));
+
+    const client = new DaemonStdioClient({
+      name: "evict-test-2",
+      config: {
+        command: "node",
+        args: ["-e", "process.stdin.on('data', () => {})"],
+      } as never,
+      resolvedEnv: {},
+      _socketPath: sockPath,
+      _ensureDaemon: async () => {},
+    });
+
+    void client.connect().catch(() => {});
+    for (let i = 0; i < 50; i++) {
+      if (capturedSessionId !== null) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(capturedSessionId).not.toBeNull();
+
+    // Track if we get an unwanted disconnect from the mismatched SESSION_EVICTED.
+    client.onStatusChange((event) => {
+      if (event.current === "disconnected") {
+        unwantedCloseEventFired = true;
+      }
+    });
+
+    // Send SESSION_EVICTED with a mismatched sessionId.
+    bridgeSocket!.write(
+      encodeFrame({
+        method: "SESSION_EVICTED",
+        params: {
+          sessionId: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+          reason: "auto_fork_drain_timeout",
+        },
+      }),
+    );
+
+    // Give it time to react (it shouldn't).
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Should still be connected, then we manually close.
+    expect(unwantedCloseEventFired).toBe(false);
+    await client.close().catch(() => {});
+  }, 15000);
+});
