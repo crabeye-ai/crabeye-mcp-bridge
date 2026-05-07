@@ -62,7 +62,17 @@ describe.skipIf(isWindows)("ManagerDaemon — notifications fanout", () => {
     });
     await manager.start();
 
-    const spec = { serverName: "x", command: "node", args: [], resolvedEnv: {}, cwd: "" };
+    const spec = {
+      serverName: "x",
+      command: "node",
+      args: [],
+      resolvedEnv: {},
+      cwd: "",
+      sharing: "auto" as const,
+      clientInfo: { name: "test-bridge", version: "0.0.0" },
+      clientCapabilities: {},
+      protocolVersion: "2025-06-18",
+    };
     const sidA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const sidB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
@@ -147,7 +157,17 @@ describe.skipIf(isWindows)("ManagerDaemon — notifications fanout", () => {
     });
     await manager.start();
 
-    const spec = { serverName: "x", command: "node", args: [], resolvedEnv: {}, cwd: "" };
+    const spec = {
+      serverName: "x",
+      command: "node",
+      args: [],
+      resolvedEnv: {},
+      cwd: "",
+      sharing: "auto" as const,
+      clientInfo: { name: "test-bridge", version: "0.0.0" },
+      clientCapabilities: {},
+      protocolVersion: "2025-06-18",
+    };
     const sidA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const sidB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 

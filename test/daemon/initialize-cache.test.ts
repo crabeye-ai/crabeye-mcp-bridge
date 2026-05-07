@@ -74,7 +74,17 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
     const cA = new DaemonClient({ socketPath: paths.sock, transport: netTransport, rpcTimeoutMs: 1_000, connectTimeoutMs: 1_000 });
     const cB = new DaemonClient({ socketPath: paths.sock, transport: netTransport, rpcTimeoutMs: 1_000, connectTimeoutMs: 1_000 });
     try {
-      const spec = { serverName: "x", command: "node", args: [], resolvedEnv: {}, cwd: "" };
+      const spec = {
+        serverName: "x",
+        command: "node",
+        args: [],
+        resolvedEnv: {},
+        cwd: "",
+        sharing: "auto" as const,
+        clientInfo: { name: "test-bridge", version: "0.0.0" },
+        clientCapabilities: {},
+        protocolVersion: "2025-06-18",
+      };
 
       // Session A
       await cA.connect();

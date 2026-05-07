@@ -25,6 +25,10 @@ const SPEC = {
   args: [],
   resolvedEnv: {},
   cwd: "",
+  sharing: "auto",
+  clientInfo: { name: "test-bridge", version: "0.0.0" },
+  clientCapabilities: {},
+  protocolVersion: "2025-06-18",
 } as const;
 
 describe.skipIf(isWindows)("ManagerDaemon — idle-child grace timer", () => {

@@ -73,7 +73,17 @@ describe.skipIf(isWindows)("ManagerDaemon — grace-kill race", () => {
     });
     try {
       await c.connect();
-      const spec = { serverName: "x", command: "node", args: [], resolvedEnv: {}, cwd: "" };
+      const spec = {
+        serverName: "x",
+        command: "node",
+        args: [],
+        resolvedEnv: {},
+        cwd: "",
+        sharing: "auto" as const,
+        clientInfo: { name: "test-bridge", version: "0.0.0" },
+        clientCapabilities: {},
+        protocolVersion: "2025-06-18",
+      };
       const A = "11111111-1111-1111-1111-111111111111";
       const B = "22222222-2222-2222-2222-222222222222";
       await c.call("OPEN", { sessionId: A, spec });

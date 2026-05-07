@@ -62,6 +62,10 @@ export interface OpenParams {
     args: string[];
     resolvedEnv: Record<string, string>;
     cwd: string;
+    sharing: "auto" | "shared" | "dedicated";
+    clientInfo: { name: string; version: string };
+    clientCapabilities: Record<string, unknown>;
+    protocolVersion: string;
   };
 }
 

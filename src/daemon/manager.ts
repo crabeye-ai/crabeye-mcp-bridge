@@ -62,6 +62,10 @@ const MAX_ENV_KEY_BYTES = 256;
 const MAX_ENV_VAL_BYTES = 65_536;
 const MAX_ENV_COUNT = 512;
 const MAX_CWD_BYTES = 4096;
+const MAX_CLIENT_CAPS_BYTES = 64 * 1024;
+const MAX_PROTOCOL_VERSION_BYTES = 64;
+const MAX_CLIENT_INFO_NAME_BYTES = 256;
+const MAX_CLIENT_INFO_VERSION_BYTES = 64;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1093,6 +1097,18 @@ function parseOpenParams(raw: unknown): OpenParams | null {
   // Reject relative cwd: it would resolve against the daemon's cwd (whatever
   // shell launched the daemon), almost never the bridge's intent.
   if (s.cwd !== "" && !isAbsolute(s.cwd)) return null;
+  if (s.sharing !== "auto" && s.sharing !== "shared" && s.sharing !== "dedicated") return null;
+  if (typeof s.protocolVersion !== "string" || s.protocolVersion.length === 0
+      || s.protocolVersion.length > MAX_PROTOCOL_VERSION_BYTES) return null;
+  if (typeof s.clientInfo !== "object" || s.clientInfo === null || Array.isArray(s.clientInfo)) return null;
+  const ci = s.clientInfo as { name?: unknown; version?: unknown };
+  if (typeof ci.name !== "string" || ci.name.length === 0 || ci.name.length > MAX_CLIENT_INFO_NAME_BYTES) return null;
+  if (typeof ci.version !== "string" || ci.version.length === 0 || ci.version.length > MAX_CLIENT_INFO_VERSION_BYTES) return null;
+  if (typeof s.clientCapabilities !== "object" || s.clientCapabilities === null
+      || Array.isArray(s.clientCapabilities)) return null;
+  const capsJson = JSON.stringify(s.clientCapabilities);
+  if (capsJson.length > MAX_CLIENT_CAPS_BYTES) return null;
+
   return {
     sessionId: r.sessionId,
     spec: {
@@ -1101,6 +1117,10 @@ function parseOpenParams(raw: unknown): OpenParams | null {
       args: s.args as string[],
       resolvedEnv: s.resolvedEnv as Record<string, string>,
       cwd: s.cwd,
+      sharing: s.sharing as "auto" | "shared" | "dedicated",
+      clientInfo: { name: ci.name, version: ci.version },
+      clientCapabilities: s.clientCapabilities as Record<string, unknown>,
+      protocolVersion: s.protocolVersion,
     },
   };
 }

@@ -140,6 +140,13 @@ class DaemonStdioTransport implements Transport {
           args: this.opts.args,
           resolvedEnv: this.opts.resolvedEnv,
           cwd: this.opts.cwd,
+          // Phase D fields — the daemon validates these in parseOpenParams.
+          // Real config wiring lands in AIT-248 task 4; for now we ship
+          // sensible defaults so the daemon accepts the OPEN.
+          sharing: "auto",
+          clientInfo: { name: "crabeye-mcp-bridge", version: "0.0.0" },
+          clientCapabilities: {},
+          protocolVersion: "2025-06-18",
         },
       });
     } catch (err) {

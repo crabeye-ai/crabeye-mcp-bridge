@@ -60,7 +60,17 @@ describe.skipIf(isWindows)("ManagerDaemon — subscribe/unsubscribe dedupe", () 
     });
     await manager.start();
 
-    const spec = { serverName: "x", command: "node", args: [], resolvedEnv: {}, cwd: "" };
+    const spec = {
+      serverName: "x",
+      command: "node",
+      args: [],
+      resolvedEnv: {},
+      cwd: "",
+      sharing: "auto" as const,
+      clientInfo: { name: "test-bridge", version: "0.0.0" },
+      clientCapabilities: {},
+      protocolVersion: "2025-06-18",
+    };
     const sidA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const sidB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
@@ -180,7 +190,20 @@ describe.skipIf(isWindows)("ManagerDaemon — subscribe/unsubscribe dedupe", () 
     try {
       await c.connect();
       const A = "11111111-1111-1111-1111-111111111111";
-      await c.call("OPEN", { sessionId: A, spec: { serverName: "x", command: "node", args: [], resolvedEnv: {}, cwd: "" } });
+      await c.call("OPEN", {
+        sessionId: A,
+        spec: {
+          serverName: "x",
+          command: "node",
+          args: [],
+          resolvedEnv: {},
+          cwd: "",
+          sharing: "auto" as const,
+          clientInfo: { name: "test-bridge", version: "0.0.0" },
+          clientCapabilities: {},
+          protocolVersion: "2025-06-18",
+        },
+      });
 
       const errors: unknown[] = [];
       c.setNotificationHandler((notif) => {

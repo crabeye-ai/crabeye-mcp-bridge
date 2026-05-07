@@ -73,6 +73,10 @@ describe.skipIf(isWindows)("ManagerDaemon — hash-based sharing", () => {
         args: ["-e", "process.stdin.on('data', () => {})"],
         resolvedEnv: {},
         cwd: "",
+        sharing: "auto" as const,
+        clientInfo: { name: "test-bridge", version: "0.0.0" },
+        clientCapabilities: {},
+        protocolVersion: "2025-06-18",
       };
       await c.call("OPEN", { sessionId: "11111111-1111-1111-1111-111111111111", spec });
       await c.call("OPEN", { sessionId: "22222222-2222-2222-2222-222222222222", spec });
