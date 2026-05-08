@@ -42,6 +42,10 @@ Per-upstream `_bridge.sharing` setting controls behavior:
 
 The bridge dedupes config entries by `upstreamHash` locally — duplicate identical entries collapse to one session before reaching the manager.
 
+## Initialize cache
+
+The first bridge session against a child runs a real `initialize` round-trip. The manager caches the result and replays it on every subsequent session's `initialize` for the same child — the call never reaches the child a second time. The cache covers `protocolVersion`, `serverInfo`, `capabilities`, and (when the upstream advertises one) the `instructions` text used by the bridge's [`_bridge.passthrough`](configuration.md#context-passthrough) feature, so all sessions see the same instructions regardless of attach order.
+
 ## CLI
 
 The manager is started automatically on first bridge connect. The `daemon` subcommand exists for manual control:

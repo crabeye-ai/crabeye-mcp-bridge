@@ -28,6 +28,17 @@ export const ReconnectConfigSchema = z.object({
   reconnectMaxDelay: z.number().int().positive().optional(),
 });
 
+/**
+ * Per-server context-passthrough level. Controls how much of an upstream's
+ * `initialize.instructions` and tool list gets injected into the bridge's
+ * downstream instructions string at handshake. The literal `true` is not
+ * accepted — callers must pick a level explicitly.
+ */
+export const PassthroughLevelSchema = z.union([
+  z.literal(false),
+  z.enum(["instructions", "tools", "full"]),
+]);
+
 export const ServerBridgeConfigSchema = z
   .object({
     auth: ServerOAuthConfigSchema.optional(),
@@ -37,6 +48,13 @@ export const ServerBridgeConfigSchema = z
     rateLimit: RateLimitConfigSchema.optional(),
     reconnect: ReconnectConfigSchema.optional(),
     sharing: z.enum(["auto", "shared", "dedicated"]).optional(),
+    passthrough: PassthroughLevelSchema.optional(),
+    /**
+     * Per-server byte cap on the rendered passthrough block. Bounded at 1
+     * MiB at the schema layer; the renderer enforces an additional 256 KiB
+     * default ceiling when this is unset.
+     */
+    passthroughMaxBytes: z.number().int().positive().max(1_048_576).optional(),
   })
   .strict();
 
@@ -123,6 +141,7 @@ export const BridgeConfigSchema = z.object({
 // --- Inferred types ---
 
 export type ToolPolicy = z.infer<typeof ToolPolicySchema>;
+export type PassthroughLevel = z.infer<typeof PassthroughLevelSchema>;
 export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
 export type ReconnectConfig = z.infer<typeof ReconnectConfigSchema>;
 export type ServerOAuthConfig = z.infer<typeof ServerOAuthConfigSchema>;

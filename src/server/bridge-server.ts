@@ -29,6 +29,28 @@ import { APP_NAME, APP_VERSION } from "../constants.js";
 
 const WAIT_FOR_RESPAWN_MS = 60_000;
 
+const BASE_INSTRUCTIONS = [
+  "This MCP bridge connects you to many external tools and services.",
+  "You MUST call search_tools BEFORE any of the following:",
+  "- The user mentions a service, tool, or MCP server by name",
+  "- The user says 'use X', 'with X', 'in X', 'on X', 'via X', or 'through X'",
+  "- The user asks you to perform an action that might be handled by an external service (create, update, query, send, manage, etc.)",
+  "- The user asks what tools or integrations are available, or what you can do",
+  "- The user asks 'can you...?' about a capability that could involve an external service",
+  "- You are about to claim a tool is unavailable or that you cannot perform an action — search first, then answer",
+  "- You are about to fall back to a web search for something that might be available as a tool",
+  "",
+  "Skip search_tools when you already have everything you need to call the tool. If a server below documents a tool with its full input schema (or the tool is already auto-enabled), call it directly via run_tool — searching first only burns a round-trip. Search remains required when you don't yet know the namespaced tool name or its arguments.",
+  "",
+  "Discovery workflow:",
+  '1. Start broad: search by provider or category to get summaries: { "queries": [{ "provider": "linear" }] }',
+  '2. Drill in: use a tool filter or expand_tools to get full definitions: { "queries": [{ "provider": "linear", "expand_tools": true }] } or { "queries": [{ "tool": "create", "provider": "linear" }] }',
+  "",
+  "Results are always grouped by provider: results[].providers[].tools[]",
+  "After discovering tools, use run_tool to execute them. You can also call auto-enabled tools directly by their namespaced name.",
+  "When in doubt, search — it is always better to search and find nothing than to miss an available tool.",
+].join("\n");
+
 export interface BridgeServerOptions {
   stdin?: Readable;
   stdout?: Writable;
@@ -40,6 +62,13 @@ export interface BridgeServerOptions {
   logger?: Logger;
   showStats?: boolean;
   onSearchStats?: (stats: SessionStatsSnapshot) => void;
+  /**
+   * Optional renderer for the per-server `_bridge.passthrough` blocks.
+   * When provided, the returned string is appended after the base bridge
+   * instructions on every regenerate. Empty string means no servers
+   * contributed (or no upstreams are connected yet).
+   */
+  buildPassthrough?: () => string;
 }
 
 export class BridgeServer {
@@ -64,25 +93,7 @@ export class BridgeServer {
       );
     }
 
-    const instructions = [
-      "This MCP bridge connects you to many external tools and services.",
-      "You MUST call search_tools BEFORE any of the following:",
-      "- The user mentions a service, tool, or MCP server by name",
-      "- The user says 'use X', 'with X', 'in X', 'on X', 'via X', or 'through X'",
-      "- The user asks you to perform an action that might be handled by an external service (create, update, query, send, manage, etc.)",
-      "- The user asks what tools or integrations are available, or what you can do",
-      "- The user asks 'can you...?' about a capability that could involve an external service",
-      "- You are about to claim a tool is unavailable or that you cannot perform an action — search first, then answer",
-      "- You are about to fall back to a web search for something that might be available as a tool",
-      "",
-      "Discovery workflow:",
-      '1. Start broad: search by provider or category to get summaries: { "queries": [{ "provider": "linear" }] }',
-      '2. Drill in: use a tool filter or expand_tools to get full definitions: { "queries": [{ "provider": "linear", "expand_tools": true }] } or { "queries": [{ "tool": "create", "provider": "linear" }] }',
-      "",
-      "Results are always grouped by provider: results[].providers[].tools[]",
-      "After discovering tools, use run_tool to execute them. You can also call auto-enabled tools directly by their namespaced name.",
-      "When in doubt, search — it is always better to search and find nothing than to miss an available tool.",
-    ].join("\n");
+    const instructions = this.composeInstructions();
 
     this.server = new Server(
       { name: APP_NAME, version: APP_VERSION },
@@ -345,5 +356,31 @@ export class BridgeServer {
 
   getToolRegistry(): ToolRegistry {
     return this.toolRegistry;
+  }
+
+  private composeInstructions(): string {
+    const passthrough = this.options.buildPassthrough?.() ?? "";
+    if (passthrough.length === 0) return BASE_INSTRUCTIONS;
+    return `${BASE_INSTRUCTIONS}\n\n${passthrough}`;
+  }
+
+  /**
+   * SDK `Server` has no public setter for `instructions`. We mutate its
+   * private `_instructions` field so the next `initialize` reads the new
+   * text. Active sessions are unaffected — MCP has no mid-session push for
+   * instructions. If the SDK is ever upgraded and the field is renamed,
+   * `_instructions` won't be present on the instance and we no-op with a
+   * warn log instead of silently breaking hot-reload.
+   */
+  regenerateInstructions(): void {
+    const target = this.server as unknown as { _instructions?: string };
+    if (!("_instructions" in target)) {
+      this.options.logger?.warn(
+        "MCP SDK Server has no _instructions field; instructions hot-reload disabled",
+        { component: "bridge" },
+      );
+      return;
+    }
+    target._instructions = this.composeInstructions();
   }
 }

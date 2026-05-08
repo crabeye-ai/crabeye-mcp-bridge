@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   ServerBridgeConfigSchema,
   DaemonConfigSchema,
+  PassthroughLevelSchema,
 } from "../../src/config/schema.js";
 
 describe("config — Phase D sharing config", () => {
@@ -57,5 +58,64 @@ describe("DaemonConfigSchema — Phase E additions", () => {
       heartbeatMs: 2_000,
       respawnLockWaitMs: 10_000,
     });
+  });
+});
+
+describe("ServerBridgeConfigSchema — passthrough (AIT-183)", () => {
+  it("accepts every documented passthrough level", () => {
+    expect(PassthroughLevelSchema.parse(false)).toBe(false);
+    expect(PassthroughLevelSchema.parse("instructions")).toBe("instructions");
+    expect(PassthroughLevelSchema.parse("tools")).toBe("tools");
+    expect(PassthroughLevelSchema.parse("full")).toBe("full");
+  });
+
+  it("rejects literal true so callers must pick a level explicitly", () => {
+    expect(() => PassthroughLevelSchema.parse(true)).toThrow();
+    expect(() =>
+      ServerBridgeConfigSchema.parse({ passthrough: true }),
+    ).toThrow();
+  });
+
+  it("rejects unknown string levels", () => {
+    expect(() => PassthroughLevelSchema.parse("partial")).toThrow();
+    expect(() =>
+      ServerBridgeConfigSchema.parse({ passthrough: "everything" }),
+    ).toThrow();
+  });
+
+  it("passthroughMaxBytes accepts positive integers", () => {
+    const cfg = ServerBridgeConfigSchema.parse({
+      passthrough: "tools",
+      passthroughMaxBytes: 1024,
+    });
+    expect(cfg.passthroughMaxBytes).toBe(1024);
+  });
+
+  it("passthroughMaxBytes rejects zero, negatives, and non-integers", () => {
+    expect(() =>
+      ServerBridgeConfigSchema.parse({ passthroughMaxBytes: 0 }),
+    ).toThrow();
+    expect(() =>
+      ServerBridgeConfigSchema.parse({ passthroughMaxBytes: -10 }),
+    ).toThrow();
+    expect(() =>
+      ServerBridgeConfigSchema.parse({ passthroughMaxBytes: 1.5 }),
+    ).toThrow();
+  });
+
+  it("passthroughMaxBytes is bounded at 1 MiB", () => {
+    expect(
+      ServerBridgeConfigSchema.parse({ passthroughMaxBytes: 1_048_576 })
+        .passthroughMaxBytes,
+    ).toBe(1_048_576);
+    expect(() =>
+      ServerBridgeConfigSchema.parse({ passthroughMaxBytes: 1_048_577 }),
+    ).toThrow();
+  });
+
+  it("defaults to undefined (no passthrough) when unset", () => {
+    const cfg = ServerBridgeConfigSchema.parse({});
+    expect(cfg.passthrough).toBeUndefined();
+    expect(cfg.passthroughMaxBytes).toBeUndefined();
   });
 });

@@ -8,10 +8,16 @@ import {
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
 import { resolveUpstreams, isStdioServer } from "./config/schema.js";
-import type { ServerBridgeConfig, ServerConfig, HttpServerConfig } from "./config/schema.js";
+import type {
+  BridgeConfig,
+  ServerBridgeConfig,
+  ServerConfig,
+  HttpServerConfig,
+} from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
 import { RateLimiter } from "./server/rate-limiter.js";
 import { ToolRegistry } from "./server/tool-registry.js";
+import { renderPassthrough } from "./server/passthrough.js";
 import { ToolSearchService } from "./search/index.js";
 import type { DiscoveryMode } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
@@ -37,6 +43,30 @@ function buildServerBridgeConfigs(
     }
   }
   return result;
+}
+
+/**
+ * `applyConfigDiff` doesn't trigger an instructions regenerate when only
+ * `_bridge.passthrough` or `_bridge.passthroughMaxBytes` changed, so we
+ * detect that drift here and drive the regenerate from the reload handler.
+ */
+function hasPassthroughChange(
+  oldConfig: BridgeConfig,
+  newConfig: BridgeConfig,
+): boolean {
+  const oldUpstreams = resolveUpstreams(oldConfig);
+  const newUpstreams = resolveUpstreams(newConfig);
+  const names = new Set([
+    ...Object.keys(oldUpstreams),
+    ...Object.keys(newUpstreams),
+  ]);
+  for (const name of names) {
+    const oldB = oldUpstreams[name]?._bridge;
+    const newB = newUpstreams[name]?._bridge;
+    if (oldB?.passthrough !== newB?.passthrough) return true;
+    if (oldB?.passthroughMaxBytes !== newB?.passthroughMaxBytes) return true;
+  }
+  return false;
 }
 
 const program = new Command();
@@ -128,6 +158,9 @@ program
         toolRegistry,
         logger,
         credentialStore,
+        // Late-connecting upstreams: regenerate bridge instructions so the
+        // next client `initialize` includes their passthrough block.
+        onClientConnected: () => server?.regenerateInstructions(),
       });
 
       const serverBridgeConfigs = buildServerBridgeConfigs(upstreams);
@@ -159,6 +192,19 @@ program
             { component: "stats" },
           );
         },
+        buildPassthrough: () =>
+          renderPassthrough({
+            upstreams: resolveUpstreams(config),
+            getInstructions: (name) =>
+              upstreamManager!.getClient(name)?.instructions,
+            getTools: (name) =>
+              toolRegistry
+                .listRegisteredTools()
+                .filter((r) => r.source === name)
+                .map((r) => r.tool),
+            resolvePolicy: (name, toolName) =>
+              policyEngine.resolvePolicy(name, toolName),
+          }),
       });
       await server.start();
 
@@ -228,7 +274,17 @@ program
           await upstreamManager!.applyConfigDiff(diff, newConfig);
         }
 
+        // Detect passthrough config drift so we can rebuild bridge instructions
+        // for the next `initialize` handshake. Tracked separately from the
+        // generic `updated` bucket because we want to regenerate even when
+        // only the passthrough fields changed (no other reconnect).
+        const passthroughChanged = hasPassthroughChange(config, newConfig);
+
         config = newConfig;
+
+        if (passthroughChanged || hasServerChanges) {
+          server?.regenerateInstructions();
+        }
       };
 
       // Connect upstreams in the background — tools appear as each server connects.

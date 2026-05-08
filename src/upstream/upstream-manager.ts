@@ -19,6 +19,13 @@ export interface UpstreamManagerOptions {
   credentialStore?: CredentialStore;
   /** Health check interval in seconds. 0 to disable. Overrides config value. */
   healthCheckInterval?: number;
+  /**
+   * Fires once each time any upstream client transitions to `connected`.
+   * Used by `BridgeServer` to regenerate downstream instructions so the
+   * passthrough block for a late-connecting upstream lands in the next
+   * `initialize` handshake. Listener must not throw.
+   */
+  onClientConnected?: () => void;
   /** Injectable client factory for testing. */
   _clientFactory?: (
     name: string,
@@ -97,6 +104,7 @@ export class UpstreamManager {
   private _pingsInFlight = new WeakSet<ClientGroup>();
   private _pingTimeoutMs = 5000;
   private _unhealthyThreshold = 3;
+  private _onClientConnected: (() => void) | undefined;
 
   constructor(options: UpstreamManagerOptions) {
     this._config = options.config;
@@ -105,6 +113,7 @@ export class UpstreamManager {
     this._credentialStore = options.credentialStore;
     this._healthCheckInterval =
       options.healthCheckInterval ?? options.config._bridge.healthCheckInterval;
+    this._onClientConnected = options.onClientConnected;
 
     const credentialStore = options.credentialStore;
     this._clientFactory =
@@ -303,6 +312,12 @@ export class UpstreamManager {
         }
       } else {
         log.debug(`${event.current}`);
+      }
+      if (event.current === "connected") {
+        // Fire once per transition. Aliases all share the same client, so
+        // one regenerate covers every passthrough block produced from this
+        // group. Listener contract: must not throw.
+        this._onClientConnected?.();
       }
     });
 

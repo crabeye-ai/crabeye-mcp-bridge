@@ -59,6 +59,10 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     return this._tools;
   }
 
+  get instructions(): string | undefined {
+    return this._client?.getInstructions();
+  }
+
   async connect(): Promise<void> {
     if (this._connectPromise) return this._connectPromise;
     this._connectPromise = this._doConnect().finally(() => {

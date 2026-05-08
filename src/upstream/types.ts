@@ -21,6 +21,12 @@ export interface UpstreamClient {
   readonly name: string;
   readonly status: ConnectionStatus;
   readonly tools: ReadonlyArray<Tool>;
+  /**
+   * Upstream's `initialize.instructions` text, captured by the SDK Client when
+   * the upstream completes its initialize handshake. `undefined` until
+   * connected, or when the upstream did not advertise instructions.
+   */
+  readonly instructions?: string;
 
   connect(): Promise<void>;
   callTool(params: {

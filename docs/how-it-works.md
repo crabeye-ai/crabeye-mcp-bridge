@@ -30,6 +30,17 @@ The bridge tracks how many tokens it saves compared to exposing all upstream too
 
 Token counts are estimated using a chars/4 heuristic.
 
+## Bridge instructions assembly
+
+The bridge advertises its own `instructions` string to clients during the MCP `initialize` handshake. It is built in two parts:
+
+1. **Base instructions** — a static block telling the assistant how and when to call `search_tools` and `run_tool`.
+2. **Per-server passthrough blocks** — appended for every upstream that opted in via `_bridge.passthrough` (see [configuration.md](configuration.md#context-passthrough)). One H2-headed block per upstream, in the order upstreams are resolved from the config.
+
+Upstream `instructions` are read from each upstream's `initialize` response and surfaced via the SDK `Client.getInstructions()` API. For STDIO upstreams that share a daemon-owned child, the daemon caches the field in its `CachedInit` and replays it from the initialize short-circuit, so subsequent sessions on the same child see the same text.
+
+When an upstream connects after the bridge starts, or when `_bridge.passthrough` changes via config hot-reload, the bridge regenerates this string. The change applies to the **next** client `initialize` only — MCP has no mechanism to push an updated instructions string to a connected session.
+
 ## Examples
 
 ### Discovering providers

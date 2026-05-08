@@ -31,6 +31,12 @@ export interface CachedInit {
   /** From the child's `initialize` response. */
   serverInfo: { name: string; version: string; [k: string]: unknown };
   capabilities: Record<string, unknown>;
+  /**
+   * Optional `instructions` field from the child's `initialize` response.
+   * Replayed verbatim by the daemon's initialize short-circuit so subsequent
+   * sessions on a shared child still see it via `Client.getInstructions()`.
+   */
+  instructions?: string;
 }
 
 export interface ChildHandleOptions {

@@ -178,6 +178,63 @@ describe("BridgeServer initialize", () => {
 
     await cleanup();
   });
+
+  it("buildPassthrough output is appended to bridge instructions on initialize (AIT-183)", async () => {
+    const toolRegistry = new ToolRegistry();
+    const server = new BridgeServer({
+      toolRegistry,
+      buildPassthrough: () => "## linear\n\nUse Linear for tickets.",
+    });
+    const client = new Client({ name: "t", version: "0" });
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await server.connect(s);
+    await client.connect(c);
+    const instructions = client.getInstructions();
+    expect(instructions).toBeDefined();
+    expect(instructions).toContain("This MCP bridge connects you");
+    expect(instructions).toContain("## linear\n\nUse Linear for tickets.");
+    await client.close();
+    await server.close();
+  });
+
+  it("regenerateInstructions updates the text seen by the next initialize (AIT-183)", async () => {
+    const toolRegistry = new ToolRegistry();
+    let block = "";
+    const server = new BridgeServer({
+      toolRegistry,
+      buildPassthrough: () => block,
+    });
+
+    // First handshake: empty passthrough.
+    {
+      const client = new Client({ name: "t", version: "0" });
+      const [c, s] = InMemoryTransport.createLinkedPair();
+      await server.connect(s);
+      await client.connect(c);
+      const instr = client.getInstructions();
+      expect(instr).toBeDefined();
+      expect(instr).not.toContain("## fs");
+      await client.close();
+    }
+
+    // Simulate a late-connecting upstream: regenerate, then a fresh client
+    // initialize should see the new text.
+    block = "## fs\n\nFile-system server.";
+    server.regenerateInstructions();
+
+    {
+      const client = new Client({ name: "t", version: "0" });
+      const [c, s] = InMemoryTransport.createLinkedPair();
+      await server.connect(s);
+      await client.connect(c);
+      const instr = client.getInstructions();
+      expect(instr).toContain("## fs");
+      expect(instr).toContain("File-system server.");
+      await client.close();
+    }
+
+    await server.close();
+  });
 });
 
 // --- tools/list ---

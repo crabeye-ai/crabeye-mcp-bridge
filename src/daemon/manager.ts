@@ -877,6 +877,9 @@ export class ManagerDaemon {
                 protocolVersion: initResult.protocolVersion,
                 serverInfo: initResult.serverInfo,
                 capabilities: initResult.capabilities,
+                ...(typeof initResult.instructions === "string" && {
+                  instructions: initResult.instructions,
+                }),
               },
             },
           },
@@ -1197,7 +1200,12 @@ export class ManagerDaemon {
       if (group.child.cachedInit === null) {
         const restored = routing.payload as { id?: unknown; result?: unknown };
         const result = restored.result as
-          | { protocolVersion?: unknown; serverInfo?: unknown; capabilities?: unknown }
+          | {
+              protocolVersion?: unknown;
+              serverInfo?: unknown;
+              capabilities?: unknown;
+              instructions?: unknown;
+            }
           | undefined;
         if (
           result !== undefined &&
@@ -1207,10 +1215,20 @@ export class ManagerDaemon {
           typeof result.capabilities === "object" &&
           result.capabilities !== null
         ) {
+          // Cap cached `instructions` to defend the daemon's RSS against a
+          // hostile upstream that returns a multi-MiB string. The bridge has
+          // its own per-server cap on top; this is a backstop.
+          const DAEMON_INSTRUCTIONS_CAP = 64 * 1024;
+          const rawInstr = result.instructions;
+          const instrToCache =
+            typeof rawInstr === "string" && rawInstr.length > 0
+              ? rawInstr.slice(0, DAEMON_INSTRUCTIONS_CAP)
+              : undefined;
           group.child.setCachedInit({
             protocolVersion: result.protocolVersion,
             serverInfo: result.serverInfo as CachedInit["serverInfo"],
             capabilities: result.capabilities as Record<string, unknown>,
+            ...(instrToCache !== undefined && { instructions: instrToCache }),
           });
         }
       }
