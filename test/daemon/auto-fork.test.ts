@@ -614,13 +614,13 @@ describe.skipIf(isWindows)("AutoForkOrchestrator — fork sequence (Phase D)", (
       await c3.connect();
       const sid3 = "33333333-3333-3333-3333-333333333333";
       await c3.call("OPEN", { sessionId: sid3, spec: defaultSpec("auto") });
-      const status2 = (await c3.call("STATUS")) as {
-        children: Array<{ pid: number; sessions: string[]; mode: string }>;
-      };
+      const status2 = (await c3.call("STATUS")) as import("../../src/daemon/protocol.js").StatusResult;
       const sid3Child = status2.children.find((c) => c.sessions.includes(sid3));
       expect(sid3Child).toBeDefined();
       expect(sid3Child!.mode).toBe("dedicated");
       expect(sid3Child!.pid).not.toBe(oldChildPid);
+      // Telemetry: exactly one fork event per upstreamHash non-shareable transition.
+      expect(status2.telemetry.fork.eventsTotal).toBe(1);
       c3.close();
     } finally {
       c1.close();

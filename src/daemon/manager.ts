@@ -45,6 +45,7 @@ import { InflightOverflowError, TokenRewriter, type InnerId } from "./token-rewr
 import { SubscriptionTracker } from "./subscription-tracker.js";
 import { NotificationRouter } from "./notification-router.js";
 import { AutoForkOrchestrator } from "./auto-fork.js";
+import { Telemetry, type KilledReason } from "./telemetry.js";
 import type { DaemonServer, FrameChannel, Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
@@ -286,6 +287,7 @@ export class ManagerDaemon {
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
   private readonly autoFork: AutoForkOrchestrator;
+  private readonly telemetry = new Telemetry();
   private readonly exitedPromise: Promise<number>;
   private exitedResolve: (code: number) => void = () => {
     /* replaced in constructor */
@@ -321,8 +323,10 @@ export class ManagerDaemon {
       sendToSession: (group, sessionId, payload) => this.deliver(group, [sessionId], payload),
       warnedShared: new Set<string>(),
       taintAuto: (hash) => {
+        const wasTainted = this.autoTainted.has(hash);
         this.autoTainted.add(hash);
         this.shareableIndex.delete(`${hash}:auto`);
+        if (!wasTainted) this.telemetry.recordForkEvent();
       },
       delistShareable: (group, sharing) => {
         const key = `${group.upstreamHash}:${sharing}`;
@@ -364,7 +368,7 @@ export class ManagerDaemon {
         group.internalRequests.delete(id);
       },
       killGroup: (group) => {
-        void this.unregisterGroup(group).catch(() => {});
+        void this.unregisterGroup(group, "fork").catch(() => {});
       },
       evictSession: (sessionId, reason) => {
         const att = this.sessions.get(sessionId);
@@ -499,7 +503,7 @@ export class ManagerDaemon {
     }
     const groups = Array.from(this.groups.values());
     for (const g of groups) {
-      await this.unregisterGroup(g).catch(() => {});
+      await this.unregisterGroup(g, "shutdown").catch(() => {});
     }
 
     for (const ch of this.connections) {
@@ -606,6 +610,7 @@ export class ManagerDaemon {
           version: PROTOCOL_VERSION,
           children: this.statusChildren(),
           sessions: this.statusSessions(),
+          telemetry: this.telemetry.snapshot(),
         };
         return { id: req.id, result };
       }
@@ -697,7 +702,14 @@ export class ManagerDaemon {
       return;
     }
     if (isRequest(msg)) {
-      const res = await this.handleRequest(msg, channel);
+      this.telemetry.rpcInFlightInc();
+      let res: DaemonResponse;
+      try {
+        res = await this.handleRequest(msg, channel);
+      } finally {
+        this.telemetry.rpcInFlightDec();
+      }
+      if (res.error !== undefined) this.telemetry.recordRpcError(res.error.code);
       channel.send(res);
       return;
     }
@@ -990,6 +1002,7 @@ export class ManagerDaemon {
       migration: { kind: "idle" },
     };
     this.sessions.set(params.sessionId, attachment);
+    this.telemetry.recordSessionOpen();
     const owned = this.sessionsByChannel.get(channel) ?? new Set<string>();
     owned.add(params.sessionId);
     this.sessionsByChannel.set(channel, owned);
@@ -1013,13 +1026,6 @@ export class ManagerDaemon {
     const group = this.shareableIndex.get(key);
     if (group === undefined || group.dying) return undefined;
     return group;
-  }
-
-  /** Mark a hash as auto-tainted; future auto OPENs spawn fresh dedicated. */
-  private taintAuto(hash: string): void {
-    this.autoTainted.add(hash);
-    // Clear from shareable index so further attaches don't find it.
-    this.shareableIndex.delete(`${hash}:auto`);
   }
 
   private spawnGroup(
@@ -1089,6 +1095,8 @@ export class ManagerDaemon {
       this.shareableIndex.set(`${hash}:${spec.sharing}`, group);
     }
 
+    this.telemetry.recordSpawn();
+
     if (child.pid !== null) {
       void this.tracker
         .register({
@@ -1150,7 +1158,7 @@ export class ManagerDaemon {
         if (att === undefined) continue;
         this.sendRestartedError(att, "admin_restart");
       }
-      void this.unregisterGroup(group).catch(() => {
+      void this.unregisterGroup(group, "restart").catch(() => {
         /* logged elsewhere */
       });
     }
@@ -1373,7 +1381,7 @@ export class ManagerDaemon {
       void this.detachSession(sid, "child process exited").catch(() => {});
     }
 
-    void this.unregisterGroup(group).catch(() => {});
+    void this.unregisterGroup(group, "crash").catch(() => {});
   }
 
   /**
@@ -1404,11 +1412,12 @@ export class ManagerDaemon {
         newGroup.sessions.size === 0 ||
         (newGroup.sessions.size === 1 && newGroup.sessions.has(sessionId))
       ) {
-        void this.unregisterGroup(newGroup).catch(() => {});
+        void this.unregisterGroup(newGroup, "fork").catch(() => {});
       }
     }
 
     this.sessions.delete(sessionId);
+    this.telemetry.recordSessionClose();
 
     const owned = this.sessionsByChannel.get(att.channel);
     if (owned) owned.delete(sessionId);
@@ -1487,7 +1496,7 @@ export class ManagerDaemon {
     if (group.sessions.size > 0) return; // re-attached during the window
     group.dying = true;
     group.graceTimer = null;
-    await this.unregisterGroup(group).catch(() => {});
+    await this.unregisterGroup(group, "grace").catch(() => {});
     if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
       this.armIdleTimer();
     }
@@ -1500,9 +1509,15 @@ export class ManagerDaemon {
     }
   }
 
-  private async unregisterGroup(group: ChildGroup): Promise<void> {
+  private async unregisterGroup(
+    group: ChildGroup,
+    reason: KilledReason | "shutdown",
+  ): Promise<void> {
     if (this.groups.get(group.groupId) === group) {
       this.groups.delete(group.groupId);
+      // Counters reflect lifecycle events while the daemon is alive; don't
+      // count children torn down during stop().
+      if (reason !== "shutdown") this.telemetry.recordKill(reason);
     }
     // Remove from shareable index if this group is the indexed one.
     const indexKey = `${group.upstreamHash}:${group.sharing}`;

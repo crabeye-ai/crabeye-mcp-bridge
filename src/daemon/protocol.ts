@@ -114,12 +114,19 @@ export interface StatusSession {
   serverName: string;
 }
 
+export type {
+  KilledReason as TelemetryKilledReason,
+  TelemetrySnapshot,
+} from "./telemetry.js";
+import type { TelemetrySnapshot as _TelemetrySnapshot } from "./telemetry.js";
+
 export interface StatusResult {
   uptime: number;
   pid: number;
   version: number;
   children: StatusChild[];
   sessions: StatusSession[];
+  telemetry: _TelemetrySnapshot;
 }
 
 // Typed error codes. Listed here so call sites and tests share the literal.

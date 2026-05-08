@@ -33,8 +33,13 @@ describe.skipIf(isWindows)("ManagerDaemon — RESTART handler", () => {
     // unregisterGroup() is awaited synchronously with the response chain so
     // give the kill a tick to propagate.
     await new Promise((r) => setTimeout(r, 100));
-    const after = (await fx.client.call("STATUS")) as { children: unknown[] };
+    const after = (await fx.client.call("STATUS")) as import("../../src/daemon/protocol.js").StatusResult;
     expect(after.children).toEqual([]);
+    // Telemetry: admin RESTART increments killedTotal.restart.
+    expect(after.telemetry.children.killedTotal.restart).toBe(1);
+    expect(after.telemetry.children.killedTotal.grace).toBe(0);
+    expect(after.telemetry.children.killedTotal.fork).toBe(0);
+    expect(after.telemetry.children.killedTotal.crash).toBe(0);
     await session.close();
   });
 

@@ -15,6 +15,8 @@ import {
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   type DaemonNotification,
 } from "../daemon/index.js";
+import type { LivenessFailureKind } from "../daemon/liveness-supervisor.js";
+import { createNoopLogger, type Logger } from "../logging/index.js";
 import { BaseUpstreamClient } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 import { IdempotencyTable } from "./idempotency-table.js";
@@ -107,6 +109,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
       rpcTimeoutMs: this._rpcTimeoutMs,
       heartbeatMs: this._heartbeatMs,
       respawnLockWaitMs: this._respawnLockWaitMs,
+      logger: this._logger,
     });
   }
 }
@@ -130,6 +133,8 @@ interface DaemonStdioTransportOpts {
   heartbeatMs: number;
   /** Lock-wait bound during respawn. */
   respawnLockWaitMs: number;
+  /** Optional logger; defaults to noop. Used to emit force-respawn structured logs. */
+  logger?: Logger;
 }
 
 /**
@@ -149,6 +154,7 @@ class DaemonStdioTransport implements Transport {
 
   private readonly _daemonSessionId: string;
   private readonly opts: DaemonStdioTransportOpts;
+  private readonly _logger: Logger;
   private supervisor: DaemonLivenessSupervisor;
   private idempotency = new IdempotencyTable();
   private opened = false;
@@ -156,6 +162,7 @@ class DaemonStdioTransport implements Transport {
 
   constructor(opts: DaemonStdioTransportOpts) {
     this.opts = opts;
+    this._logger = opts.logger ?? createNoopLogger();
     this._daemonSessionId = randomUUID();
     this.supervisor = new DaemonLivenessSupervisor({
       socketPath: opts.socketPath,
@@ -167,15 +174,17 @@ class DaemonStdioTransport implements Transport {
       onNotification: (notif) => this._onNotification(notif),
       _ensureDaemonRunning: opts.ensureDaemon,
     });
-    this.supervisor.on("respawned", () => {
+    this.supervisor.on("respawned", (reason: LivenessFailureKind) => {
+      this._logger.info("force_respawn", {
+        component: "daemon-stdio",
+        event: "force_respawn",
+        sessionId: this._daemonSessionId,
+        reason,
+        sessionsReopened: 1,
+      });
       void this._reopenAfterRespawn();
     });
     this.supervisor.on("respawnFailed", (err) => this._onRespawnFailed(err));
-    this.supervisor.on("livenessFailure", () => {
-      // The supervisor's force-respawn flow runs autonomously; the transport
-      // doesn't need to react here. We listen so a future ops-metrics hook
-      // has a place to plug in.
-    });
   }
 
   async start(): Promise<void> {

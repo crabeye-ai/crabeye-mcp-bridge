@@ -93,6 +93,15 @@ describe.skipIf(isWindows)("ManagerDaemon — idle-child grace timer", () => {
       // After grace window expires — child must be killed.
       await new Promise((r) => setTimeout(r, 200));
       expect(killed).toBe(true);
+
+      // Telemetry: a single grace-killed child should be tallied under
+      // killedTotal.grace=1 with no other reasons.
+      const status = (await c.call("STATUS")) as import("../../src/daemon/protocol.js").StatusResult;
+      expect(status.telemetry.children.spawnedTotal).toBe(1);
+      expect(status.telemetry.children.killedTotal).toEqual({ grace: 1, restart: 0, fork: 0, crash: 0 });
+      expect(status.telemetry.children.total).toBe(0);
+      expect(status.telemetry.sessions.openedTotal).toBe(1);
+      expect(status.telemetry.sessions.closedTotal).toBe(1);
     } finally {
       c.close();
     }

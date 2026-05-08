@@ -188,7 +188,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
     this.stopHeartbeat();
     this.emit("livenessFailure", ev);
     if (this.opts._disableForceRespawnForTest) return;
-    this.respawnPromise = this.forceRespawn().finally(() => {
+    this.respawnPromise = this.forceRespawn(ev.kind).finally(() => {
       this.respawnPromise = null;
     });
   }
@@ -200,7 +200,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
    * and SIGKILL — gated by `looksLikeOurDaemon` to mitigate the recycled-pid
    * hazard inherent in the file-based pidcheck.
    */
-  private async forceRespawn(): Promise<void> {
+  private async forceRespawn(reason: LivenessFailureKind): Promise<void> {
     try {
       let handle = await this.tryAcquireLockOnce();
       if (handle === null) {
@@ -231,7 +231,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
       // failLiveness that gets masked by `respawning`, leaving the supervisor
       // wedged.
       this.failed = false;
-      this.emit("respawned");
+      this.emit("respawned", reason);
     } catch (err) {
       this.emit("respawnFailed", err);
     }
