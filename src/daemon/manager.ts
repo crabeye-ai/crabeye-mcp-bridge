@@ -140,7 +140,7 @@ export interface ChildGroup {
   mode: "shared" | "dedicated";
   /** Phase D: config intent at OPEN time — "auto", "shared", or "dedicated". */
   sharing: "auto" | "shared" | "dedicated";
-  /** Phase D: true once this group has triggered an auto-fork. Always false in Task 5. */
+  /** Phase D: true once this group has triggered an auto-fork. */
   forked: boolean;
   /**
    * Phase D (Task 11): pending daemon-issued internal-request callbacks,
@@ -170,10 +170,6 @@ export interface ChildGroup {
  *   sent and the session transitions to `migrated`.
  * - `migrated` — the session has switched over to its new group; this state
  *   is terminal for the migration cycle.
- *
- * Task 10 only exercises `idle` and `draining`. The `migrated` variant and
- * the `replayDone` flag are added now to keep the union complete; Tasks
- * 11–13 wire up the actual transitions.
  */
 type MigrationState =
   | { kind: "idle" }
@@ -259,9 +255,10 @@ export interface ManagerOptions {
 }
 
 /**
- * Phase-B manager daemon. Owns the lockfile, pidfile, IPC server, and the
- * spawned STDIO upstream children. Sessions map 1:1 to children in this
- * phase; phase C will dedupe by `upstreamHash` so multiple sessions share.
+ * Manager daemon. Owns the lockfile, pidfile, IPC server, and the spawned
+ * STDIO upstream children. Sessions sharing a `upstreamHash` (and `auto`/
+ * `shared` sharing mode) collapse onto a single child; `dedicated` sessions
+ * always get their own.
  */
 export class ManagerDaemon {
   private server: DaemonServer | null = null;
@@ -646,12 +643,6 @@ export class ManagerDaemon {
         const result: PingResult = { seq: params.seq };
         return { id: req.id, result };
       }
-      case "OPENED":
-        return errorResponse(
-          req.id,
-          "not_implemented",
-          `method "${req.method}" is not implemented in this phase`,
-        );
       default:
         return errorResponse(req.id, ERROR_CODE_UNKNOWN_METHOD, `unknown method "${req.method}"`);
     }

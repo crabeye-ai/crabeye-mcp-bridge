@@ -206,8 +206,8 @@ export class DaemonLivenessSupervisor extends EventEmitter {
       if (handle === null) {
         const pid = await this.readManagerPid();
         if (pid !== null) {
-          await this.killPid(pid);
-          this.sigkillsIssued++;
+          const killed = await this.killPid(pid);
+          if (killed) this.sigkillsIssued++;
         }
         await delay(50, undefined, { ref: false });
         handle = await this.acquireLockBounded();
@@ -270,14 +270,15 @@ export class DaemonLivenessSupervisor extends EventEmitter {
     }
   }
 
-  private async killPid(pid: number): Promise<void> {
+  private async killPid(pid: number): Promise<boolean> {
     // Defense in depth against a recycled-pid hazard: never SIGKILL self,
     // and refuse to kill a pid whose binary doesn't look like a Node daemon.
     // The lockfile-based liveness check (`process.kill(pid, 0)`) cannot
     // distinguish a recycled pid from the original daemon, so we cross-check
-    // the process command line before signalling.
-    if (pid === process.pid) return;
-    if (!(await looksLikeOurDaemon(pid))) return;
+    // the process command line before signalling. Returns true iff the
+    // signal/taskkill was actually dispatched.
+    if (pid === process.pid) return false;
+    if (!(await looksLikeOurDaemon(pid))) return false;
     try {
       if (process.platform === "win32") {
         const { spawn } = await import("node:child_process");
@@ -291,9 +292,11 @@ export class DaemonLivenessSupervisor extends EventEmitter {
       } else {
         process.kill(pid, "SIGKILL");
       }
+      return true;
     } catch {
       // pid may have died between check and kill; the second lock attempt
       // covers this.
+      return false;
     }
   }
 }

@@ -41,10 +41,7 @@ export interface AutoForkDeps {
   unregisterInternal: (group: ChildGroup, id: number) => void;
   /** Force-kill a group (used when initialize replay fails). */
   killGroup: (group: ChildGroup) => void;
-  /**
-   * Evict a session: emit SESSION_EVICTED notification + force-detach.
-   * Stub for Task 11 (just logs); Task 13 implements the real path.
-   */
+  /** Evict a session: emit SESSION_EVICTED notification + force-detach. */
   evictSession: (
     sessionId: string,
     reason: "auto_fork_initialize_failed" | "auto_fork_drain_timeout",
@@ -59,7 +56,7 @@ export interface AutoForkDeps {
     newGroup: ChildGroup,
     sessionId: string,
   ) => void;
-  /** Force-complete migration (used by drain timeout in Task 13; expose now for completion logic). */
+  /** Force-complete migration (used by drain timeout and completion logic). */
   completeMigration: (
     oldGroup: ChildGroup,
     newGroup: ChildGroup,
@@ -165,9 +162,6 @@ export class AutoForkOrchestrator {
    * Originating session (first attached) keeps the old child as dedicated.
    * Non-originating sessions get fresh dedicated children with daemon-issued
    * initialize replay using their per-session caps.
-   *
-   * Subscribe replay, drain detection, and migration completion land in
-   * Task 12. Drain timeout + eviction in Task 13.
    */
   private async fork(group: ChildGroup, triggeringPayload: unknown): Promise<void> {
     const sessionIds = Array.from(group.sessions);
@@ -222,8 +216,7 @@ export class AutoForkOrchestrator {
       return;
     }
 
-    // Transition session to draining state. Subscribe replay + drain hook
-    // + migration completion → Task 12. Drain timer arming → Task 13.
+    // Transition session to draining state.
     att.migration = {
       kind: "draining",
       newGroup,
@@ -278,7 +271,6 @@ export class AutoForkOrchestrator {
       method: "notifications/initialized",
     });
 
-    // Subscribe replay + drain hook + migration completion → Task 12.
     // Replay subscriptions sequentially.
     const uris = this.deps.urisForSession(oldGroup, sessionId);
     for (const uri of uris) {

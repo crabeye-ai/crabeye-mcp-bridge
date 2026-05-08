@@ -20,12 +20,12 @@ export interface UpstreamReconnectInputs {
  * Hash inputs are deliberately narrow: only fields that, if changed, must
  * produce a different child process or surface different runtime behavior.
  * The daemon's own `process.env` is NOT in the hash so two bridges started
- * under different shells still share a child in phase C.
+ * under different shells still share a child.
  *
  * `serverName` is intentionally **not** part of the hash. Two upstreams
  * mounted under different names that resolve to the same spec collapse to a
  * single child (with a warning at the bridge layer); the daemon treats them
- * as the same identity for sharing in phase C.
+ * as the same identity for sharing.
  */
 export interface UpstreamSpec {
   /**

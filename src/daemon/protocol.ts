@@ -23,7 +23,6 @@ export type DaemonMethod =
   | "STATUS"
   | "SHUTDOWN"
   | "OPEN"
-  | "OPENED"
   | "RPC"
   | "CLOSE"
   | "RESTART"
