@@ -8,6 +8,8 @@
 
 export type KilledReason = "grace" | "restart" | "fork" | "crash";
 
+const RPC_ERROR_CODE_CAP = 64;
+
 export interface TelemetrySnapshot {
   children: {
     total: number;
@@ -80,6 +82,13 @@ export class Telemetry {
   }
 
   recordRpcError(code: string): void {
+    // Bound the per-code map. All daemon error codes today flow from a closed
+    // ERROR_CODE_* enum (~10 entries), so this cap is well above the live set;
+    // it exists to keep the map finite if a future code path ever introduces
+    // a dynamic code string.
+    if (!this.rpcErrorsTotal.has(code) && this.rpcErrorsTotal.size >= RPC_ERROR_CODE_CAP) {
+      return;
+    }
     this.rpcErrorsTotal.set(code, (this.rpcErrorsTotal.get(code) ?? 0) + 1);
   }
 

@@ -5,7 +5,36 @@ import { ManagerDaemon } from "../../src/daemon/manager.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 import type { ChildHandle } from "../../src/daemon/child-handle.js";
-import type { StatusResult } from "../../src/daemon/protocol.js";
+import {
+  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
+  ERROR_CODE_BACKPRESSURE,
+  ERROR_CODE_INVALID_PARAMS,
+  ERROR_CODE_INVALID_REQUEST,
+  ERROR_CODE_NOT_IMPLEMENTED,
+  ERROR_CODE_RPC_TIMEOUT,
+  ERROR_CODE_SESSION_NOT_FOUND,
+  ERROR_CODE_SPAWN_FAILED,
+  ERROR_CODE_TOO_MANY_CONNECTIONS,
+  ERROR_CODE_TOO_MANY_SESSIONS,
+  ERROR_CODE_UNKNOWN_METHOD,
+  ERROR_CODE_UPSTREAM_RESTARTED,
+  type StatusResult,
+} from "../../src/daemon/protocol.js";
+
+const KNOWN_ERROR_CODES = new Set([
+  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
+  ERROR_CODE_BACKPRESSURE,
+  ERROR_CODE_INVALID_PARAMS,
+  ERROR_CODE_INVALID_REQUEST,
+  ERROR_CODE_NOT_IMPLEMENTED,
+  ERROR_CODE_RPC_TIMEOUT,
+  ERROR_CODE_SESSION_NOT_FOUND,
+  ERROR_CODE_SPAWN_FAILED,
+  ERROR_CODE_TOO_MANY_CONNECTIONS,
+  ERROR_CODE_TOO_MANY_SESSIONS,
+  ERROR_CODE_UNKNOWN_METHOD,
+  ERROR_CODE_UPSTREAM_RESTARTED,
+]);
 
 const isWindows = process.platform === "win32";
 
@@ -104,6 +133,12 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       const totalErrors = Object.values(status.telemetry.rpc.errorsTotal).reduce((a, b) => a + b, 0);
       expect(totalErrors).toBeGreaterThanOrEqual(2);
       expect(status.telemetry.rpc.errorsTotal.unknown_method).toBeGreaterThanOrEqual(1);
+      // Closed-enum invariant: every key must be a known protocol error code.
+      // Guards against a future code path leaking peer-controlled or dynamic
+      // strings into the per-code map (unbounded-key DoS via STATUS).
+      for (const code of Object.keys(status.telemetry.rpc.errorsTotal)) {
+        expect(KNOWN_ERROR_CODES.has(code)).toBe(true);
+      }
     } finally {
       c.close();
     }

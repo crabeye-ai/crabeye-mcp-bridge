@@ -180,7 +180,7 @@ class DaemonStdioTransport implements Transport {
         event: "force_respawn",
         sessionId: this._daemonSessionId,
         reason,
-        sessionsReopened: 1,
+        sessionsReopened: this.closing ? 0 : 1,
       });
       void this._reopenAfterRespawn();
     });

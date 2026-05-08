@@ -110,6 +110,18 @@ describe("Telemetry", () => {
         session_not_found: 1,
       });
     });
+
+    it("recordRpcError caps the number of distinct codes", () => {
+      const t = new Telemetry();
+      for (let i = 0; i < 200; i++) t.recordRpcError(`code_${i}`);
+      const errorsTotal = t.snapshot().rpc.errorsTotal;
+      // Cap is 64; at the cap, new keys are dropped but counts on existing keys still increment.
+      expect(Object.keys(errorsTotal).length).toBeLessThanOrEqual(64);
+      // Existing keys must still count up.
+      t.recordRpcError("code_0");
+      t.recordRpcError("code_0");
+      expect(t.snapshot().rpc.errorsTotal.code_0).toBeGreaterThanOrEqual(3);
+    });
   });
 
   describe("snapshot independence", () => {
