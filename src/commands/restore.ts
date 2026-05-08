@@ -122,7 +122,7 @@ async function restoreClientConfig(configPath: string): Promise<boolean> {
   // Step 2: find the upstream key
   let upstreamKey: string | undefined;
   let upstreamEntries: unknown;
-  for (const [key, origKey] of Object.entries(UPSTREAM_TO_ORIGINAL)) {
+  for (const key of Object.keys(UPSTREAM_TO_ORIGINAL)) {
     if (key in parsed) {
       upstreamKey = key;
       upstreamEntries = parsed[key];

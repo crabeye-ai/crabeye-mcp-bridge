@@ -16,6 +16,7 @@ import {
   ERROR_CODE_TOO_MANY_CONNECTIONS,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
+  INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
   INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
   INNER_ERROR_CODE_BACKPRESSURE,
@@ -29,11 +30,16 @@ import {
   type DaemonRequest,
   type DaemonResponse,
   type OpenParams,
+  type PingParams,
+  type PingResult,
+  type RestartParams,
+  type RestartResult,
   type RpcNotificationParams,
   type SessionEvictedParams,
   type StatusChild,
   type StatusResult,
   type StatusSession,
+  type UpstreamRestartedReason,
 } from "./protocol.js";
 import { InflightOverflowError, TokenRewriter, type InnerId } from "./token-rewriter.js";
 import { SubscriptionTracker } from "./subscription-tracker.js";
@@ -553,6 +559,19 @@ export class ManagerDaemon {
   }
 
   /**
+   * @internal Test seam for AIT-249 liveness tests. Replaces every active
+   * server-side channel's inbound message handler with a no-op so frames
+   * arriving from the bridge are silently dropped — simulates a stalled
+   * daemon while keeping the socket open.
+   */
+  severFramesForTest(): void {
+    for (const channel of this.connections) {
+      channel.removeAllListeners("message");
+      channel.on("message", () => { /* swallow */ });
+    }
+  }
+
+  /**
    * @internal Test seam for AIT-248 auto-fork. Emits a server→child message
    * from the (single) currently-shared child as if it had arrived on the
    * child's stdout. Used by fork tests to synthesize server→client requests
@@ -608,8 +627,26 @@ export class ManagerDaemon {
       }
       case "CLOSE":
         return this.handleClose(req.id, req.params);
-      case "OPENED":
       case "RESTART":
+        return this.handleRestart(req.id, req.params);
+      case "PING": {
+        const params = req.params as Partial<PingParams> | undefined;
+        if (
+          params === undefined ||
+          typeof params.seq !== "number" ||
+          !Number.isInteger(params.seq) ||
+          params.seq < 0
+        ) {
+          return errorResponse(
+            req.id,
+            ERROR_CODE_INVALID_PARAMS,
+            "PING params must be { seq: non-negative integer }",
+          );
+        }
+        const result: PingResult = { seq: params.seq };
+        return { id: req.id, result };
+      }
+      case "OPENED":
         return errorResponse(
           req.id,
           "not_implemented",
@@ -1094,6 +1131,57 @@ export class ManagerDaemon {
   }
 
   /**
+   * Admin RESTART: kill the child group(s) matching `params.upstreamHash`.
+   *
+   * Before tearing each group down we surface a typed JSON-RPC error
+   * (`upstream_restarted`, `data.reason: "admin_restart"`) to every
+   * attached session for any in-flight request, so the bridge sees the
+   * intended cause instead of the generic `session_closed` that
+   * detachSession() would otherwise emit when the child exits underneath.
+   */
+  private handleRestart(reqId: string, rawParams: unknown): DaemonResponse {
+    const params = parseRestartParams(rawParams);
+    if (params === null) {
+      return errorResponse(
+        reqId,
+        ERROR_CODE_INVALID_PARAMS,
+        "RESTART params must be { upstreamHash: string }",
+      );
+    }
+    const hash = params.upstreamHash;
+    // Snapshot before iterating: unregisterGroup() mutates this.groups.
+    const matched = Array.from(this.groups.values()).filter(
+      (g) => g.upstreamHash === hash,
+    );
+    for (const group of matched) {
+      for (const sid of Array.from(group.sessions)) {
+        const att = this.sessions.get(sid);
+        if (att === undefined) continue;
+        this.sendRestartedError(att, "admin_restart");
+      }
+      void this.unregisterGroup(group).catch(() => {
+        /* logged elsewhere */
+      });
+    }
+    const result: RestartResult = { ok: true, killed: matched.length };
+    return { id: reqId, result };
+  }
+
+  /**
+   * Synthesize an `upstream_restarted` JSON-RPC error for every in-flight
+   * request on the given session, framed inside an `RPC` notification so the
+   * bridge sees it as a regular response.
+   */
+  private sendRestartedError(att: SessionAttachment, reason: UpstreamRestartedReason): void {
+    const inflight = att.group.rewriter.inflightForSession(att.sessionId);
+    for (const outerId of inflight) {
+      const origin = att.group.rewriter.peekOrigin(outerId);
+      if (origin === undefined) continue;
+      this.sendUpstreamRestartedError(att.channel, att.sessionId, origin.originalId, reason);
+    }
+  }
+
+  /**
    * Route an inbound child→bridge message to the correct session(s).
    * - "response" / "progress" / "cancelled": sessionIds from rewriter (originating session)
    * - "drop": silently discard
@@ -1472,6 +1560,29 @@ export class ManagerDaemon {
     });
   }
 
+  private sendUpstreamRestartedError(
+    channel: FrameChannel,
+    sessionId: string,
+    innerId: InnerId,
+    reason: UpstreamRestartedReason,
+  ): void {
+    // MCP SDK's JSONRPCErrorResponseSchema requires `code: number`; the
+    // human-readable discriminator lives in `data.reason`.
+    const payload = {
+      jsonrpc: "2.0",
+      id: innerId,
+      error: {
+        code: INNER_ERROR_CODE_UPSTREAM_RESTARTED,
+        message: `upstream restarted (${reason})`,
+        data: { reason },
+      },
+    };
+    channel.send({
+      method: "RPC",
+      params: { sessionId, payload },
+    });
+  }
+
   private statusChildren(): StatusChild[] {
     return Array.from(this.groups.values()).map((g) => ({
       pid: g.child.pid ?? -1,
@@ -1618,6 +1729,13 @@ function buildSpawnEnv(resolvedEnv: Record<string, string>): Record<string, stri
     out[k] = v;
   }
   return out;
+}
+
+function parseRestartParams(raw: unknown): RestartParams | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.upstreamHash !== "string" || r.upstreamHash.length === 0) return null;
+  return { upstreamHash: r.upstreamHash };
 }
 
 function parseCloseParams(raw: unknown): CloseParams | null {

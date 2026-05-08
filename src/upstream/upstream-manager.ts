@@ -114,11 +114,15 @@ export class UpstreamManager {
         if (isStdioServer(config)) {
           // Re-resolve env on every reconnect so a rotated credential reaches
           // the daemon-spawned child (matches HttpUpstreamClient behavior).
+          const daemonCfg = this._config._bridge.daemon;
           return new DaemonStdioClient({
             name,
             config,
             logger,
             resolveEnv: () => this._resolveStdioEnv(config),
+            rpcTimeoutMs: daemonCfg.rpcTimeoutMs,
+            heartbeatMs: daemonCfg.heartbeatMs,
+            respawnLockWaitMs: daemonCfg.respawnLockWaitMs,
             ...reconnectOpts,
           });
         }

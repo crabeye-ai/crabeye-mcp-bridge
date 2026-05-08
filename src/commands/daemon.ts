@@ -14,8 +14,16 @@ import {
 } from "../daemon/index.js";
 import { loadBridgeOwnedConfig } from "../config/bridge-config.js";
 import { DaemonConfigSchema } from "../config/schema.js";
+import { APP_NAME } from "../constants.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
+
+export interface RestartUpstreamOpts {
+  hash?: string;
+  all?: boolean;
+  /** Test override for socket path. */
+  _socketPath?: string;
+}
 
 const STOP_TIMEOUT_MS = 2_000;
 const STOP_POLL_MS = 50;
@@ -196,6 +204,61 @@ async function runStatus(): Promise<number> {
 async function runRestart(): Promise<number> {
   await runStop();
   return runStart();
+}
+
+/**
+ * Admin CLI: force-respawn one upstream child by hash, or every active upstream
+ * when `--all` is passed. Hits the daemon's RESTART RPC.
+ *
+ * Exit codes:
+ *  - 0: success (or daemon not running — idempotent no-op).
+ *  - 1: RPC error from a reachable daemon.
+ *  - 2: usage error (neither hash nor --all).
+ */
+export async function runRestartUpstream(opts: RestartUpstreamOpts): Promise<number> {
+  if (!opts.all && (typeof opts.hash !== "string" || opts.hash.length === 0)) {
+    process.stderr.write(
+      `Usage: ${APP_NAME} daemon restart-upstream <hash> | --all\n`,
+    );
+    return 2;
+  }
+  const socketPath = opts._socketPath ?? getDaemonSocketPath();
+  const client = new DaemonClient({
+    socketPath,
+    transport: netTransport,
+    rpcTimeoutMs: 5_000,
+    connectTimeoutMs: 1_500,
+  });
+  try {
+    try {
+      await client.connect();
+    } catch {
+      // Daemon not reachable: nothing to restart. Idempotent no-op, matching
+      // `daemon stop`'s behaviour.
+      process.stderr.write("daemon not running; nothing to restart\n");
+      return 0;
+    }
+    const hashes: string[] = opts.all
+      ? ((await client.call("STATUS")) as { children: { upstreamHash: string }[] }).children.map(
+          (c) => c.upstreamHash,
+        )
+      : [opts.hash as string];
+    const unique = Array.from(new Set(hashes));
+    let killedTotal = 0;
+    for (const upstreamHash of unique) {
+      const r = (await client.call("RESTART", { upstreamHash })) as { killed: number };
+      killedTotal += r.killed;
+    }
+    process.stderr.write(
+      `restart-upstream: killed ${killedTotal} child group${killedTotal === 1 ? "" : "s"}\n`,
+    );
+    return 0;
+  } catch (err) {
+    process.stderr.write(`restart-upstream: ${errMsg(err)}\n`);
+    return 1;
+  } finally {
+    client.close();
+  }
 }
 
 async function isDaemonReachable(): Promise<boolean> {

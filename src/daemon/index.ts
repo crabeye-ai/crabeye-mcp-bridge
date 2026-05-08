@@ -38,11 +38,26 @@ export {
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
   ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
+  ERROR_CODE_UPSTREAM_RESTARTED,
   INNER_ERROR_CODE_BACKPRESSURE,
   INNER_ERROR_CODE_SESSION_CLOSED,
   INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
   INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
+  INNER_ERROR_CODE_UPSTREAM_RESTARTED,
 } from "./protocol.js";
+export type {
+  UpstreamRestartedReason,
+  RestartParams,
+  RestartResult,
+  PingParams,
+  PingResult,
+} from "./protocol.js";
+export { DaemonLivenessSupervisor } from "./liveness-supervisor.js";
+export type {
+  DaemonLivenessSupervisorOpts,
+  LivenessFailureEvent,
+  LivenessFailureKind,
+} from "./liveness-supervisor.js";
 export {
   getDaemonRunDir,
   getDaemonSocketPath,

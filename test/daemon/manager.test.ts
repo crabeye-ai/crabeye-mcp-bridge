@@ -98,7 +98,7 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
     }
   });
 
-  it("RESTART still returns not_implemented in phase B", async () => {
+  it("RESTART rejects malformed params (Phase E: handler is implemented)", async () => {
     manager = new ManagerDaemon({
       socketPath: paths.sock,
       pidPath: paths.pid,
@@ -116,8 +116,9 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
       connectTimeoutMs: 1_000,
     });
     try {
+      // Empty params -> invalid_params (was not_implemented before AIT-249).
       await expect(client.call("RESTART", {})).rejects.toMatchObject({
-        code: "not_implemented",
+        code: "invalid_params",
       });
     } finally {
       client.close();

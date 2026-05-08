@@ -21,3 +21,41 @@ describe("config — Phase D sharing config", () => {
     expect(() => DaemonConfigSchema.parse({ autoForkDrainTimeoutMs: -1 })).toThrow();
   });
 });
+
+describe("DaemonConfigSchema — Phase E additions", () => {
+  it("defaults rpcTimeoutMs to 30000", () => {
+    const cfg = DaemonConfigSchema.parse({});
+    expect(cfg.rpcTimeoutMs).toBe(30_000);
+  });
+
+  it("defaults heartbeatMs to 5000", () => {
+    const cfg = DaemonConfigSchema.parse({});
+    expect(cfg.heartbeatMs).toBe(5_000);
+  });
+
+  it("defaults respawnLockWaitMs to 60000", () => {
+    const cfg = DaemonConfigSchema.parse({});
+    expect(cfg.respawnLockWaitMs).toBe(60_000);
+  });
+
+  it("rejects non-positive rpcTimeoutMs", () => {
+    expect(() => DaemonConfigSchema.parse({ rpcTimeoutMs: 0 })).toThrow();
+  });
+
+  it("rejects non-positive heartbeatMs", () => {
+    expect(() => DaemonConfigSchema.parse({ heartbeatMs: 0 })).toThrow();
+  });
+
+  it("accepts custom values", () => {
+    const cfg = DaemonConfigSchema.parse({
+      rpcTimeoutMs: 15_000,
+      heartbeatMs: 2_000,
+      respawnLockWaitMs: 10_000,
+    });
+    expect(cfg).toMatchObject({
+      rpcTimeoutMs: 15_000,
+      heartbeatMs: 2_000,
+      respawnLockWaitMs: 10_000,
+    });
+  });
+});

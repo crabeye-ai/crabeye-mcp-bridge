@@ -1,11 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { writeFile, mkdir, rm, readFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   BridgeOwnedConfigSchema,
-  loadBridgeOwnedConfig,
-  saveBridgeOwnedConfig,
   getBridgeConfigPath,
 } from "../src/config/bridge-config.js";
 
@@ -66,7 +64,6 @@ describe("loadBridgeOwnedConfig", () => {
 
 describe("saveBridgeOwnedConfig round-trip", () => {
   const testDir = join(tmpdir(), `bridge-config-test-${process.pid}`);
-  const testConfigDir = join(testDir, ".crabeye-mcp-bridge");
 
   afterEach(async () => {
     await rm(testDir, { recursive: true, force: true });

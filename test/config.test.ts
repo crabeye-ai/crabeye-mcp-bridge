@@ -147,6 +147,9 @@ describe("schema validation", () => {
           killGraceMs: 2000,
           autoForkDrainTimeoutMs: 60000,
           autoForkInitializeTimeoutMs: 10000,
+          rpcTimeoutMs: 30000,
+          heartbeatMs: 5000,
+          respawnLockWaitMs: 60000,
         },
       });
     }

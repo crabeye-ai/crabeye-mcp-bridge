@@ -7,10 +7,15 @@ import {
   PROTOCOL_VERSION,
   notImplementedResponse,
   ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
+  ERROR_CODE_UPSTREAM_RESTARTED,
   INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
   INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
+  INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   type SessionEvictedParams,
   type DaemonMethod,
+  type UpstreamRestartedReason,
+  type RestartParams,
+  type RestartResult,
 } from "../../src/daemon/protocol.js";
 
 describe("daemon protocol", () => {
@@ -141,6 +146,34 @@ describe("daemon protocol", () => {
       };
       expect(m).toBe("SESSION_EVICTED");
       expect(p.reason).toBe("auto_fork_drain_timeout");
+    });
+  });
+
+  describe("protocol — Phase E additions", () => {
+    it("exports ERROR_CODE_UPSTREAM_RESTARTED with the literal value", () => {
+      expect(ERROR_CODE_UPSTREAM_RESTARTED).toBe("upstream_restarted");
+    });
+
+    it("exports INNER_ERROR_CODE_UPSTREAM_RESTARTED with the numeric literal", () => {
+      expect(INNER_ERROR_CODE_UPSTREAM_RESTARTED).toBe(-32004);
+    });
+
+    it("typechecks both upstream-restarted reasons", () => {
+      const a: UpstreamRestartedReason = "admin_restart";
+      const b: UpstreamRestartedReason = "daemon_respawn";
+      expect([a, b]).toEqual(["admin_restart", "daemon_respawn"]);
+    });
+
+    it("typechecks RestartParams + RestartResult", () => {
+      const p: RestartParams = { upstreamHash: "deadbeef" };
+      const r: RestartResult = { ok: true, killed: 1 };
+      expect(p.upstreamHash).toBe("deadbeef");
+      expect(r.killed).toBe(1);
+    });
+
+    it("includes PING in DaemonMethod union", () => {
+      const m: DaemonMethod = "PING";
+      expect(m).toBe("PING");
     });
   });
 });

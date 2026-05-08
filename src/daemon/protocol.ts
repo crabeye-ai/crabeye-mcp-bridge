@@ -27,6 +27,7 @@ export type DaemonMethod =
   | "RPC"
   | "CLOSE"
   | "RESTART"
+  | "PING"
   | "SESSION_EVICTED";
 
 export interface DaemonRequest {
@@ -139,6 +140,31 @@ export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
 export const INNER_ERROR_CODE_BACKPRESSURE = -32001;
 /** Daemon-protocol-level error: failed to replay `initialize` against a forked child. */
 export const ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED = "auto_fork_initialize_failed";
+/** Daemon-protocol error: child was killed by an admin RESTART, or daemon was force-respawned. `data.reason` distinguishes the two. */
+export const ERROR_CODE_UPSTREAM_RESTARTED = "upstream_restarted";
+/** Inner JSON-RPC error: child was killed (admin RESTART or daemon respawn). MCP SDK requires numeric `code`; reason is carried in `data.reason`. */
+export const INNER_ERROR_CODE_UPSTREAM_RESTARTED = -32004;
+
+export type UpstreamRestartedReason = "admin_restart" | "daemon_respawn";
+
+export interface RestartParams {
+  upstreamHash: string;
+}
+
+export interface RestartResult {
+  ok: true;
+  /** How many child groups were killed. 0 means the hash was not registered (still ok=true). */
+  killed: number;
+}
+
+export interface PingParams {
+  /** Monotonically increasing seq from the sender. Echoed back in the PONG response. */
+  seq: number;
+}
+
+export interface PingResult {
+  seq: number;
+}
 /** Inner JSON-RPC error: drain window exceeded autoForkDrainTimeoutMs with old-child requests still pending. */
 export const INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT = -32002;
 /** Inner JSON-RPC error: per-session drain queue overflowed during fork. */

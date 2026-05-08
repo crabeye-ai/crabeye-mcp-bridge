@@ -81,6 +81,12 @@ export const DaemonConfigSchema = z
     killGraceMs: z.number().int().nonnegative().default(2_000),
     autoForkDrainTimeoutMs: z.number().int().nonnegative().default(60_000),
     autoForkInitializeTimeoutMs: z.number().int().nonnegative().default(10_000),
+    /** Per-RPC timeout the bridge applies to outbound daemon calls. Was hardcoded 10000 in DaemonStdioTransport. */
+    rpcTimeoutMs: z.number().int().positive().default(30_000),
+    /** Bridge sends `PING` on this cadence. Missed `PONG` for `heartbeatMs * 3` triggers a liveness failure. */
+    heartbeatMs: z.number().int().positive().default(5_000),
+    /** How long a losing bridge waits on `manager.lock` after detecting a dead daemon before surfacing `ERR_UPSTREAM_RESTARTED`. */
+    respawnLockWaitMs: z.number().int().positive().default(60_000),
   })
   .strict();
 
