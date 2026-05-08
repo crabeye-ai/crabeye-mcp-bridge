@@ -11,7 +11,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Readable, Writable } from "node:stream";
 import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
-import type { UpstreamClient } from "../upstream/types.js";
+import type { ConnectionStatus, UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
   SEARCH_TOOL_NAME,
@@ -246,7 +246,12 @@ export class BridgeServer {
       const reconnected = await this.waitForReconnect(client);
 
       if (!reconnected) {
-        if (client.status === "error") {
+        // waitForReconnect resolves false for both "errored" and "timed out".
+        // Cast to widen back to the full ConnectionStatus union: the
+        // mutable status field can transition during the await, so the
+        // narrowing TS inferred before the await is no longer accurate.
+        const statusAfterWait = client.status as ConnectionStatus;
+        if (statusAfterWait === "error") {
           throw new McpError(
             ErrorCode.InternalError,
             `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
