@@ -6,12 +6,12 @@
     "url": "https://github.com/crabeye-ai/crabeye-mcp-bridge",
     "source": "github"
   },
-  "version": "1.2.0",
+  "version": "1.2.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@crabeye-ai/crabeye-mcp-bridge",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "transport": {
         "type": "stdio"
       }
