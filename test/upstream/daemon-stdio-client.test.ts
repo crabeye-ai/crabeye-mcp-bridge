@@ -3,6 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { APP_VERSION } from "../../src/constants.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
 import { DaemonStdioClient } from "../../src/upstream/daemon-stdio-client.js";
 
@@ -88,7 +89,7 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     expect(spec.sharing).toBe("dedicated");
     expect(spec.clientInfo).toEqual({
       name: "crabeye-mcp-bridge/test-upstream",
-      version: "0.1.0",
+      version: APP_VERSION,
     });
     expect(spec.clientCapabilities).toEqual({});
     expect(spec.protocolVersion).toBe(LATEST_PROTOCOL_VERSION);

@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { APP_VERSION } from "../src/constants.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
 import type { BridgeServerOptions } from "../src/server/bridge-server.js";
@@ -163,7 +164,7 @@ describe("BridgeServer initialize", () => {
     const serverInfo = client.getServerVersion();
     expect(serverInfo).toBeDefined();
     expect(serverInfo!.name).toBe("crabeye-mcp-bridge");
-    expect(serverInfo!.version).toBe("0.1.0");
+    expect(serverInfo!.version).toBe(APP_VERSION);
 
     await cleanup();
   });
