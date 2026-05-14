@@ -158,10 +158,13 @@ async function probeOAuthAdvertised(
   discover: typeof discoverOAuthProtectedResourceMetadata,
 ): Promise<boolean> {
   // Discovery is network-bound. A slow or hung HTTP upstream would otherwise
-  // make `--list` look broken. AbortSignal.timeout requires Node 17.3+.
+  // make `--list` look broken. The SDK takes a `fetchFn`, not a signal, so
+  // bolt the timeout onto every fetch the discovery helper issues.
   const signal = AbortSignal.timeout(DISCOVERY_PROBE_TIMEOUT_MS);
+  const fetchWithTimeout: typeof fetch = (input, init) =>
+    fetch(input, { ...init, signal });
   try {
-    const meta = await discover(server.url, { signal });
+    const meta = await discover(server.url, undefined, fetchWithTimeout);
     return meta !== undefined;
   } catch {
     // Discovery probe failed (network, timeout, malformed metadata, etc.) —
@@ -549,11 +552,11 @@ function formatErr(err: unknown): string {
   // `errorCode` field carrying machine-readable codes (`invalid_grant`,
   // `invalid_client`, …). Surface the code so users can diagnose without
   // having to dig through SDK source.
-  if (
-    err instanceof Error &&
-    typeof (err as { errorCode?: unknown }).errorCode === "string"
-  ) {
-    return `[${(err as { errorCode: string }).errorCode}] ${err.message}`;
+  if (err instanceof Error) {
+    const errorCode = (err as { errorCode?: unknown }).errorCode;
+    if (typeof errorCode === "string") {
+      return `[${errorCode}] ${err.message}`;
+    }
   }
   return err instanceof Error ? err.message : String(err);
 }

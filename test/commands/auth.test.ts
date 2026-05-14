@@ -328,7 +328,8 @@ describe("runAuthLogin", () => {
         // First call: SDK builds auth URL, asks provider to redirect, returns 'REDIRECT'.
         // Mirror what the real SDK does: pull state from the provider so the
         // CLI can verify the callback against the same value.
-        issuedState = provider.state?.();
+        // SDK types `state?` as `string | Promise<string>`. Our impl is sync.
+        issuedState = await provider.state?.();
         await provider.redirectToAuthorization(
           new URL(`https://provider.example.com/authorize?state=${issuedState}`),
         );
@@ -397,7 +398,8 @@ describe("runAuthLogin", () => {
       options: { serverUrl: string | URL; authorizationCode?: string },
     ): Promise<"AUTHORIZED" | "REDIRECT"> => {
       if (options.authorizationCode === undefined) {
-        issuedState = provider.state?.();
+        // SDK types `state?` as `string | Promise<string>`. Our impl is sync.
+        issuedState = await provider.state?.();
         await provider.redirectToAuthorization(
           new URL(`https://provider.example.com/authorize?state=${issuedState}`),
         );
