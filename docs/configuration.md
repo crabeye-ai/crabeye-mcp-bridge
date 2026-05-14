@@ -38,6 +38,34 @@ Remote servers accessible via HTTP:
 
 HTTP/SSE upstreams are **not** routed through the manager; each bridge connects directly.
 
+### OAuth-authenticated HTTP servers
+
+For servers that advertise OAuth, the minimal setup is just the `url` — run `crabeye-mcp-bridge auth <server>` once and the bridge takes it from there. The `_bridge.auth` block is only needed to override discovery or pin a pre-registered client:
+
+```json
+{
+  "upstreamMcpServers": {
+    "linear": {
+      "url": "https://mcp.linear.app/mcp"
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "_bridge": {
+        "auth": {
+          "type": "oauth2",
+          "clientId": "pre-registered-client-id",
+          "scopes": ["read", "write"],
+          "redirectPort": 18234,
+          "clientSecret": "${NOTION_OAUTH_SECRET}"
+        }
+      }
+    }
+  }
+}
+```
+
+See [docs/auth.md](auth.md#oauth) for the full OAuth flow, confidential-client setup, and platform notes.
+
 ## Categories
 
 Assign a category to a server so tools can be discovered by domain rather than server name:

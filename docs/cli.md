@@ -15,6 +15,9 @@ npx @crabeye-ai/crabeye-mcp-bridge [command] [options]
 | `credential get <key>` | Retrieve a credential (`--show-secret` to unmask) |
 | `credential delete <key>` | Delete a stored credential |
 | `credential list` | List all stored credential keys |
+| `auth <server>` | Run OAuth flow for an upstream — see [docs/auth.md](auth.md#oauth) |
+| `auth --list` (or bare `auth`) | Show OAuth status per server |
+| `auth --remove <server>` | Delete stored OAuth credentials for a server (local only) |
 | `daemon start` \| `stop` \| `status` \| `restart` | Manage the per-user [STDIO manager](stdio-manager.md) process |
 
 ## Options (bridge mode)

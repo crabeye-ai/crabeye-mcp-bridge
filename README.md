@@ -84,7 +84,7 @@ Alternatively, you can add the bridge alongside your existing `mcpServers` entri
 
 - **Discovery + search.** Two meta-tools (`search_tools`, `run_tool`) instead of N×M tool definitions in context. See [docs/how-it-works.md](docs/how-it-works.md).
 - **Configuration.** STDIO, HTTP, and SSE upstreams; categories; multi-source config keys. See [docs/configuration.md](docs/configuration.md).
-- **Authentication.** Encrypted credential store, OS-keychain-backed master key, `${credential:key}` templates. See [docs/auth.md](docs/auth.md).
+- **Authentication.** Encrypted credential store, OS-keychain-backed master key, `${credential:key}` templates, and a one-shot `auth <server>` OAuth flow for HTTP upstreams. See [docs/auth.md](docs/auth.md).
 - **Policies.** Per-tool / per-server / global tool policies (`always` / `prompt` / `never`), rate limiting, discovery modes. See [docs/policies.md](docs/policies.md).
 - **STDIO manager.** STDIO upstreams routed through a per-user manager process so multiple bridges share a single subprocess per upstream. See [docs/stdio-manager.md](docs/stdio-manager.md).
 - **CLI.** `init`, `restore`, `credential`, `daemon`, `--validate`. See [docs/cli.md](docs/cli.md).
