@@ -7,14 +7,86 @@ export const ToolPolicySchema = z.enum(["always", "never", "prompt"]);
 
 // --- Per-server auth config ---
 
-export const ServerOAuthConfigSchema = z.object({
-  type: z.literal("oauth2"),
-  clientId: z.string(),
-  endpoints: z.object({
+function isHttpUrl(value: string): boolean {
+  try {
+    const u = new URL(value);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `z.string().url()` happily accepts `javascript:`, `file://`, custom app
+ * schemes, etc. The auth flow hands the authorization URL to the OS browser
+ * launcher and POSTs to the token endpoint, so a tampered config could turn
+ * either into an exfiltration vector or a local-handler exploit. Restrict to
+ * http(s), and pin token to the same origin as authorization so a config
+ * can't redirect just the code-exchange leg to an attacker URL.
+ */
+const OAuthEndpointsSchema = z
+  .object({
     authorization: z.string().url(),
     token: z.string().url(),
-  }),
+  })
+  .superRefine((endpoints, ctx) => {
+    if (!isHttpUrl(endpoints.authorization)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["authorization"],
+        message: "authorization endpoint must use http or https",
+      });
+    }
+    if (!isHttpUrl(endpoints.token)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["token"],
+        message: "token endpoint must use http or https",
+      });
+    }
+    if (isHttpUrl(endpoints.authorization) && isHttpUrl(endpoints.token)) {
+      const a = new URL(endpoints.authorization).origin;
+      const t = new URL(endpoints.token).origin;
+      if (a !== t) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["token"],
+          message: `token endpoint origin (${t}) must match authorization endpoint origin (${a})`,
+        });
+      }
+    }
+  });
+
+/**
+ * Per-server OAuth config. Most fields are optional now that the bridge uses
+ * the MCP SDK's RFC 9728 / RFC 8414 discovery and RFC 7591 dynamic client
+ * registration. Configure these only to override what discovery returns or
+ * to pin a pre-registered client.
+ *
+ * Minimal config: `{ type: "oauth2" }` — everything else is discovered.
+ */
+export const ServerOAuthConfigSchema = z.object({
+  type: z.literal("oauth2"),
+  /** Pre-registered client_id. When omitted, the bridge dynamically registers. */
+  clientId: z.string().optional(),
+  /** Pinned authorization/token endpoints. When omitted, RFC 8414 discovery is used. */
+  endpoints: OAuthEndpointsSchema.optional(),
   scopes: z.array(z.string()).optional(),
+  /**
+   * Pin the loopback redirect port used during the `auth` flow. Default:
+   * random free port. Restricted to >=1024 — binding privileged ports
+   * needs root, and a malicious local process colluding with a tampered
+   * config to pre-bind a low port is the easier attack we want to remove.
+   */
+  redirectPort: z.number().int().min(1024).max(65535).optional(),
+  /**
+   * Optional client secret for confidential clients. Supports
+   * `${ENV_VAR}` interpolation, resolved at config-load time (env var name
+   * must contain "OAUTH"). If unset, the resolver falls back to
+   * credential-store key `oauth-client-secret:<server>`. Plain strings work
+   * but are discouraged (config files are often shared).
+   */
+  clientSecret: z.string().optional(),
 });
 
 export const RateLimitConfigSchema = z.object({
@@ -73,14 +145,41 @@ export const StdioServerConfigSchema = z.object({
   _bridge: ServerBridgeConfigSchema.optional(),
 });
 
-export const HttpServerConfigSchema = z.object({
-  type: z
-    .enum(["streamable-http", "http", "streamableHttp", "sse"])
-    .default("streamable-http"),
-  url: z.string().url(),
-  headers: z.record(z.string(), z.string()).optional(),
-  _bridge: ServerBridgeConfigSchema.optional(),
-});
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+export const HttpServerConfigSchema = z
+  .object({
+    type: z
+      .enum(["streamable-http", "http", "streamableHttp", "sse"])
+      .default("streamable-http"),
+    url: z.string().url(),
+    headers: z.record(z.string(), z.string()).optional(),
+    _bridge: ServerBridgeConfigSchema.optional(),
+  })
+  .superRefine((server, ctx) => {
+    // When `_bridge.auth` is configured, refuse plain-http upstreams that
+    // aren't loopback. The bridge's connection to the upstream is otherwise
+    // unencrypted, so a network-positioned attacker can serve tampered RFC
+    // 9728 / 8414 metadata that redirects the token endpoint to an
+    // attacker-controlled origin and exfiltrates the authorization code,
+    // PKCE verifier, and client secret.
+    if (!server._bridge?.auth) return;
+    let parsed: URL;
+    try {
+      parsed = new URL(server.url);
+    } catch {
+      return; // url validation will surface this separately
+    }
+    if (parsed.protocol === "http:" && !LOOPBACK_HOSTS.has(parsed.hostname)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["url"],
+        message:
+          "OAuth-configured upstreams must use https (non-loopback hosts). " +
+          `Got http://${parsed.host} — a MITM could inject AS metadata.`,
+      });
+    }
+  });
 
 // HTTP first: it has a required `type` field that disambiguates
 export const ServerConfigSchema = z.union([
@@ -215,7 +314,11 @@ export function resolveUpstreams(
 // --- Type guards ---
 
 export function isHttpServer(config: ServerConfig): config is HttpServerConfig {
-  return "type" in config;
+  // HttpServerConfigSchema requires `url`; stdio configs never carry one.
+  // Discriminating on `url` is structurally tighter than the previous
+  // `"type" in config` check: stdio entries with an extraneous `type` field
+  // (legacy editors, third-party tools) won't mis-classify.
+  return "url" in config;
 }
 
 export function isStdioServer(

@@ -11,6 +11,9 @@ export const OAuth2CredentialSchema = z.object({
   type: z.literal("oauth2"),
   access_token: z.string().min(1),
   refresh_token: z.string().min(1).optional(),
+  /** RFC 6749 §5.1 — `Bearer` by default; preserved as-issued so non-Bearer
+   * schemes (Mac, DPoP) are not silently downgraded by the bridge. */
+  token_type: z.string().min(1).optional(),
   token_endpoint: z.string().url().optional(),
   client_id: z.string().min(1).optional(),
   expires_at: z.number().int().nonnegative().finite().optional(),

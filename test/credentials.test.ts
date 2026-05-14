@@ -411,16 +411,36 @@ describe("CredentialStore CRUD", () => {
     ).rejects.toThrow(/reserved/);
   });
 
-  it("get does not return Object.prototype properties", async () => {
-    const result = await store.get("constructor");
-    expect(result).toBeUndefined();
+  it("rejects constructor and prototype as credential keys", async () => {
+    for (const key of ["constructor", "prototype"]) {
+      await expect(
+        store.set(key, { type: "bearer", access_token: "tok" }),
+      ).rejects.toThrow(/reserved/);
+      await expect(store.get(key)).rejects.toThrow(/reserved/);
+      await expect(store.delete(key)).rejects.toThrow(/reserved/);
+    }
   });
 
-  it("delete does not match Object.prototype properties", async () => {
-    await store.set("real", { type: "bearer", access_token: "tok" });
-    const deleted = await store.delete("constructor");
-    expect(deleted).toBe(false);
+  it("deleteMany removes the present keys in one write and reports them", async () => {
+    await store.set("a", { type: "bearer", access_token: "1" });
+    await store.set("b", { type: "bearer", access_token: "2" });
+    const removed = await store.deleteMany(["a", "b", "missing"]);
+    expect(removed.sort()).toEqual(["a", "b"]);
+    expect(await store.get("a")).toBeUndefined();
+    expect(await store.get("b")).toBeUndefined();
   });
+
+  it("deleteMany returns empty when nothing matched", async () => {
+    await store.set("a", { type: "bearer", access_token: "1" });
+    const removed = await store.deleteMany(["missing"]);
+    expect(removed).toEqual([]);
+    expect(await store.get("a")).toBeDefined();
+  });
+
+  // `constructor` / `prototype` / `__proto__` are rejected at the
+  // _validateKey gate (see "rejects constructor and prototype as credential
+  // keys" above). The read-path `Object.hasOwn` check is now belt-and-
+  // suspenders defense-in-depth for any future code that bypasses validate.
 
   it("throws when keychain is wiped but store file exists", async () => {
     await store.set("key", { type: "bearer", access_token: "tok" });

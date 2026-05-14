@@ -558,6 +558,79 @@ credential
     }
   });
 
+// --- Auth subcommand ---
+const authCmd = program
+  .command("auth [server]")
+  .description("Manage OAuth credentials for upstream servers")
+  .option("--list", "show auth status for all servers (default for bare invocation)")
+  .option("--remove <server>", "delete the stored oauth:<server> credential (local only)")
+  .helpOption("-h, --help", "show usage")
+  .allowUnknownOption(false)
+  .addHelpText(
+    "beforeAll",
+    `Usage:
+  ${APP_NAME} auth <server>            run OAuth flow for a server
+  ${APP_NAME} auth --list              show auth status for all servers (default)
+  ${APP_NAME} auth --remove <server>   delete stored credentials for a server
+  ${APP_NAME} auth help                show this help
+`,
+  )
+  .action(async (server: string | undefined, options: { list?: boolean; remove?: string }) => {
+    const { runAuthList, runAuthLogin, runAuthRemove, authUsage } = await import(
+      "./commands/auth.js"
+    );
+
+    // `auth help` is the documented third invocation form (next to `--help`
+    // and `-h`). Commander handles the flag forms via `helpOption`; this
+    // branch keeps the positional `help` synonym working.
+    if (server === "help") {
+      process.stdout.write(authUsage);
+      return;
+    }
+
+    // Reject `auth <server> --remove <other>` — both name a server, and
+    // silently honouring `--remove` while ignoring the positional is
+    // confusing. Either alone is fine.
+    if (options.remove && server) {
+      process.stderr.write(
+        `Error: pass either \`auth <server>\` or \`auth --remove <server>\`, not both.\n`,
+      );
+      process.exitCode = 2;
+      return;
+    }
+
+    const configPath = program.opts<{ config?: string }>().config;
+
+    if (options.remove) {
+      process.exitCode = await runAuthRemove(options.remove, { configPath });
+      return;
+    }
+
+    if (options.list || !server) {
+      process.exitCode = await runAuthList({ configPath });
+      return;
+    }
+
+    // Ctrl-C / kubectl-style SIGTERM / terminal-close SIGHUP all abort the
+    // in-flight flow so the loopback listener tears down cleanly instead of
+    // leaking on a pinned `redirectPort` (where it would surface as
+    // EADDRINUSE on the next invocation).
+    const abort = new AbortController();
+    const onSig = (): void => abort.abort();
+    const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+    for (const sig of signals) process.once(sig, onSig);
+    try {
+      process.exitCode = await runAuthLogin(
+        { configPath, serverName: server },
+        { signal: abort.signal },
+      );
+    } finally {
+      for (const sig of signals) process.off(sig, onSig);
+    }
+  });
+
+authCmd.addHelpText("afterAll", "\nRun `auth help` for the same usage as `--help`.");
+
 // --- Init / Restore subcommands ---
 
 program

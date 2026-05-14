@@ -64,6 +64,29 @@ export class CredentialStore {
     return true;
   }
 
+  /**
+   * Delete multiple credentials in a single read-modify-write cycle so two
+   * related entries (e.g. `oauth:<srv>` + `oauth-client-secret:<srv>`) can't
+   * land out-of-sync if a concurrent writer interleaves between two `delete()`
+   * calls. Returns the keys that were actually present and removed.
+   */
+  async deleteMany(keys: string[]): Promise<string[]> {
+    for (const key of keys) this._validateKey(key);
+    if (!await this._storeFileExists()) return [];
+    const masterKey = await this._getExistingMasterKey();
+    const store = await this._readStore(masterKey);
+    const removed: string[] = [];
+    for (const key of keys) {
+      if (Object.hasOwn(store.credentials, key)) {
+        delete store.credentials[key];
+        removed.push(key);
+      }
+    }
+    if (removed.length === 0) return [];
+    await this._writeStore(store, masterKey);
+    return removed;
+  }
+
   async list(): Promise<string[]> {
     if (!await this._storeFileExists()) return [];
     const masterKey = await this._getExistingMasterKey();
@@ -77,7 +100,11 @@ export class CredentialStore {
     if (!key) {
       throw new CredentialError("Credential key must not be empty");
     }
-    if (key === "__proto__") {
+    // Defense-in-depth against prototype pollution. Reads already use
+    // `Object.hasOwn` so the danger is theoretical, but writes through
+    // bracket assignment would otherwise be observable as own-properties
+    // shadowing prototype members.
+    if (key === "__proto__" || key === "constructor" || key === "prototype") {
       throw new CredentialError(
         `Credential key "${key}" is reserved and cannot be used`,
       );
@@ -191,7 +218,9 @@ export class CredentialStore {
     const encrypted = this._encrypt(data, masterKey);
 
     const dir = dirname(this.filePath);
-    await mkdir(dir, { recursive: true });
+    // 0o700 so co-located users can't even list the directory contents and
+    // watch token-refresh mtimes. The file itself is already 0o600 below.
+    await mkdir(dir, { recursive: true, mode: 0o700 });
 
     const tmpPath = `${this.filePath}.tmp.${process.pid}`;
     await writeFile(tmpPath, encrypted, { mode: 0o600 });

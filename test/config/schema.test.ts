@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   ServerBridgeConfigSchema,
+  ServerOAuthConfigSchema,
   DaemonConfigSchema,
   PassthroughLevelSchema,
 } from "../../src/config/schema.js";
@@ -117,5 +118,89 @@ describe("ServerBridgeConfigSchema — passthrough (AIT-183)", () => {
     const cfg = ServerBridgeConfigSchema.parse({});
     expect(cfg.passthrough).toBeUndefined();
     expect(cfg.passthroughMaxBytes).toBeUndefined();
+  });
+});
+
+describe("ServerOAuthConfigSchema — endpoint trust (AIT-122)", () => {
+  const base = {
+    type: "oauth2" as const,
+    clientId: "ci",
+    endpoints: {
+      authorization: "https://provider.example.com/authorize",
+      token: "https://provider.example.com/token",
+    },
+  };
+
+  it("accepts http(s) same-origin endpoints", () => {
+    expect(() => ServerOAuthConfigSchema.parse(base)).not.toThrow();
+    expect(() =>
+      ServerOAuthConfigSchema.parse({
+        ...base,
+        endpoints: {
+          authorization: "http://localhost:8080/authorize",
+          token: "http://localhost:8080/token",
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects non-http(s) schemes on authorization endpoint", () => {
+    for (const url of [
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+      "vscode://workspace",
+    ]) {
+      expect(() =>
+        ServerOAuthConfigSchema.parse({
+          ...base,
+          endpoints: { authorization: url, token: base.endpoints.token },
+        }),
+      ).toThrow(/authorization endpoint must use http or https/);
+    }
+  });
+
+  it("rejects non-http(s) schemes on token endpoint", () => {
+    expect(() =>
+      ServerOAuthConfigSchema.parse({
+        ...base,
+        endpoints: {
+          authorization: base.endpoints.authorization,
+          token: "file:///tmp/leaked",
+        },
+      }),
+    ).toThrow(/token endpoint must use http or https/);
+  });
+
+  it("rejects cross-origin token endpoint", () => {
+    expect(() =>
+      ServerOAuthConfigSchema.parse({
+        ...base,
+        endpoints: {
+          authorization: "https://real-provider.example.com/authorize",
+          token: "https://attacker.example.com/exchange",
+        },
+      }),
+    ).toThrow(/origin.*must match authorization endpoint origin/);
+  });
+
+  it("accepts redirectPort and clientSecret as optional", () => {
+    const cfg = ServerOAuthConfigSchema.parse({
+      ...base,
+      redirectPort: 19876,
+      clientSecret: "${OAUTH_NOTION_SECRET}",
+    });
+    expect(cfg.redirectPort).toBe(19876);
+    expect(cfg.clientSecret).toBe("${OAUTH_NOTION_SECRET}");
+  });
+
+  it("rejects privileged redirectPort (<1024)", () => {
+    for (const port of [80, 443, 22, 1023]) {
+      expect(() =>
+        ServerOAuthConfigSchema.parse({ ...base, redirectPort: port }),
+      ).toThrow();
+    }
+    expect(() =>
+      ServerOAuthConfigSchema.parse({ ...base, redirectPort: 1024 }),
+    ).not.toThrow();
   });
 });
