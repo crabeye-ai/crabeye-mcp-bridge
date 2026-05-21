@@ -142,16 +142,74 @@ describe("BridgeOAuthClientProvider", () => {
     }
   });
 
-  it("redirectToAuthorization throws when no onRedirect (runtime context)", async () => {
+  it("redirectToAuthorization throws an actionable reauth message when no onRedirect (runtime)", async () => {
     const provider = new BridgeOAuthClientProvider({
       serverName: "srv",
       store,
       redirectUrl: REDIRECT,
       clientId: "ci",
     });
+    // Both the permanent-refresh-failure path (SDK retries after
+    // InvalidGrantError, finds no refresh_token, falls into redirect) and
+    // the circuit-breaker trip (tokens() returns undefined) funnel here.
+    // The error message must name the server and the exact CLI command.
     await expect(
       provider.redirectToAuthorization(new URL("https://provider/auth?state=x")),
-    ).rejects.toThrow(/mcp-bridge auth srv/);
+    ).rejects.toThrow(/Authentication for "srv" expired.*mcp-bridge auth srv/);
+  });
+
+  it("saveTokens preserves the stored refresh_token when the SDK omits it", async () => {
+    // Common with IdPs that don't rotate refresh tokens (Google, Slack):
+    // the refresh response carries only `access_token`. Overwriting the
+    // stored credential with no refresh_token would force re-auth.
+    await store.set(oauthCredentialKey("srv"), {
+      type: "oauth2",
+      access_token: "old-at",
+      refresh_token: "preserved-rt",
+    });
+    const provider = new BridgeOAuthClientProvider({
+      serverName: "srv",
+      store,
+      redirectUrl: REDIRECT,
+      clientId: "ci",
+    });
+    await provider.saveTokens({
+      access_token: "new-at",
+      token_type: "Bearer",
+      expires_in: 1800,
+    });
+    const stored = await store.get(oauthCredentialKey("srv"));
+    expect(stored).toMatchObject({
+      type: "oauth2",
+      access_token: "new-at",
+      refresh_token: "preserved-rt",
+    });
+  });
+
+  it("saveTokens overwrites refresh_token when the SDK supplies a rotated one", async () => {
+    await store.set(oauthCredentialKey("srv"), {
+      type: "oauth2",
+      access_token: "old-at",
+      refresh_token: "old-rt",
+    });
+    const provider = new BridgeOAuthClientProvider({
+      serverName: "srv",
+      store,
+      redirectUrl: REDIRECT,
+      clientId: "ci",
+    });
+    await provider.saveTokens({
+      access_token: "new-at",
+      token_type: "Bearer",
+      refresh_token: "rotated-rt",
+      expires_in: 1800,
+    });
+    const stored = await store.get(oauthCredentialKey("srv"));
+    expect(stored).toMatchObject({
+      type: "oauth2",
+      access_token: "new-at",
+      refresh_token: "rotated-rt",
+    });
   });
 
   it("redirectToAuthorization invokes onRedirect when configured (CLI context)", async () => {
@@ -330,6 +388,128 @@ describe("BridgeOAuthClientProvider", () => {
     // Corrupt entry was dropped — subsequent lookup also returns undefined,
     // but the underlying store no longer holds the bad value.
     expect(await store.get(`oauth-client:${encodeURIComponent("srv")}`)).toBeUndefined();
+  });
+
+  describe("wrapFetch refresh-token coalescing", () => {
+    function refreshInit(rt = "rt-1"): RequestInit {
+      return {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: rt }),
+      };
+    }
+
+    it("coalesces N concurrent refresh POSTs into a single base fetch call", async () => {
+      const provider = new BridgeOAuthClientProvider({
+        serverName: "srv",
+        store,
+        redirectUrl: REDIRECT,
+        clientId: "ci",
+        runtime: true,
+      });
+
+      let calls = 0;
+      let resolveBase: ((res: Response) => void) | undefined;
+      const base: typeof fetch = async () => {
+        calls++;
+        // Block the in-flight HTTP call so all callers pile up on the
+        // shared promise before any of them resolves.
+        return new Promise<Response>((resolve) => {
+          resolveBase = resolve;
+        });
+      };
+      const wrapped = provider.wrapFetch(base);
+
+      const N = 5;
+      const inflight = Array.from({ length: N }, () =>
+        wrapped("https://as.example/token", refreshInit()),
+      );
+      // Give the coalesce code a tick to register all N awaiters.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(calls).toBe(1);
+
+      resolveBase?.(
+        new Response(
+          JSON.stringify({ access_token: "new", token_type: "Bearer", expires_in: 60 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      const responses = await Promise.all(inflight);
+      expect(responses).toHaveLength(N);
+      // Each caller gets its own readable body — cloning is mandatory.
+      for (const r of responses) {
+        expect(r.status).toBe(200);
+        const json = (await r.json()) as { access_token: string };
+        expect(json.access_token).toBe("new");
+      }
+    });
+
+    it("does not coalesce non-refresh requests", async () => {
+      const provider = new BridgeOAuthClientProvider({
+        serverName: "srv",
+        store,
+        redirectUrl: REDIRECT,
+        clientId: "ci",
+      });
+      let calls = 0;
+      const base: typeof fetch = async () => {
+        calls++;
+        return new Response("ok", { status: 200 });
+      };
+      const wrapped = provider.wrapFetch(base);
+      // GET — not a refresh
+      await wrapped("https://example/anything", { method: "GET" });
+      // POST with a different grant — not a refresh
+      await wrapped("https://example/token", {
+        method: "POST",
+        body: new URLSearchParams({ grant_type: "authorization_code" }),
+      });
+      expect(calls).toBe(2);
+    });
+
+    it("allows a fresh refresh after the in-flight one settles", async () => {
+      const provider = new BridgeOAuthClientProvider({
+        serverName: "srv",
+        store,
+        redirectUrl: REDIRECT,
+        clientId: "ci",
+      });
+      let calls = 0;
+      const base: typeof fetch = async () => {
+        calls++;
+        return new Response(
+          JSON.stringify({ access_token: `at-${calls}`, token_type: "Bearer" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      const wrapped = provider.wrapFetch(base);
+      await wrapped("https://as/token", refreshInit());
+      await wrapped("https://as/token", refreshInit());
+      // Two SEQUENTIAL refreshes are independent and each hit the IdP — we
+      // only coalesce overlapping in-flight calls, not back-to-back ones.
+      expect(calls).toBe(2);
+    });
+
+    it("propagates baseFetch rejection to every coalesced awaiter", async () => {
+      const provider = new BridgeOAuthClientProvider({
+        serverName: "srv",
+        store,
+        redirectUrl: REDIRECT,
+        clientId: "ci",
+      });
+      const err = new Error("token endpoint exploded");
+      const base: typeof fetch = async () => {
+        // Microtask-defer so multiple wrapped() callers register before the
+        // promise settles.
+        await Promise.resolve();
+        throw err;
+      };
+      const wrapped = provider.wrapFetch(base);
+      const a = wrapped("https://as/token", refreshInit()).catch((e) => e);
+      const b = wrapped("https://as/token", refreshInit()).catch((e) => e);
+      const [ra, rb] = await Promise.all([a, b]);
+      expect(ra).toBe(err);
+      expect(rb).toBe(err);
+    });
   });
 });
 

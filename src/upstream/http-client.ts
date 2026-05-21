@@ -143,8 +143,13 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
     // Pin token-endpoint origin to authorization-endpoint origin via the
     // transport's fetch override. This protects the runtime refresh leg
     // against tampered AS metadata pointing the token endpoint at an
-    // attacker-controlled origin. Only installed when OAuth is configured.
-    const fetch = authProvider ? makeOriginPinningFetch() : undefined;
+    // attacker-controlled origin. Layered with the provider's refresh-dedup
+    // wrapper so concurrent 401s coalesce to a single token-endpoint POST
+    // (avoids the IdP rotating away under N parallel refresh attempts).
+    // Only installed when OAuth is configured.
+    const fetch = authProvider
+      ? authProvider.wrapFetch(makeOriginPinningFetch())
+      : undefined;
 
     // Build options once so the conditional spread isn't duplicated across
     // the two transport types.

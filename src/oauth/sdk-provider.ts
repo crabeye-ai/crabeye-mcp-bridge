@@ -56,6 +56,31 @@ export interface BridgeOAuthProviderOptions {
 const REFRESH_WINDOW_MS = 60_000;
 const REFRESH_BURST_LIMIT = 6;
 
+type FetchLike = typeof fetch;
+
+/**
+ * True when `init` describes an OAuth 2.0 refresh-token request: a POST whose
+ * URL-encoded body carries `grant_type=refresh_token`. Used by
+ * `BridgeOAuthClientProvider.wrapFetch` to coalesce parallel refresh attempts.
+ *
+ * The SDK's `refreshAuthorization` constructs the body with `URLSearchParams`;
+ * `addClientAuthentication` hooks may serialize the body to a string before it
+ * reaches `fetch`, so we accept both shapes.
+ */
+function isRefreshTokenRequest(init: RequestInit | undefined): boolean {
+  if (!init) return false;
+  const method = init.method?.toUpperCase();
+  if (method !== "POST") return false;
+  const body = init.body;
+  if (body instanceof URLSearchParams) {
+    return body.get("grant_type") === "refresh_token";
+  }
+  if (typeof body === "string") {
+    return /(^|&)grant_type=refresh_token(&|$)/.test(body);
+  }
+  return false;
+}
+
 /**
  * `OAuthClientProvider` implementation backed by the bridge's encrypted
  * credential store.
@@ -76,6 +101,9 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   private _state: string | undefined;
   private _recentSaves: number[] = [];
   private _refreshExhausted = false;
+  // In-flight token-endpoint refresh, used by `wrapFetch` to coalesce
+  // parallel refresh attempts. See `wrapFetch` for the lifecycle.
+  private _refreshFetchPromise: Promise<Response> | undefined;
 
   constructor(opts: BridgeOAuthProviderOptions) {
     this._opts = opts;
@@ -188,11 +216,26 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
         ? Math.floor(Date.now() / 1000) + tokens.expires_in
         : undefined;
 
+    // Preserve refresh_token when the SDK's refresh response omits it.
+    // Most IdPs (Google, Slack, …) don't rotate refresh tokens by default and
+    // return only `access_token` on refresh. Without this fallback we'd
+    // overwrite the stored credential with no refresh_token, forcing the user
+    // to re-auth on the next expiry.
+    let refreshToken = tokens.refresh_token;
+    if (!refreshToken) {
+      const existing = await this._opts.store.get(
+        oauthCredentialKey(this._opts.serverName),
+      );
+      if (existing?.type === "oauth2" && existing.refresh_token) {
+        refreshToken = existing.refresh_token;
+      }
+    }
+
     await this._opts.store.set(oauthCredentialKey(this._opts.serverName), {
       type: "oauth2",
       access_token: tokens.access_token,
       ...(tokens.token_type ? { token_type: tokens.token_type } : {}),
-      ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
+      ...(refreshToken ? { refresh_token: refreshToken } : {}),
       ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
       ...(this._opts.clientId ? { client_id: this._opts.clientId } : {}),
     });
@@ -217,12 +260,55 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
 
   async redirectToAuthorization(url: URL): Promise<void> {
     if (!this._opts.onRedirect) {
+      // Runtime: no interactive user. Reached when either the stored
+      // refresh_token is permanently invalid (SDK retried after
+      // InvalidGrantError, wiped tokens, then re-entered auth) or the
+      // refresh-loop circuit breaker tripped and `tokens()` returned
+      // undefined. Both paths surface here as the single actionable
+      // message the LLM/tool-caller sees.
       throw new Error(
-        `OAuth authorization required for "${this._opts.serverName}" — ` +
-        `run \`${APP_NAME} auth ${this._opts.serverName}\``,
+        `Authentication for "${this._opts.serverName}" expired. ` +
+        `Run: ${APP_NAME} auth ${this._opts.serverName}`,
       );
     }
     await this._opts.onRedirect(url);
+  }
+
+  /**
+   * Wrap a `fetch` implementation so concurrent OAuth refresh-token requests
+   * coalesce to a single HTTP call. The SDK's transport calls `auth()` once
+   * per 401, so N parallel tool calls hitting an expired access token spawn
+   * N parallel `refreshAuthorization` POSTs. With IdPs that rotate refresh
+   * tokens (Linear, GitHub, …), only one of those wins and the others
+   * either fail or invalidate the just-minted token. Coalescing avoids that
+   * race entirely while preserving the SDK's reactive 401 flow.
+   *
+   * Scope: per-provider instance. Each upstream HTTP server owns its own
+   * provider, so dedup is naturally per-server.
+   */
+  wrapFetch(baseFetch: FetchLike): FetchLike {
+    return async (input, init) => {
+      if (!isRefreshTokenRequest(init)) return baseFetch(input, init);
+      let p = this._refreshFetchPromise;
+      if (!p) {
+        p = baseFetch(input, init);
+        this._refreshFetchPromise = p;
+        // Clear the slot once the in-flight call settles. Both branches
+        // (resolve, reject) drain awaiters; the catch on the cleanup chain
+        // is purely to silence the otherwise-unhandled rejection warning
+        // that node emits for the bookkeeping chain — every real awaiter
+        // still observes the rejection via its own `await p`.
+        p.finally(() => {
+          if (this._refreshFetchPromise === p) {
+            this._refreshFetchPromise = undefined;
+          }
+        }).catch(() => {});
+      }
+      // Each awaiter gets its own clone — Response bodies are single-use
+      // streams, so we cannot hand the same Response to multiple callers.
+      const response = await p;
+      return response.clone();
+    };
   }
 
   saveCodeVerifier(verifier: string): void {
@@ -281,8 +367,6 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     }
   }
 }
-
-type FetchLike = typeof fetch;
 
 /**
  * Wraps `fetch` so RFC 8414 / 9728 metadata responses are inspected for
