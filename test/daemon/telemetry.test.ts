@@ -8,7 +8,7 @@ describe("Telemetry", () => {
       children: {
         total: 0,
         spawnedTotal: 0,
-        killedTotal: { grace: 0, restart: 0, fork: 0, crash: 0 },
+        killedTotal: { grace: 0, restart: 0, fork: 0, crash: 0, wedged: 0 },
       },
       sessions: { total: 0, openedTotal: 0, closedTotal: 0 },
       fork: { eventsTotal: 0 },
@@ -35,7 +35,7 @@ describe("Telemetry", () => {
       const s = t.snapshot();
       expect(s.children.total).toBe(0);
       expect(s.children.spawnedTotal).toBe(2);
-      expect(s.children.killedTotal).toEqual({ grace: 1, restart: 1, fork: 0, crash: 0 });
+      expect(s.children.killedTotal).toEqual({ grace: 1, restart: 1, fork: 0, crash: 0, wedged: 0 });
     });
 
     it("recordKill never drops total below zero", () => {
@@ -49,7 +49,7 @@ describe("Telemetry", () => {
       const t = new Telemetry();
       const reasons: KilledReason[] = ["grace", "grace", "restart", "fork", "crash", "crash", "crash"];
       for (const r of reasons) t.recordKill(r);
-      expect(t.snapshot().children.killedTotal).toEqual({ grace: 2, restart: 1, fork: 1, crash: 3 });
+      expect(t.snapshot().children.killedTotal).toEqual({ grace: 2, restart: 1, fork: 1, crash: 3, wedged: 0 });
     });
   });
 

@@ -59,6 +59,9 @@ export async function runDaemonInternal(): Promise<number> {
     killGraceMs: cfg.killGraceMs,
     autoForkDrainTimeoutMs: cfg.autoForkDrainTimeoutMs,
     autoForkInitializeTimeoutMs: cfg.autoForkInitializeTimeoutMs,
+    childPingMs: cfg.childPingMs,
+    childPingTimeoutMs: cfg.childPingTimeoutMs,
+    childPingMaxConsecutiveFailures: cfg.childPingMaxConsecutiveFailures,
     transport: netTransport,
   });
 

@@ -204,6 +204,16 @@ export const DaemonConfigSchema = z
     heartbeatMs: z.number().int().positive().default(5_000),
     /** How long a losing bridge waits on `manager.lock` after detecting a dead daemon before surfacing `ERR_UPSTREAM_RESTARTED`. */
     respawnLockWaitMs: z.number().int().positive().default(60_000),
+    /**
+     * Cadence for the daemon-side MCP `ping` against each spawned stdio child.
+     * `0` disables the supervisor (bridge end-to-end ping then becomes the
+     * only liveness signal for the upstream).
+     */
+    childPingMs: z.number().int().nonnegative().default(15_000),
+    /** Per-ping deadline for the daemon-side child ping. */
+    childPingTimeoutMs: z.number().int().positive().default(5_000),
+    /** Kill the child after this many consecutive ping failures. */
+    childPingMaxConsecutiveFailures: z.number().int().positive().default(3),
   })
   .strict();
 

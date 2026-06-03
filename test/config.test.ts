@@ -150,6 +150,9 @@ describe("schema validation", () => {
           rpcTimeoutMs: 30000,
           heartbeatMs: 5000,
           respawnLockWaitMs: 60000,
+          childPingMs: 15000,
+          childPingTimeoutMs: 5000,
+          childPingMaxConsecutiveFailures: 3,
         },
       });
     }

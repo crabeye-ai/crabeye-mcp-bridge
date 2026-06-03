@@ -96,7 +96,7 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       // Telemetry: 2 sessions opened on 1 shared child; nothing closed yet.
       expect(status.telemetry.children.total).toBe(1);
       expect(status.telemetry.children.spawnedTotal).toBe(1);
-      expect(status.telemetry.children.killedTotal).toEqual({ grace: 0, restart: 0, fork: 0, crash: 0 });
+      expect(status.telemetry.children.killedTotal).toEqual({ grace: 0, restart: 0, fork: 0, crash: 0, wedged: 0 });
       expect(status.telemetry.sessions.total).toBe(2);
       expect(status.telemetry.sessions.openedTotal).toBe(2);
       expect(status.telemetry.sessions.closedTotal).toBe(0);

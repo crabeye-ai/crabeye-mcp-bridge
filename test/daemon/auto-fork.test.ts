@@ -183,6 +183,7 @@ describe("AutoForkOrchestrator — shared/dedicated dispatch", () => {
       forked: false,
       internalRequests: new Map(),
       nextInternalId: -1,
+      childPing: null,
     };
   }
 

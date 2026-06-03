@@ -46,6 +46,7 @@ import { SubscriptionTracker } from "./subscription-tracker.js";
 import { NotificationRouter } from "./notification-router.js";
 import { AutoForkOrchestrator } from "./auto-fork.js";
 import { Telemetry, type KilledReason } from "./telemetry.js";
+import { ChildPing } from "./child-ping.js";
 import type { DaemonServer, FrameChannel, Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
@@ -157,6 +158,13 @@ export interface ChildGroup {
    * `kind: "internal"`.
    */
   nextInternalId: number;
+  /**
+   * Daemon-side MCP ping supervisor. Lifecycled with the child: instantiated
+   * at `spawnGroup`, armed once we see the initialize response, stopped in
+   * `handleChildExit` / `unregisterGroup`. `null` when the supervisor is
+   * disabled via `childPingMs <= 0`.
+   */
+  childPing: ChildPing | null;
 }
 
 /**
@@ -222,6 +230,12 @@ export interface ManagerOptions {
    * is evicted. Default 10_000ms.
    */
   autoForkInitializeTimeoutMs?: number;
+  /** Cadence between daemon-side child pings. `0` disables. Default 15_000. */
+  childPingMs?: number;
+  /** Per-ping deadline. Default 5_000. */
+  childPingTimeoutMs?: number;
+  /** Wedge threshold: kill the child after N consecutive ping failures. Default 3. */
+  childPingMaxConsecutiveFailures?: number;
   transport: Transport;
   /** Override pid for tests. */
   pid?: number;
@@ -284,6 +298,9 @@ export class ManagerDaemon {
   private readonly killGraceMsValue: number;
   private readonly autoForkDrainTimeoutMs: number;
   private readonly autoForkInitializeTimeoutMs: number;
+  private readonly childPingMs: number;
+  private readonly childPingTimeoutMs: number;
+  private readonly childPingMaxConsecutiveFailures: number;
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
   private readonly autoFork: AutoForkOrchestrator;
@@ -301,6 +318,9 @@ export class ManagerDaemon {
     this.killGraceMsValue = opts.killGraceMs ?? 2_000;
     this.autoForkDrainTimeoutMs = opts.autoForkDrainTimeoutMs ?? 60_000;
     this.autoForkInitializeTimeoutMs = opts.autoForkInitializeTimeoutMs ?? 10_000;
+    this.childPingMs = opts.childPingMs ?? 15_000;
+    this.childPingTimeoutMs = opts.childPingTimeoutMs ?? 5_000;
+    this.childPingMaxConsecutiveFailures = opts.childPingMaxConsecutiveFailures ?? 3;
     this.logger = opts.logger ?? createNoopLogger();
     this.tracker =
       opts.processTracker ??
@@ -1091,8 +1111,64 @@ export class ManagerDaemon {
       forked: false,
       internalRequests: new Map(),
       nextInternalId: -1,
+      childPing: null,
     };
     groupRef.value = group;
+
+    // Daemon-side liveness ping. Armed only once the child has answered
+    // initialize (see `routeChildMessage`): MCP servers commonly reject
+    // arbitrary requests before init, and treating those error responses
+    // as "alive" would technically work but pollutes the child's logs.
+    if (this.childPingMs > 0) {
+      group.childPing = new ChildPing({
+        pingMs: this.childPingMs,
+        timeoutMs: this.childPingTimeoutMs,
+        maxConsecutiveFailures: this.childPingMaxConsecutiveFailures,
+        logger: this.logger.child({
+          component: "child-ping",
+          upstreamHash: hash,
+          server: spec.serverName,
+        }),
+        deps: {
+          allocateId: () => {
+            const id = group.nextInternalId;
+            group.nextInternalId -= 1;
+            return id;
+          },
+          registerCallback: (id, cb) => {
+            // ChildPing only cares whether a response landed, not what it
+            // contained. Wrap to match the manager's payload-receiving
+            // callback shape.
+            group.internalRequests.set(id, () => cb());
+          },
+          unregisterCallback: (id) => {
+            group.internalRequests.delete(id);
+          },
+          sendPayload: (payload) => {
+            group.child.send(payload);
+          },
+          onWedged: (reason) => {
+            this.logger.error(
+              `child wedged: ${reason} — killing`,
+              {
+                component: "child-ping",
+                upstreamHash: hash,
+                server: spec.serverName,
+                pid: group.child.pid,
+              },
+            );
+            // The child's onClose callback fires once kill() lands and runs
+            // through handleChildExit → unregisterGroup. `handleChildExit`
+            // checks `childPing.isWedged` to pass `"wedged"` (not the
+            // default `"crash"`) into telemetry, so this path doesn't need
+            // to record the kill itself.
+            void group.child.kill(this.killGraceMsValue).catch(() => {
+              /* best-effort */
+            });
+          },
+        },
+      });
+    }
 
     if (mode === "shared") {
       this.shareableIndex.set(`${hash}:${spec.sharing}`, group);
@@ -1230,6 +1306,9 @@ export class ManagerDaemon {
             capabilities: result.capabilities as Record<string, unknown>,
             ...(instrToCache !== undefined && { instructions: instrToCache }),
           });
+          // Initialize completed — child has demonstrated it can read +
+          // write the stdio pipes, so the ping supervisor can safely arm.
+          group.childPing?.start();
         }
       }
       this.deliver(group, routing.sessionIds, routing.payload);
@@ -1399,7 +1478,10 @@ export class ManagerDaemon {
       void this.detachSession(sid, "child process exited").catch(() => {});
     }
 
-    void this.unregisterGroup(group, "crash").catch(() => {});
+    // If the child-ping supervisor flagged this child as wedged before exit,
+    // record the kill under `wedged` instead of the generic `crash`.
+    const reason: KilledReason = group.childPing?.isWedged === true ? "wedged" : "crash";
+    void this.unregisterGroup(group, reason).catch(() => {});
   }
 
   /**
@@ -1543,6 +1625,7 @@ export class ManagerDaemon {
       this.shareableIndex.delete(indexKey);
     }
     this.cancelGraceTimer(group);
+    group.childPing?.stop();
     const pid = group.child.pid;
     try {
       await group.child.kill(this.killGraceMs());

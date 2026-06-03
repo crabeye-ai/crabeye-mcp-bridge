@@ -6,7 +6,7 @@
  * started_at gauge — uptime is sufficient signal).
  */
 
-export type KilledReason = "grace" | "restart" | "fork" | "crash";
+export type KilledReason = "grace" | "restart" | "fork" | "crash" | "wedged";
 
 const RPC_ERROR_CODE_CAP = 64;
 
@@ -38,6 +38,7 @@ export class Telemetry {
     restart: 0,
     fork: 0,
     crash: 0,
+    wedged: 0,
   };
 
   private sessionsTotal = 0;
