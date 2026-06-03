@@ -93,6 +93,21 @@ function parseRegex(input: string): RegExp | null {
   }
 }
 
+function fingerprintTools(
+  registered: ReadonlyArray<{ source: string; tool: { name: string; description?: string } }>,
+  getCategory: (source: string) => string,
+): string {
+  // Stable order: registry returns Map insertion order which can differ
+  // across rebuilds, so sort by (source, name) to keep the fingerprint
+  // resilient to re-registration order changes that don't alter content.
+  const rows = registered
+    .map(({ source, tool }) =>
+      [source, tool.name, tool.description ?? "", getCategory(source)].join("\x1f"),
+    )
+    .sort();
+  return `${rows.length}|${rows.join("\x1e")}`;
+}
+
 function setsEqual(a: Set<string>, b: Set<string>): boolean {
   if (a.size !== b.size) return false;
   for (const item of a) {
@@ -218,6 +233,14 @@ export class ToolSearchService {
   private listeners = new Set<VisibleToolsChangedCallback>();
   private unsubscribeRegistry: () => void;
   private policyEngine: PolicyEngine | undefined;
+  /**
+   * Fingerprint of the last indexed state. A buggy upstream that spams
+   * `notifications/tools/list_changed` (some servers do this on every tool
+   * call) used to drive a full minisearch tear-down + re-add per notify
+   * even when the tool list was byte-identical. We skip the rebuild when
+   * the fingerprint is unchanged.
+   */
+  private lastFingerprint = "";
 
   private discoveryMode: DiscoveryMode;
 
@@ -247,10 +270,20 @@ export class ToolSearchService {
   }
 
   private rebuildIndex(): void {
+    const registered = this.registry.listRegisteredTools();
+    // Cheap content fingerprint: source + name + description + category.
+    // Skips the expensive minisearch teardown + re-add when an upstream
+    // re-emits an identical tool list. Description is included so a tool
+    // whose description changed (with the same name) still rebuilds.
+    const fingerprint = fingerprintTools(registered, (s) =>
+      this.registry.getCategoryForSource(s) ?? "",
+    );
+    if (fingerprint === this.lastFingerprint) return;
+    this.lastFingerprint = fingerprint;
+
     this.index.removeAll();
     this.indexedTools.clear();
 
-    const registered = this.registry.listRegisteredTools();
     for (const { source, tool } of registered) {
       const parsed = parseNamespacedName(tool.name);
       const originalName = parsed?.toolName ?? tool.name;

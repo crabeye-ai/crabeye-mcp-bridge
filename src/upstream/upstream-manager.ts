@@ -298,9 +298,12 @@ export class UpstreamManager {
       for (const aliasName of group.aliasNames) {
         const namespaced = tools.map((t) => namespaceTool(aliasName, t));
         this._toolRegistry.setToolsForSource(aliasName, namespaced);
-        log.info(
-          `${tools.length} tool${tools.length === 1 ? "" : "s"} discovered: ${namespaced.map((t) => t.name).join(", ")}`,
-        );
+        // An upstream that spams `notifications/tools/list_changed` (some
+        // buggy servers do this on every tool call) used to drive this
+        // O(n) join on every fire, melting CPU when N is in the hundreds.
+        // Info now reports the count only; the full list is debug-level.
+        log.info(`${tools.length} tool${tools.length === 1 ? "" : "s"} discovered`);
+        log.debug("discovered tools", { tools: namespaced.map((t) => t.name) });
       }
     });
 

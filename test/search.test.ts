@@ -563,6 +563,34 @@ describe("ToolSearchService", () => {
       result = service.search({ queries: [{ tool: "new_tool" }] });
       expect(result.results[0].total).toBe(1);
     });
+
+    it("identical re-registration skips the minisearch rebuild", () => {
+      // Guards against an upstream that spams `notifications/tools/list_changed`
+      // (some buggy MCP servers do this on every tool call): the registry
+      // fires onChanged every time, but the index should only tear down when
+      // the tool content actually changed.
+      const tools = [
+        makeTool("spam__a", "Tool A"),
+        makeTool("spam__b", "Tool B"),
+      ];
+      registry.setToolsForSource("spam", tools);
+
+      const index = (service as unknown as { index: { removeAll: () => void } }).index;
+      const removeAllSpy = vi.spyOn(index, "removeAll");
+
+      // Five identical re-registrations — the spam pattern.
+      for (let i = 0; i < 5; i++) {
+        registry.setToolsForSource("spam", [
+          makeTool("spam__a", "Tool A"),
+          makeTool("spam__b", "Tool B"),
+        ]);
+      }
+      expect(removeAllSpy).not.toHaveBeenCalled();
+
+      // A real content change still triggers the rebuild.
+      registry.setToolsForSource("spam", [makeTool("spam__a", "Tool A (renamed desc)")]);
+      expect(removeAllSpy).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("dispose", () => {
