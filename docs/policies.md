@@ -40,7 +40,13 @@ In this example, all Linear tools require confirmation except `list_issues` (run
 
 ## Rate limiting
 
-Prevent the bridge from exceeding upstream API quotas by setting per-server rate limits. When the limit is hit, calls wait in a FIFO queue until the sliding window opens — the LLM just sees slightly higher latency instead of an error.
+The bridge applies a preemptive rate limit to every upstream so an LLM's bursty tool calls don't blow through the upstream's API quota. When the limit is hit, calls wait in a FIFO queue until the sliding window opens — the LLM just sees slightly higher latency instead of an error. Each queued call has its own 60-second timeout; past that it fails.
+
+### Defaults
+
+Out of the box, every upstream gets `{ maxCalls: 30, windowSeconds: 6 }` — averaging 5 calls per second, smoothed across a 6-second window. This protects upstreams the user didn't think to configure; the first time the default actually blocks a call on a given upstream, the bridge logs an INFO message naming both opt-out paths.
+
+### Per-server override
 
 ```json
 {
@@ -49,19 +55,59 @@ Prevent the bridge from exceeding upstream API quotas by setting per-server rate
       "command": "npx",
       "args": ["-y", "@anthropic/github-mcp-server"],
       "_bridge": {
-        "rateLimit": {
-          "maxCalls": 30,
-          "windowSeconds": 60
-        }
+        "rateLimit": { "maxCalls": 30, "windowSeconds": 60 }
       }
     }
   }
 }
 ```
 
-In this example, the bridge allows at most 30 tool calls to the `github` server per 60-second sliding window. If a 31st call arrives before the window slides, it waits until a slot opens. If the wait exceeds 30 seconds, the call fails with an error.
+The `github` server is capped at 30 calls per 60-second window. Per-server values override both the global default and the hardcoded fallback.
 
-Rate limit configuration is hot-reloadable — changes take effect without restarting the bridge.
+### Global default
+
+```json
+{
+  "_bridge": {
+    "defaultRateLimit": { "maxCalls": 60, "windowSeconds": 10 }
+  }
+}
+```
+
+Every upstream that doesn't set its own `_bridge.rateLimit` follows this. Replaces the hardcoded `30/6` fallback.
+
+### Opting out
+
+Set the value to `false` to disable rate limiting:
+
+```json
+{
+  "upstreamMcpServers": {
+    "fast-local": {
+      "command": "...",
+      "_bridge": { "rateLimit": false }
+    }
+  },
+  "_bridge": {
+    "defaultRateLimit": false
+  }
+}
+```
+
+- Per-server `false` opts that upstream out (regardless of the global default).
+- Global `defaultRateLimit: false` opts out every upstream that didn't set its own.
+
+### Resolution order
+
+First match wins:
+
+1. Per-server `_bridge.rateLimit === false` → no limit
+2. Per-server `_bridge.rateLimit` object → use it
+3. Global `_bridge.defaultRateLimit === false` → no limit
+4. Global `_bridge.defaultRateLimit` object → use it
+5. Otherwise → hardcoded `{ maxCalls: 30, windowSeconds: 6 }`
+
+Rate limit configuration is hot-reloadable. When a hot-reload lifts a limit (per-server or global flips to `false`) while calls are queued, those queued calls fire immediately instead of erroring — the user's intent was to remove the throttle.
 
 ## Discovery mode
 

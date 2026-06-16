@@ -3,7 +3,9 @@ import {
   ServerBridgeConfigSchema,
   ServerOAuthConfigSchema,
   DaemonConfigSchema,
+  GlobalBridgeConfigSchema,
   PassthroughLevelSchema,
+  RateLimitConfigOrDisabledSchema,
 } from "../../src/config/schema.js";
 
 describe("config — Phase D sharing config", () => {
@@ -59,6 +61,56 @@ describe("DaemonConfigSchema — Phase E additions", () => {
       heartbeatMs: 2_000,
       respawnLockWaitMs: 10_000,
     });
+  });
+});
+
+describe("rate limit — disabled opt-out (#183)", () => {
+  it("accepts a concrete config object", () => {
+    expect(
+      RateLimitConfigOrDisabledSchema.parse({ maxCalls: 5, windowSeconds: 2 }),
+    ).toEqual({ maxCalls: 5, windowSeconds: 2 });
+  });
+
+  it("accepts the literal `false` as opt-out", () => {
+    expect(RateLimitConfigOrDisabledSchema.parse(false)).toBe(false);
+  });
+
+  it("rejects `true`, null, and partial objects", () => {
+    expect(() => RateLimitConfigOrDisabledSchema.parse(true)).toThrow();
+    expect(() => RateLimitConfigOrDisabledSchema.parse(null)).toThrow();
+    expect(() =>
+      RateLimitConfigOrDisabledSchema.parse({ maxCalls: 5 }),
+    ).toThrow();
+    expect(() =>
+      RateLimitConfigOrDisabledSchema.parse({ windowSeconds: 2 }),
+    ).toThrow();
+  });
+
+  it("ServerBridgeConfigSchema.rateLimit accepts both object and `false`", () => {
+    expect(
+      ServerBridgeConfigSchema.parse({
+        rateLimit: { maxCalls: 10, windowSeconds: 1 },
+      }).rateLimit,
+    ).toEqual({ maxCalls: 10, windowSeconds: 1 });
+    expect(
+      ServerBridgeConfigSchema.parse({ rateLimit: false }).rateLimit,
+    ).toBe(false);
+  });
+
+  it("GlobalBridgeConfigSchema.defaultRateLimit accepts both object and `false`", () => {
+    expect(
+      GlobalBridgeConfigSchema.parse({
+        defaultRateLimit: { maxCalls: 100, windowSeconds: 60 },
+      }).defaultRateLimit,
+    ).toEqual({ maxCalls: 100, windowSeconds: 60 });
+    expect(
+      GlobalBridgeConfigSchema.parse({ defaultRateLimit: false })
+        .defaultRateLimit,
+    ).toBe(false);
+  });
+
+  it("GlobalBridgeConfigSchema.defaultRateLimit defaults to undefined", () => {
+    expect(GlobalBridgeConfigSchema.parse({}).defaultRateLimit).toBeUndefined();
   });
 });
 

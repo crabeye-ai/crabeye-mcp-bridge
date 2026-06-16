@@ -15,7 +15,8 @@ import type {
   HttpServerConfig,
 } from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
-import { RateLimiter } from "./server/rate-limiter.js";
+import type { RateLimiter } from "./server/rate-limiter.js";
+import { applyRateLimiters } from "./server/rate-limit-resolution.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { renderPassthrough } from "./server/passthrough.js";
 import { ToolSearchService } from "./search/index.js";
@@ -173,11 +174,12 @@ program
       const discoveryMode = options.discoveryMode as DiscoveryMode;
       toolSearchService = new ToolSearchService(toolRegistry, policyEngine, discoveryMode);
 
-      for (const [name, serverConfig] of Object.entries(upstreams)) {
-        if (serverConfig._bridge?.rateLimit) {
-          rateLimiters.set(name, new RateLimiter(serverConfig._bridge.rateLimit));
-        }
-      }
+      applyRateLimiters({
+        upstreams,
+        global: config._bridge,
+        rateLimiters,
+        logger,
+      });
 
       server = new BridgeServer({
         toolRegistry,
@@ -242,26 +244,15 @@ program
           logger.info(`tool policy changed to ${diff.bridge.toolPolicy}`, { component: "reload" });
         }
 
-        // Update rate limiters from new config
-        for (const [name, serverConfig] of Object.entries(newUpstreams)) {
-          const rl = serverConfig._bridge?.rateLimit;
-          const existing = rateLimiters.get(name);
-          if (rl && existing) {
-            existing.reconfigure(rl);
-          } else if (rl) {
-            rateLimiters.set(name, new RateLimiter(rl));
-          } else if (existing) {
-            existing.dispose();
-            rateLimiters.delete(name);
-          }
-        }
-        // Remove rate limiters for servers no longer in config
-        for (const name of rateLimiters.keys()) {
-          if (!(name in newUpstreams)) {
-            rateLimiters.get(name)!.dispose();
-            rateLimiters.delete(name);
-          }
-        }
+        // Update rate limiters from new config. The helper handles every
+        // transition: new/changed/removed limit, drain-on-disable, and
+        // upstream-removed.
+        applyRateLimiters({
+          upstreams: newUpstreams,
+          global: newConfig._bridge,
+          rateLimiters,
+          logger,
+        });
 
         // Server-level changes
         const hasServerChanges =

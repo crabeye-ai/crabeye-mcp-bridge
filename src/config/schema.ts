@@ -90,9 +90,22 @@ export const ServerOAuthConfigSchema = z.object({
 });
 
 export const RateLimitConfigSchema = z.object({
-  maxCalls: z.number().int().positive(),
-  windowSeconds: z.number().int().positive(),
+  // Upper bounds are defense-in-depth against operator typos that would
+  // silently disable throttling (huge maxCalls) or trip Node's timer-delay
+  // clamping (huge windowSeconds → 1ms setTimeout quirk).
+  maxCalls: z.number().int().min(1).max(1_000_000),
+  windowSeconds: z.number().int().min(1).max(86_400),
 });
+
+/**
+ * A rate-limit slot. Either a concrete `{ maxCalls, windowSeconds }` config
+ * or the literal `false` to opt out. Used for both per-server overrides and
+ * the global `defaultRateLimit` so opting out works at either level.
+ */
+export const RateLimitConfigOrDisabledSchema = z.union([
+  RateLimitConfigSchema,
+  z.literal(false),
+]);
 
 export const ReconnectConfigSchema = z.object({
   maxReconnectAttempts: z.number().int().min(0).optional(),
@@ -117,7 +130,7 @@ export const ServerBridgeConfigSchema = z
     toolPolicy: ToolPolicySchema.optional(),
     tools: z.record(z.string(), ToolPolicySchema).optional(),
     category: z.string().optional(),
-    rateLimit: RateLimitConfigSchema.optional(),
+    rateLimit: RateLimitConfigOrDisabledSchema.optional(),
     reconnect: ReconnectConfigSchema.optional(),
     sharing: z.enum(["auto", "shared", "dedicated"]).optional(),
     passthrough: PassthroughLevelSchema.optional(),
@@ -230,6 +243,13 @@ export const GlobalBridgeConfigSchema = z
     healthCheckInterval: z.number().int().min(0).default(30),
     toolPolicy: ToolPolicySchema.default("always"),
     reconnect: ReconnectConfigSchema.optional(),
+    /**
+     * Default preemptive rate limit applied to every upstream that doesn't
+     * set its own `_bridge.rateLimit`. When unset, a hardcoded fallback of
+     * 30 calls / 6 seconds is used. Set to `false` to opt every default-using
+     * upstream out of rate limiting.
+     */
+    defaultRateLimit: RateLimitConfigOrDisabledSchema.optional(),
     daemon: DaemonConfigSchema.default(DaemonConfigSchema.parse({})),
   })
   .strict();
@@ -252,6 +272,7 @@ export const BridgeConfigSchema = z.object({
 export type ToolPolicy = z.infer<typeof ToolPolicySchema>;
 export type PassthroughLevel = z.infer<typeof PassthroughLevelSchema>;
 export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
+export type RateLimitConfigOrDisabled = z.infer<typeof RateLimitConfigOrDisabledSchema>;
 export type ReconnectConfig = z.infer<typeof ReconnectConfigSchema>;
 export type ServerOAuthConfig = z.infer<typeof ServerOAuthConfigSchema>;
 export type ServerBridgeConfig = z.infer<typeof ServerBridgeConfigSchema>;
