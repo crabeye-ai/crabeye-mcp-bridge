@@ -726,3 +726,204 @@ describe("CredentialError", () => {
     expect(err.cause).toBe(cause);
   });
 });
+
+// --- Concurrency tests (#115) ---
+
+describe("concurrency", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = tempDir();
+    await mkdir(dir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const range = (n: number): number[] =>
+    Array.from({ length: n }, (_, i) => i);
+
+  it("N concurrent set() calls for different keys all land", async () => {
+    const store = new CredentialStore({
+      keychain: new MockKeychain(),
+      filePath: join(dir, "creds.enc"),
+    });
+
+    const N = 20;
+    await Promise.all(
+      range(N).map((i) =>
+        store.set(`k-${i}`, { type: "bearer", access_token: `tok-${i}` }),
+      ),
+    );
+
+    const keys = await store.list();
+    expect(keys.sort()).toEqual(range(N).map((i) => `k-${i}`).sort());
+    for (const i of range(N)) {
+      expect(await store.get(`k-${i}`)).toEqual({
+        type: "bearer",
+        access_token: `tok-${i}`,
+      });
+    }
+  });
+
+  it("N concurrent delete() calls for different keys all complete", async () => {
+    const store = new CredentialStore({
+      keychain: new MockKeychain(),
+      filePath: join(dir, "creds.enc"),
+    });
+
+    const N = 20;
+    // Seed serially — the parallel-delete fixture is what's under test, so
+    // racing the seeding too would obscure which operation lost a write.
+    for (const i of range(N)) {
+      await store.set(`k-${i}`, { type: "bearer", access_token: `tok-${i}` });
+    }
+
+    const results = await Promise.all(
+      range(N).map((i) => store.delete(`k-${i}`)),
+    );
+    expect(results).toEqual(new Array(N).fill(true));
+    expect(await store.list()).toEqual([]);
+  });
+
+  it("interleaved set + delete on the same key leaves a coherent final state", async () => {
+    const store = new CredentialStore({
+      keychain: new MockKeychain(),
+      filePath: join(dir, "creds.enc"),
+    });
+
+    // Fire 5 sets and 5 deletes for the same key in parallel. The
+    // load-bearing assertion is that `await Promise.all` does not throw —
+    // i.e. no parse/decrypt error from a torn write. The `expect()` calls
+    // below verify the final state is one of the legal outcomes (present
+    // with one of the written tokens, or absent); they cannot pin which.
+    const sets = range(5).map((i) =>
+      store.set("k", { type: "bearer", access_token: `tok-${i}` }),
+    );
+    const deletes = range(5).map(() => store.delete("k"));
+    await Promise.all([...sets, ...deletes]);
+
+    const final = await store.get("k");
+    if (final !== undefined) {
+      expect(final.type).toBe("bearer");
+      if (final.type === "bearer") {
+        expect(final.access_token).toMatch(/^tok-[0-4]$/);
+      }
+    }
+  });
+
+  it("two CredentialStore instances on the same file share the lock", async () => {
+    const filePath = join(dir, "creds.enc");
+    const sharedKey = randomBytes(32);
+    const kc1 = new MockKeychain();
+    const kc2 = new MockKeychain();
+    await kc1.setKey(sharedKey);
+    await kc2.setKey(sharedKey);
+
+    const a = new CredentialStore({ keychain: kc1, filePath });
+    const b = new CredentialStore({ keychain: kc2, filePath });
+
+    const N = 10;
+    await Promise.all([
+      ...range(N).map((i) =>
+        a.set(`a-${i}`, { type: "bearer", access_token: `at-${i}` }),
+      ),
+      ...range(N).map((i) =>
+        b.set(`b-${i}`, { type: "bearer", access_token: `bt-${i}` }),
+      ),
+    ]);
+
+    const keys = await a.list();
+    expect(keys).toHaveLength(2 * N);
+    for (const i of range(N)) {
+      expect(await a.get(`a-${i}`)).toBeDefined();
+      expect(await a.get(`b-${i}`)).toBeDefined();
+    }
+  });
+
+  it("stores on different files run without cross-contamination", async () => {
+    const a = new CredentialStore({
+      keychain: new MockKeychain(),
+      filePath: join(dir, "a.enc"),
+    });
+    const b = new CredentialStore({
+      keychain: new MockKeychain(),
+      filePath: join(dir, "b.enc"),
+    });
+
+    await Promise.all([
+      a.set("a", { type: "bearer", access_token: "at" }),
+      b.set("b", { type: "bearer", access_token: "bt" }),
+    ]);
+
+    expect(await a.list()).toEqual(["a"]);
+    expect(await b.list()).toEqual(["b"]);
+    // Cross-file invisibility — sanity check that the locks really are
+    // independent and the writes didn't cross-contaminate.
+    expect(await a.get("b")).toBeUndefined();
+    expect(await b.get("a")).toBeUndefined();
+  });
+
+  it("a rejected RMW does not poison the chain", async () => {
+    let getKeyCalls = 0;
+    let stored: Buffer | undefined;
+    const flaky: KeychainAdapter = {
+      async getKey() {
+        getKeyCalls++;
+        if (getKeyCalls === 3) {
+          throw new CredentialError("transient keychain error");
+        }
+        return stored;
+      },
+      async setKey(k) {
+        stored = k;
+      },
+      async deleteKey() {
+        stored = undefined;
+      },
+    };
+    const store = new CredentialStore({
+      keychain: flaky,
+      filePath: join(dir, "creds.enc"),
+    });
+
+    const results = await Promise.allSettled([
+      store.set("k1", { type: "bearer", access_token: "t1" }),
+      store.set("k2", { type: "bearer", access_token: "t2" }),
+      store.set("k3", { type: "bearer", access_token: "t3" }),
+      store.set("k4", { type: "bearer", access_token: "t4" }),
+      store.set("k5", { type: "bearer", access_token: "t5" }),
+    ]);
+
+    // Order is preserved through the mutex chain, so the 3rd call rejects.
+    expect(results[2]!.status).toBe("rejected");
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(4);
+
+    const keys = (await store.list()).sort();
+    expect(keys).toEqual(["k1", "k2", "k4", "k5"]);
+  });
+
+  it("get() during a set() does not deadlock", async () => {
+    const store = new CredentialStore({
+      keychain: new MockKeychain(),
+      filePath: join(dir, "creds.enc"),
+    });
+
+    // Seed an initial value so the first get() has something to return.
+    await store.set("k", { type: "bearer", access_token: "v0" });
+
+    const setP = store.set("k", { type: "bearer", access_token: "v1" });
+    const getP = store.get("k");
+
+    const [, gotten] = await Promise.all([setP, getP]);
+    // Either pre- or post-write — both are legal since reads skip the lock.
+    expect(gotten?.type).toBe("bearer");
+    if (gotten?.type === "bearer") {
+      expect(["v0", "v1"]).toContain(gotten.access_token);
+    }
+
+    // Final state is the post-set value.
+    expect(await store.get("k")).toEqual({ type: "bearer", access_token: "v1" });
+  });
+});

@@ -1,6 +1,6 @@
 import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { access, readFile, writeFile, rename, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { CREDENTIALS_DIR, CREDENTIALS_FILENAME } from "../constants.js";
 import { CredentialStoreFileSchema, type Credential, type CredentialStoreFile } from "./types.js";
@@ -17,12 +17,55 @@ export interface CredentialStoreOptions {
   filePath?: string;
 }
 
-// Note: CredentialStore is not concurrency-safe. Concurrent read-modify-write
-// cycles (e.g. two `set()` calls in parallel) may lose writes. This is
-// acceptable for CLI usage; callers requiring concurrency should serialize
-// access externally.
+/**
+ * Tiny promise-chain mutex. `run(fn)` enqueues `fn` behind any earlier work
+ * and resolves with its result; rejections in `fn` propagate to the caller
+ * but do not poison the chain — the next `run()` proceeds normally.
+ */
+class AsyncMutex {
+  private chain: Promise<void> = Promise.resolve();
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.chain;
+    let release!: () => void;
+    this.chain = new Promise<void>((r) => {
+      release = r;
+    });
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+// Mutating ops (`set`, `delete`, `deleteMany`) are serialized in-process so
+// concurrent read-modify-write cycles cannot lose writes. Reads (`get`,
+// `list`) skip the lock — atomic rename on write means readers always see a
+// self-consistent file (pre- or post-write, never a torn snapshot).
+//
+// Cross-process safety is *not* provided. The realistic race is a user
+// running `mcp-bridge credential set` (or `auth <server>`) while the daemon
+// is mid-refresh: both write through `_writeStore`, and `rename(2)` is atomic
+// per call but not against another process's concurrent `rename(2)`. The
+// loser's RMW silently overwrites the winner's data. Encryption is AEAD, so
+// a half-written file fails GCM auth (loud failure, forces re-auth) rather
+// than silently leaking — but a write *can* be lost. Revisit (e.g.
+// `proper-lockfile`) if cross-process writers become routine.
+//
+// Path keying: `getMutex()` canonicalizes via `path.resolve` and lowercases
+// on case-insensitive filesystems, but does NOT resolve symlinks. Callers
+// constructing a store must pass the same canonical path string to share a
+// lock — in this codebase that's enforced by computing the path once from
+// constants in the constructor.
+
+const CASE_INSENSITIVE_FS =
+  process.platform === "darwin" || process.platform === "win32";
 
 export class CredentialStore {
+  private static readonly mutexes = new Map<string, AsyncMutex>();
+
   private readonly keychain: KeychainAdapter;
   private readonly filePath: string;
 
@@ -31,6 +74,20 @@ export class CredentialStore {
     this.filePath =
       options.filePath ??
       join(homedir(), CREDENTIALS_DIR, CREDENTIALS_FILENAME);
+  }
+
+  private getMutex(): AsyncMutex {
+    // `resolve` collapses relatives and `..`; lowercase covers
+    // case-insensitive FS where `Creds.enc` and `creds.enc` are the same
+    // file. Symlinks are not followed (see class comment).
+    let key = resolvePath(this.filePath);
+    if (CASE_INSENSITIVE_FS) key = key.toLowerCase();
+    let mutex = CredentialStore.mutexes.get(key);
+    if (!mutex) {
+      mutex = new AsyncMutex();
+      CredentialStore.mutexes.set(key, mutex);
+    }
+    return mutex;
   }
 
   async get(key: string): Promise<Credential | undefined> {
@@ -45,23 +102,27 @@ export class CredentialStore {
 
   async set(key: string, credential: Credential): Promise<void> {
     this._validateKey(key);
-    const masterKey = await this._getOrCreateMasterKey();
-    const store = await this._readStore(masterKey);
-    store.credentials[key] = credential;
-    await this._writeStore(store, masterKey);
+    await this.getMutex().run(async () => {
+      const masterKey = await this._getOrCreateMasterKey();
+      const store = await this._readStore(masterKey);
+      store.credentials[key] = credential;
+      await this._writeStore(store, masterKey);
+    });
   }
 
   async delete(key: string): Promise<boolean> {
     this._validateKey(key);
-    if (!await this._storeFileExists()) return false;
-    const masterKey = await this._getExistingMasterKey();
-    const store = await this._readStore(masterKey);
-    if (!Object.hasOwn(store.credentials, key)) {
-      return false;
-    }
-    delete store.credentials[key];
-    await this._writeStore(store, masterKey);
-    return true;
+    return this.getMutex().run(async () => {
+      if (!await this._storeFileExists()) return false;
+      const masterKey = await this._getExistingMasterKey();
+      const store = await this._readStore(masterKey);
+      if (!Object.hasOwn(store.credentials, key)) {
+        return false;
+      }
+      delete store.credentials[key];
+      await this._writeStore(store, masterKey);
+      return true;
+    });
   }
 
   /**
@@ -72,19 +133,21 @@ export class CredentialStore {
    */
   async deleteMany(keys: string[]): Promise<string[]> {
     for (const key of keys) this._validateKey(key);
-    if (!await this._storeFileExists()) return [];
-    const masterKey = await this._getExistingMasterKey();
-    const store = await this._readStore(masterKey);
-    const removed: string[] = [];
-    for (const key of keys) {
-      if (Object.hasOwn(store.credentials, key)) {
-        delete store.credentials[key];
-        removed.push(key);
+    return this.getMutex().run(async () => {
+      if (!await this._storeFileExists()) return [];
+      const masterKey = await this._getExistingMasterKey();
+      const store = await this._readStore(masterKey);
+      const removed: string[] = [];
+      for (const key of keys) {
+        if (Object.hasOwn(store.credentials, key)) {
+          delete store.credentials[key];
+          removed.push(key);
+        }
       }
-    }
-    if (removed.length === 0) return [];
-    await this._writeStore(store, masterKey);
-    return removed;
+      if (removed.length === 0) return [];
+      await this._writeStore(store, masterKey);
+      return removed;
+    });
   }
 
   async list(): Promise<string[]> {
