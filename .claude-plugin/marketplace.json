@@ -1,0 +1,13 @@
+{
+  "name": "crabeye",
+  "description": "Crabeye MCP Bridge — one MCP connection for all your tools.",
+  "author": { "name": "Crabeye AI" },
+  "homepage": "https://github.com/crabeye-ai/crabeye-mcp-bridge",
+  "plugins": [
+    {
+      "name": "crabeye-mcp-bridge",
+      "description": "Aggregate multiple MCP servers behind a single STDIO interface.",
+      "source": { "type": "local-path", "path": "." }
+    }
+  ]
+}

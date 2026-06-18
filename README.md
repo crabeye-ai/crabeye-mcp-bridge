@@ -80,6 +80,17 @@ The bridge also reads `upstreamServers` (shorthand), `servers` (VS Code Copilot)
 
 Alternatively, you can add the bridge alongside your existing `mcpServers` entries without renaming anything — the bridge will pick up the other servers from `mcpServers` automatically (excluding itself). Disable the other MCP servers in your client so the assistant uses the bridge as the single entry point.
 
+### Install as a Claude Code plugin
+
+Register the bridge's repo as a Claude Code marketplace, then install the plugin:
+
+```
+/plugin marketplace add crabeye-ai/crabeye-mcp-bridge
+/plugin install crabeye-mcp-bridge@crabeye
+```
+
+Claude Code auto-registers the bridge as an MCP server. If you haven't configured upstreams yet, the bridge's startup error will surface in Claude Code's MCP server log — run `npx @crabeye-ai/crabeye-mcp-bridge init` in a terminal to discover and import existing MCP server configs from your other clients.
+
 ## Features
 
 - **Discovery + search.** Two meta-tools (`search_tools`, `run_tool`) instead of N×M tool definitions in context. See [docs/how-it-works.md](docs/how-it-works.md).

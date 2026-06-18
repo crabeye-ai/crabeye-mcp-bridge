@@ -12,6 +12,7 @@ export default tseslint.config(
           allowDefaultProject: [
             "*.config.ts",
             "*.config.mjs",
+            "scripts/*.js",
           ],
         },
         tsconfigRootDir: import.meta.dirname,

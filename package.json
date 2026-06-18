@@ -17,6 +17,7 @@
   ],
   "scripts": {
     "prepublishOnly": "npm run build",
+    "version": "node scripts/sync-plugin-version.js && git add .claude-plugin/plugin.json",
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
