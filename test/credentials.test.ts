@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdir, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
+import type { Logger } from "../src/logging/index.js";
 import {
   BearerCredentialSchema,
   OAuth2CredentialSchema,
@@ -925,5 +926,223 @@ describe("concurrency", () => {
 
     // Final state is the post-set value.
     expect(await store.get("k")).toEqual({ type: "bearer", access_token: "v1" });
+  });
+});
+
+// --- Lock-hold timeout (#184) ---
+
+describe("lock-hold timeout", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = tempDir();
+    await mkdir(dir, { recursive: true });
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * Keychain whose `getKey` blocks on a gate the test holds — simulates a
+   * wedged-keychain (OS prompt the user walked away from, buggy adapter).
+   * Persists the master key across calls so drain-pattern follow-up calls
+   * can decrypt what the first wedged call wrote.
+   */
+  function gatedKeychain(): { keychain: KeychainAdapter; release: () => void } {
+    let resolveGate: () => void = () => {};
+    const gate = new Promise<void>((r) => { resolveGate = r; });
+    let stored: Buffer | undefined;
+    return {
+      keychain: {
+        async getKey() { await gate; return stored; },
+        async setKey(k) { stored = k; },
+        async deleteKey() { stored = undefined; },
+      },
+      release: () => resolveGate(),
+    };
+  }
+
+  function makeLogger(): { logger: Logger; warn: ReturnType<typeof vi.fn> } {
+    const warn = vi.fn();
+    return { logger: { warn } as unknown as Logger, warn };
+  }
+
+  function makeStore(
+    keychain: KeychainAdapter,
+    logger: Logger,
+    lockTimeoutMs: number | undefined = 60_000,
+  ): CredentialStore {
+    return new CredentialStore({
+      keychain,
+      filePath: join(dir, "creds.enc"),
+      logger,
+      lockTimeoutMs,
+    });
+  }
+
+  it("does not log or reject when the closure resolves before the timeout", async () => {
+    const { logger, warn } = makeLogger();
+    const store = makeStore(new MockKeychain(), logger);
+
+    await store.set("k", { type: "bearer", access_token: "tok" });
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(await store.get("k")).toEqual({ type: "bearer", access_token: "tok" });
+  });
+
+  it("rejects the caller after the timeout and logs once", async () => {
+    const { logger, warn } = makeLogger();
+    const { keychain, release } = gatedKeychain();
+    const store = makeStore(keychain, logger);
+
+    const setP = store.set("k", { type: "bearer", access_token: "tok" });
+    const onReject = vi.fn();
+    setP.catch(onReject);
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(onReject).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2);
+    expect(onReject).toHaveBeenCalledOnce();
+    const err = onReject.mock.calls[0]?.[0] as Error;
+    expect(err).toBeInstanceOf(CredentialError);
+    expect(err.message).toMatch(/Credential store set exceeded 60000ms/);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toMatch(/Credential store set exceeded 60000ms/);
+
+    // Drain the wedged closure's fs writes before afterEach removes the
+    // tmpdir. The follow-up `set` queues behind it, so awaiting it
+    // guarantees the chain has flushed.
+    release();
+    await vi.runAllTimersAsync();
+    await store.set("__drain", { type: "bearer", access_token: "_" });
+  });
+
+  it("keeps the chain held until the wedged closure actually settles", async () => {
+    const { logger } = makeLogger();
+    const { keychain, release } = gatedKeychain();
+    const store = makeStore(keychain, logger);
+
+    const first = store.set("a", { type: "bearer", access_token: "1" });
+    first.catch(() => {});
+    await vi.advanceTimersByTimeAsync(60_001);
+
+    let secondSettled = false;
+    const second = store.set("b", { type: "bearer", access_token: "2" })
+      .finally(() => { secondSettled = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    // Wedged closure still parked → second must NOT have started (it
+    // could otherwise race the first on `_writeStore`).
+    expect(secondSettled).toBe(false);
+
+    release();
+    await vi.runAllTimersAsync();
+    await second;
+    expect(secondSettled).toBe(true);
+  });
+
+  it("a waiter behind a timed-out closure does not inherit the first's expired clock", async () => {
+    const { logger, warn } = makeLogger();
+    const { keychain, release } = gatedKeychain();
+    const store = makeStore(keychain, logger);
+
+    const first = store.set("a", { type: "bearer", access_token: "1" });
+    first.catch(() => {});
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(warn).toHaveBeenCalledOnce();
+
+    // Each call's clock starts when its own `fn` runs — and the second's
+    // can't run until the first's closure settles. If timers were shared,
+    // the second would reject by now.
+    const second = store.set("b", { type: "bearer", access_token: "2" });
+    const onSecondReject = vi.fn();
+    second.catch(onSecondReject);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(onSecondReject).not.toHaveBeenCalled();
+
+    release();
+    await vi.runAllTimersAsync();
+    await expect(second).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it("lockTimeoutMs: 0 disables the timeout (pre-#184 behavior)", async () => {
+    const { logger, warn } = makeLogger();
+    const { keychain, release } = gatedKeychain();
+    const store = makeStore(keychain, logger, 0);
+
+    const setP = store.set("k", { type: "bearer", access_token: "tok" });
+    const onSettle = vi.fn();
+    void setP.then(onSettle, onSettle);
+
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(onSettle).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+
+    release();
+    await vi.runAllTimersAsync();
+    await setP;
+    expect(onSettle).toHaveBeenCalledOnce();
+  });
+
+  it("a normal closure rejection does not trigger the timeout warning log", async () => {
+    const { logger, warn } = makeLogger();
+    const throwingKeychain: KeychainAdapter = {
+      async getKey() { throw new CredentialError("keychain locked"); },
+      async setKey() {},
+      async deleteKey() {},
+    };
+    const store = makeStore(throwingKeychain, logger);
+
+    await expect(
+      store.set("k", { type: "bearer", access_token: "tok" }),
+    ).rejects.toThrow(/keychain locked/);
+    // The timer for this call must have been cleared when `fn` rejected,
+    // so advancing past the timeout window surfaces no phantom warning.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("two concurrent timed-out operations each log once", async () => {
+    // Two independent stores → independent mutexes → both timers fire on the same tick.
+    const { logger, warn } = makeLogger();
+    const { keychain: kcA, release: releaseA } = gatedKeychain();
+    const { keychain: kcB, release: releaseB } = gatedKeychain();
+    const storeA = new CredentialStore({
+      keychain: kcA, filePath: join(dir, "a.enc"), logger, lockTimeoutMs: 60_000,
+    });
+    const storeB = new CredentialStore({
+      keychain: kcB, filePath: join(dir, "b.enc"), logger, lockTimeoutMs: 60_000,
+    });
+
+    const pA = storeA.set("k", { type: "bearer", access_token: "1" });
+    const pB = storeB.set("k", { type: "bearer", access_token: "2" });
+    pA.catch(() => {});
+    pB.catch(() => {});
+
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/set exceeded/);
+    expect(warn.mock.calls[1]?.[0]).toMatch(/set exceeded/);
+
+    releaseA();
+    releaseB();
+    await vi.runAllTimersAsync();
+    await storeA.set("__drain", { type: "bearer", access_token: "_" });
+    await storeB.set("__drain", { type: "bearer", access_token: "_" });
+  });
+
+  it("does not leak a timer when the closure resolves on time", async () => {
+    const { logger, warn } = makeLogger();
+    const store = makeStore(new MockKeychain(), logger);
+
+    await store.set("k", { type: "bearer", access_token: "tok" });
+    await vi.runAllTimersAsync();
+    expect(warn).not.toHaveBeenCalled();
   });
 });

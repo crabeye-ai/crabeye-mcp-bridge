@@ -3,6 +3,7 @@ import { access, readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { CREDENTIALS_DIR, CREDENTIALS_FILENAME } from "../constants.js";
+import type { Logger } from "../logging/index.js";
 import { CredentialStoreFileSchema, type Credential, type CredentialStoreFile } from "./types.js";
 import { CredentialError } from "./errors.js";
 import type { KeychainAdapter } from "./keychain.js";
@@ -11,31 +12,94 @@ const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
 const MAX_KEY_LENGTH = 256;
+const DEFAULT_LOCK_TIMEOUT_MS = 60_000;
 
 export interface CredentialStoreOptions {
   keychain: KeychainAdapter;
   filePath?: string;
+  logger?: Logger;
+  /**
+   * Per-RMW timeout. When `set`/`delete`/`deleteMany` exceeds this, the
+   * caller rejects with a `CredentialError` and `logger.warn` fires once;
+   * the chain stays held until the wedged closure actually settles, so it
+   * cannot race the next waiter on the file write.
+   *
+   * Caveat: this is a caller-facing "give up waiting" signal, NOT a
+   * cancellation. The wedged closure (e.g. a keychain call the user is
+   * still ignoring) keeps running, and if it eventually completes it WILL
+   * write to disk — minutes or hours later than the caller expected. In a
+   * single-process scenario the next queued write supersedes that late
+   * write; the asymmetric case (cross-process writer between the timeout
+   * and the late completion) is the same cross-process gap discussed in
+   * the class-level comment.
+   *
+   * Default 60_000 ms. Pass `0` to disable.
+   */
+  lockTimeoutMs?: number;
+}
+
+interface RunOptions {
+  timeoutMs?: number;
+  logger?: Logger;
+  /** Operation name used in the timeout error and the warning log. */
+  label?: string;
 }
 
 /**
  * Tiny promise-chain mutex. `run(fn)` enqueues `fn` behind any earlier work
  * and resolves with its result; rejections in `fn` propagate to the caller
  * but do not poison the chain — the next `run()` proceeds normally.
+ *
+ * Liveness: pass `opts.timeoutMs` to reject the caller after the budget
+ * expires. The chain is NOT released on timeout — it stays held until the
+ * closure actually settles — because the wedged closure could still touch
+ * the encrypted file via `_writeStore` and would race the next waiter if
+ * we let one in early.
  */
 class AsyncMutex {
   private chain: Promise<void> = Promise.resolve();
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  async run<T>(fn: () => Promise<T>, opts?: RunOptions): Promise<T> {
     const prev = this.chain;
     let release!: () => void;
     this.chain = new Promise<void>((r) => {
       release = r;
     });
+    await prev;
+
+    const work = (async () => {
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    })();
+
+    const timeoutMs = opts?.timeoutMs;
+    if (!timeoutMs) return work;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const op = opts?.label ?? "operation";
+        const msg =
+          `Credential store ${op} exceeded ${timeoutMs}ms; the underlying ` +
+          `closure (likely a keychain call) is still running. Subsequent ` +
+          `writes remain queued until it settles.`;
+        // Defensive: a throwing user-supplied logger inside this callback
+        // would unwind without scheduling `reject`, hanging the caller.
+        try {
+          opts?.logger?.warn(msg, { component: "credential_store" });
+        } catch {
+          // swallow
+        }
+        reject(new CredentialError(msg));
+      }, timeoutMs);
+    });
     try {
-      await prev;
-      return await fn();
+      return await Promise.race([work, timeout]);
     } finally {
-      release();
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 }
@@ -68,12 +132,16 @@ export class CredentialStore {
 
   private readonly keychain: KeychainAdapter;
   private readonly filePath: string;
+  private readonly logger: Logger | undefined;
+  private readonly lockTimeoutMs: number | undefined;
 
   constructor(options: CredentialStoreOptions) {
     this.keychain = options.keychain;
     this.filePath =
       options.filePath ??
       join(homedir(), CREDENTIALS_DIR, CREDENTIALS_FILENAME);
+    this.logger = options.logger;
+    this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   }
 
   private getMutex(): AsyncMutex {
@@ -107,7 +175,7 @@ export class CredentialStore {
       const store = await this._readStore(masterKey);
       store.credentials[key] = credential;
       await this._writeStore(store, masterKey);
-    });
+    }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "set" });
   }
 
   async delete(key: string): Promise<boolean> {
@@ -122,7 +190,7 @@ export class CredentialStore {
       delete store.credentials[key];
       await this._writeStore(store, masterKey);
       return true;
-    });
+    }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "delete" });
   }
 
   /**
@@ -147,7 +215,7 @@ export class CredentialStore {
       if (removed.length === 0) return [];
       await this._writeStore(store, masterKey);
       return removed;
-    });
+    }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "deleteMany" });
   }
 
   async list(): Promise<string[]> {
