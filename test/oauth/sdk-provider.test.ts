@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { CredentialStore } from "../../src/credentials/credential-store.js";
+import type { Credential } from "../../src/credentials/types.js";
 import {
   BridgeOAuthClientProvider,
   makeOriginPinningFetch,
@@ -173,6 +174,10 @@ describe("BridgeOAuthClientProvider", () => {
       redirectUrl: REDIRECT,
       clientId: "ci",
     });
+    // The SDK calls `tokens()` before every refresh attempt; that's where
+    // the in-provider cache of refresh_token gets populated. Mirror that
+    // sequence here.
+    await provider.tokens();
     await provider.saveTokens({
       access_token: "new-at",
       token_type: "Bearer",
@@ -509,6 +514,286 @@ describe("BridgeOAuthClientProvider", () => {
       const [ra, rb] = await Promise.all([a, b]);
       expect(ra).toBe(err);
       expect(rb).toBe(err);
+    });
+  });
+
+  describe("refresh_token cache (#185)", () => {
+    const KEY = oauthCredentialKey("srv");
+
+    const makeProvider = (storeArg: CredentialStore = store): BridgeOAuthClientProvider =>
+      new BridgeOAuthClientProvider({
+        serverName: "srv",
+        store: storeArg,
+        redirectUrl: REDIRECT,
+        clientId: "ci",
+      });
+
+    const refreshTokenOf = (c: Credential | undefined): string | undefined =>
+      c?.type === "oauth2" ? c.refresh_token : undefined;
+
+    it("tokens() populates the cache so a later saveTokens without refresh_token preserves it", async () => {
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "old-at",
+        refresh_token: "cached-rt",
+      });
+      const provider = makeProvider();
+      await provider.tokens();
+      await provider.saveTokens({
+        access_token: "new-at",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      expect(await store.get(KEY)).toMatchObject({
+        type: "oauth2",
+        access_token: "new-at",
+        refresh_token: "cached-rt",
+      });
+    });
+
+    it("saveTokens before tokens() with refresh_token in payload writes that refresh_token (initial auth)", async () => {
+      // Empty store, no `tokens()` call — cache is undefined. Initial
+      // authorization always carries a refresh_token, so the payload wins.
+      const provider = makeProvider();
+      await provider.saveTokens({
+        access_token: "at",
+        token_type: "Bearer",
+        refresh_token: "fresh-rt",
+        expires_in: 1800,
+      });
+      expect(await store.get(KEY)).toMatchObject({
+        type: "oauth2",
+        access_token: "at",
+        refresh_token: "fresh-rt",
+      });
+    });
+
+    it("saveTokens before tokens() with no refresh_token writes no refresh_token", async () => {
+      // Pathological — the SDK shouldn't drive this sequence, but if no
+      // payload refresh_token and no cache, we don't fabricate one.
+      const provider = makeProvider();
+      await provider.saveTokens({
+        access_token: "at",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      const stored = await store.get(KEY);
+      expect(stored).toMatchObject({ type: "oauth2", access_token: "at" });
+      expect(refreshTokenOf(stored)).toBeUndefined();
+    });
+
+    it("back-to-back saveTokens with no intervening tokens() preserves the cached refresh_token across both saves", async () => {
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "at-0",
+        refresh_token: "rt-0",
+      });
+      const provider = makeProvider();
+      await provider.tokens(); // populate cache once
+
+      await provider.saveTokens({
+        access_token: "at-1",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      await provider.saveTokens({
+        access_token: "at-2",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+
+      expect(await store.get(KEY)).toMatchObject({
+        type: "oauth2",
+        access_token: "at-2",
+        refresh_token: "rt-0",
+      });
+    });
+
+    it("saveTokens with a rotated refresh_token updates the cache to the rotated value", async () => {
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "at-0",
+        refresh_token: "rt-0",
+      });
+      const provider = makeProvider();
+      await provider.tokens(); // cache = rt-0
+
+      // Rotation: payload carries rt-1.
+      await provider.saveTokens({
+        access_token: "at-1",
+        token_type: "Bearer",
+        refresh_token: "rt-1",
+        expires_in: 1800,
+      });
+
+      // Next save omits refresh_token — should preserve rt-1 (the rotated
+      // value), not the original rt-0.
+      await provider.saveTokens({
+        access_token: "at-2",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+
+      expect(await store.get(KEY)).toMatchObject({
+        type: "oauth2",
+        access_token: "at-2",
+        refresh_token: "rt-1",
+      });
+    });
+
+    it("invalidateCredentials('tokens') clears the cache so the next saveTokens without payload writes no refresh_token", async () => {
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "old-at",
+        refresh_token: "rt-pre",
+      });
+      const provider = makeProvider();
+      await provider.tokens(); // cache = rt-pre
+
+      await provider.invalidateCredentials("tokens");
+
+      // Without the fix, the cache would still hold rt-pre and resurrect
+      // the credential with the just-invalidated refresh_token.
+      await provider.saveTokens({
+        access_token: "new-at",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      const stored = await store.get(KEY);
+      expect(stored).toMatchObject({ type: "oauth2", access_token: "new-at" });
+      expect(refreshTokenOf(stored)).toBeUndefined();
+    });
+
+    it("invalidateCredentials('all') clears the cache", async () => {
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "at",
+        refresh_token: "rt",
+      });
+      const provider = makeProvider();
+      await provider.tokens(); // cache = rt
+      await provider.invalidateCredentials("all");
+      await provider.saveTokens({
+        access_token: "new-at",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      expect(refreshTokenOf(await store.get(KEY))).toBeUndefined();
+    });
+
+    it.each(["client", "verifier", "discovery"] as const)(
+      "invalidateCredentials(%s) does NOT clear the cache",
+      async (scope) => {
+        await store.set(KEY, {
+          type: "oauth2",
+          access_token: "at",
+          refresh_token: "kept-rt",
+        });
+        const provider = makeProvider();
+        await provider.tokens();
+        await provider.invalidateCredentials(scope);
+        await provider.saveTokens({
+          access_token: "new-at",
+          token_type: "Bearer",
+          expires_in: 1800,
+        });
+        expect(await store.get(KEY)).toMatchObject({
+          refresh_token: "kept-rt",
+        });
+      },
+    );
+
+    it("invalidate-then-save: invalidate's sync clear lands before saveTokens reads the cache", async () => {
+      // The regression guard. Before the fix, saveTokens read the stored
+      // credential via async `store.get`, and a concurrent invalidate could
+      // delete between the get and the set — letting saveTokens write a
+      // credential carrying the just-invalidated refresh_token. With the
+      // cache the read is a sync field access; invalidate's sync clear runs
+      // first and saveTokens captures `undefined`.
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "old-at",
+        refresh_token: "rt-doomed",
+      });
+      const provider = makeProvider();
+      await provider.tokens(); // cache = rt-doomed
+
+      // Fire invalidate first so its sync cache clear lands before
+      // saveTokens reads the cache. Both writes then serialise on the
+      // credential-store mutex.
+      const invalidatePromise = provider.invalidateCredentials("tokens");
+      const savePromise = provider.saveTokens({
+        access_token: "new-at",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      await Promise.all([invalidatePromise, savePromise]);
+
+      // saveTokens runs second under the mutex, so the credential exists
+      // and carries the new access_token — but NOT a resurrected
+      // refresh_token, because the cache was cleared synchronously before
+      // saveTokens read it.
+      const stored = await store.get(KEY);
+      expect(stored).toMatchObject({ type: "oauth2", access_token: "new-at" });
+      expect(refreshTokenOf(stored)).toBeUndefined();
+    });
+
+    it("tokens() racing invalidate does not resurrect a just-cleared cache", async () => {
+      // Regression for the M1 finding (#185 security review). Before the
+      // invalidate-epoch guard, `tokens()` would await `store.get` (which
+      // bypasses the file mutex on reads), and a concurrent
+      // `invalidateCredentials("tokens")` could clear the cache and delete
+      // the credential — but the pre-delete `get` result, resolving later,
+      // would write the stale refresh_token back into the just-cleared
+      // cache. A follow-up saveTokens without a payload refresh_token would
+      // then resurrect it on disk.
+      await store.set(KEY, {
+        type: "oauth2",
+        access_token: "old-at",
+        refresh_token: "rt-ghost",
+      });
+
+      // Wrap the store to slow `get` so we can interleave invalidate
+      // deterministically while `tokens()` is mid-await.
+      let releaseGet: () => void = () => {};
+      const slowGetPromise = new Promise<void>((r) => { releaseGet = r; });
+      const realGet = store.get.bind(store);
+      const slowStore = new Proxy(store, {
+        get(target, prop, receiver) {
+          if (prop === "get") {
+            return async (key: string) => {
+              const result = await realGet(key);
+              await slowGetPromise;
+              return result;
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+
+      const provider = makeProvider(slowStore);
+
+      // Start `tokens()` — its `await store.get` resolves the real read but
+      // then blocks on `slowGetPromise` before assigning the cache.
+      const tokensPromise = provider.tokens();
+      // While `tokens()` is parked past the await, invalidate runs to
+      // completion: bumps epoch, clears cache, deletes credential.
+      await provider.invalidateCredentials("tokens");
+      // Now unblock `tokens()`. Its post-await branch sees the epoch has
+      // changed and skips the cache write.
+      releaseGet();
+      await tokensPromise;
+
+      // A subsequent saveTokens that omits refresh_token must NOT pull a
+      // resurrected value from the cache.
+      await provider.saveTokens({
+        access_token: "new-at",
+        token_type: "Bearer",
+        expires_in: 1800,
+      });
+      const stored = await store.get(KEY);
+      expect(stored).toMatchObject({ type: "oauth2", access_token: "new-at" });
+      expect(refreshTokenOf(stored)).toBeUndefined();
     });
   });
 });

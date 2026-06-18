@@ -104,6 +104,15 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   // In-flight token-endpoint refresh, used by `wrapFetch` to coalesce
   // parallel refresh attempts. See `wrapFetch` for the lifecycle.
   private _refreshFetchPromise: Promise<Response> | undefined;
+  // Sync mirror of the stored credential's refresh_token. Lets `saveTokens`
+  // preserve it on non-rotating IdPs without an async re-read, closing the
+  // saveTokens-vs-invalidateCredentials TOCTOU.
+  private _lastRefreshToken: string | undefined;
+  // Monotonic counter bumped by `invalidateCredentials` for token-clearing
+  // scopes. `tokens()` snapshots it before its `await store.get(...)` and
+  // refuses to write the cache from a stale read whose result predates a
+  // concurrent invalidate.
+  private _invalidateEpoch = 0;
 
   constructor(opts: BridgeOAuthProviderOptions) {
     this._opts = opts;
@@ -183,8 +192,16 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       // `redirectToAuthorization` throws a clear "run mcp-bridge auth" error.
       return undefined;
     }
+    // Snapshot the invalidate counter BEFORE the await — if invalidate
+    // bumps it while `store.get` is in flight, we must not let the stale
+    // pre-delete read resurrect the just-cleared cache.
+    const epoch = this._invalidateEpoch;
     const cred = await this._opts.store.get(oauthCredentialKey(this._opts.serverName));
     if (!cred || cred.type !== "oauth2") return undefined;
+
+    if (this._invalidateEpoch === epoch) {
+      this._lastRefreshToken = cred.refresh_token;
+    }
 
     // If the token is already expired and we have no refresh token, return
     // undefined so the SDK takes the re-authorization path instead of POSTing
@@ -217,19 +234,14 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
         : undefined;
 
     // Preserve refresh_token when the SDK's refresh response omits it.
-    // Most IdPs (Google, Slack, …) don't rotate refresh tokens by default and
-    // return only `access_token` on refresh. Without this fallback we'd
-    // overwrite the stored credential with no refresh_token, forcing the user
-    // to re-auth on the next expiry.
-    let refreshToken = tokens.refresh_token;
-    if (!refreshToken) {
-      const existing = await this._opts.store.get(
-        oauthCredentialKey(this._opts.serverName),
-      );
-      if (existing?.type === "oauth2" && existing.refresh_token) {
-        refreshToken = existing.refresh_token;
-      }
-    }
+    // Most IdPs (Google, Slack, …) don't rotate by default and return only
+    // `access_token` on refresh. Fallback reads the cache as a sync field
+    // access, so no await can interleave with the store.set below.
+    const refreshToken = tokens.refresh_token ?? this._lastRefreshToken;
+    // Update the cache BEFORE the await. invalidateCredentials also mutates
+    // synchronously, so whichever ran first wins consistently — and the
+    // file-level mutex serialises this write against any racing delete.
+    if (refreshToken) this._lastRefreshToken = refreshToken;
 
     await this._opts.store.set(oauthCredentialKey(this._opts.serverName), {
       type: "oauth2",
@@ -355,9 +367,16 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       this._state = undefined;
     }
     if (scope === "tokens" || scope === "all") {
-      await this._opts.store.delete(oauthCredentialKey(this._opts.serverName));
+      // Sync mutations before the await so a concurrent saveTokens sees the
+      // cleared cache (and doesn't fall back to a stale refresh_token that
+      // we're about to delete). Bumping `_invalidateEpoch` also fences any
+      // in-flight `tokens()` whose `store.get` resolves after this point
+      // from writing the stale read back into the just-cleared cache.
+      this._invalidateEpoch++;
+      this._lastRefreshToken = undefined;
       this._recentSaves = [];
       this._refreshExhausted = false;
+      await this._opts.store.delete(oauthCredentialKey(this._opts.serverName));
     }
     if (scope === "client" || scope === "all") {
       // Only invalidate dynamically-registered client info, never config-supplied.
