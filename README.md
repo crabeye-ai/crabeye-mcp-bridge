@@ -16,7 +16,9 @@ The fastest way to get started is with `init`, which discovers your MCP client c
 npx @crabeye-ai/crabeye-mcp-bridge init
 ```
 
-This scans for config files from Claude Desktop, Cursor, VS Code Copilot, Windsurf, and Zed, lets you pick which ones to use, and optionally injects the bridge entry. After that, just run `npx @crabeye-ai/crabeye-mcp-bridge` — no `--config` flag needed.
+This scans for config files from Claude Desktop, Cursor, VS Code Copilot, Windsurf, Zed, Cline, Roo Code, opencode, and Continue.dev, lets you pick which ones to use, and optionally injects the bridge entry. After that, just run `npx @crabeye-ai/crabeye-mcp-bridge` — no `--config` flag needed.
+
+opencode and Continue.dev are surfaced as **detect-only**: their config schemas don't fit the rename-and-inject pipeline, so `init` prints a manual snippet for them instead of rewriting the file.
 
 To undo, run `npx @crabeye-ai/crabeye-mcp-bridge restore`.
 

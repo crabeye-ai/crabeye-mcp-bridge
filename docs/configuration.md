@@ -147,3 +147,25 @@ The bridge reads upstream definitions from these top-level keys (in priority ord
 5. `mcpServers`
 
 Self-exclusion applies to `mcpServers` and `context_servers` — the bridge will skip its own entry to avoid recursion.
+
+## Supported clients in `init`
+
+The `init` command scans for these config files (first existing path per client wins):
+
+| Client | Mode | Default location |
+|--------|------|------------------|
+| Claude Desktop | inject | `~/.claude/claude_desktop_config.json` (or `~/.claude.json`) |
+| Cursor | inject | `~/.cursor/mcp.json` |
+| VS Code Copilot | inject | `~/Library/Application Support/Code/User/settings.json` (macOS); platform equivalents elsewhere |
+| Windsurf | inject | `~/.codeium/windsurf/mcp_config.json` |
+| Zed | inject | `~/.config/zed/settings.json` |
+| Cline | inject | `…/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` |
+| Roo Code | inject | `…/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json` — tries this first, then `cline_mcp_settings.json` for legacy Roo Cline layouts |
+| opencode | detect-only | `~/.config/opencode/opencode.json` |
+| Continue.dev | detect-only | `~/.continue/config.json`, `~/.continue/config.yaml`, or `~/.continue/mcpServers/` |
+
+**Inject** clients get the bridge wired in automatically — `init` renames the client's `mcpServers` (or equivalent) to `upstreamMcpServers` and writes a single bridge entry. `restore` reverses this.
+
+**Detect-only** clients use a config shape that doesn't fit the rename-and-inject pipeline (opencode's `mcp` key holds a divergent server entry shape; Continue.dev splits MCP across an array key, YAML files, or a directory). `init` lists them and prints a manual snippet to stderr; the file itself is not modified, and `restore` ignores them.
+
+Only the per-user HOME locations are scanned. Workspace-level configs (`./opencode.json`, `.roo/mcp.json`, `.continue/`) are not auto-detected — point `--config` at them directly if needed.

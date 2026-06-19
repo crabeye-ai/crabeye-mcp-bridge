@@ -51,8 +51,10 @@ export async function runInit(): Promise<void> {
 
   const selected = await checkbox<string>({
     message: "Select config files to use with the bridge:",
-    choices: discovered.map(({ clientName, path }) => ({
-      name: `${clientName}  ${path}`,
+    choices: discovered.map(({ clientName, path, mode }) => ({
+      name: mode === "detect-only"
+        ? `${clientName}  ${path}  (detect-only)`
+        : `${clientName}  ${path}`,
       value: path,
       checked: previousPaths.has(path),
     })),
@@ -63,21 +65,36 @@ export async function runInit(): Promise<void> {
     return;
   }
 
-  // Save bridge config — preserve existing overrides, only update configPaths
+  // Detect-only configs use a schema the bridge can't consume; keeping them
+  // out of configPaths avoids a merged-loader read against an unparseable file.
+  const selectedSet = new Set(selected);
+  const selectedEntries = discovered.filter((e) => selectedSet.has(e.path));
+  const injectableEntries = selectedEntries.filter((e) => e.mode === "inject");
+  const detectOnlyEntries = selectedEntries.filter((e) => e.mode === "detect-only");
+
   const bridgeConfig: BridgeOwnedConfig = {
     ...(existing ?? { configPaths: [], modifiedConfigs: [] }),
-    configPaths: selected,
+    configPaths: injectableEntries.map((e) => e.path),
   };
 
-  const inject = await confirm({
-    message: "Add bridge entry to selected client configs?",
-    default: true,
-  });
+  // Detect-only snippets are not gated on the inject confirm — the user picked
+  // them precisely to learn how to wire them up manually.
+  for (const entry of detectOnlyEntries) {
+    printDetectOnlySnippet(entry.clientName, entry.path);
+  }
+
+  const inject = injectableEntries.length > 0
+    ? await confirm({
+        message: "Add bridge entry to selected client configs?",
+        default: true,
+      })
+    : false;
 
   if (inject) {
     const modifiedConfigs = new Set(bridgeConfig.modifiedConfigs);
 
-    for (const configPath of selected) {
+    for (const entry of injectableEntries) {
+      const configPath = entry.path;
       try {
         const updated = await injectBridgeEntry(configPath);
         if (updated) {
@@ -101,6 +118,48 @@ export async function runInit(): Promise<void> {
     `\nSaved config to ~/.${APP_NAME}/config.json\n`,
   );
   process.stderr.write(`Done! Run \`${APP_NAME}\` to start.\n`);
+}
+
+const OPENCODE_SNIPPET = `{
+  "mcp": {
+    "${APP_NAME}": {
+      "type": "local",
+      "command": ["npx", "-y", "@crabeye-ai/${APP_NAME}"],
+      "enabled": true
+    }
+  }
+}`;
+
+const CONTINUE_DEV_HINT =
+  "Continue.dev's MCP support is still evolving (legacy JSON array shape, " +
+  "newer per-file YAML). See https://docs.continue.dev/customize/mcp-tools " +
+  "for the current schema and add an entry pointing at " +
+  `\`npx -y @crabeye-ai/${APP_NAME}\`.`;
+
+/**
+ * Print a manual-setup snippet for a harness whose config schema doesn't fit
+ * the rename-and-inject pipeline. Does not modify the file.
+ */
+function printDetectOnlySnippet(clientName: string, configPath: string): void {
+  process.stderr.write(
+    `  ${clientName} cannot be auto-injected — its config schema doesn't fit the rename pipeline.\n`,
+  );
+  process.stderr.write(`  Edit ${configPath} manually:\n\n`);
+
+  if (clientName === "opencode") {
+    process.stderr.write(`    ${OPENCODE_SNIPPET.replaceAll("\n", "\n    ")}\n\n`);
+    return;
+  }
+
+  if (clientName === "Continue.dev") {
+    process.stderr.write(`    ${CONTINUE_DEV_HINT}\n\n`);
+    return;
+  }
+
+  // Fallback for any future detect-only harness without a tailored snippet.
+  process.stderr.write(
+    `    Add an entry pointing at \`npx -y @crabeye-ai/${APP_NAME}\`.\n\n`,
+  );
 }
 
 /**
