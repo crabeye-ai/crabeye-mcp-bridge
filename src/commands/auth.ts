@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { auth, discoverOAuthProtectedResourceMetadata } from "@modelcontextprotocol/sdk/client/auth.js";
+import { auth, discoverOAuthProtectedResourceMetadata, IssuerMismatchError } from "@modelcontextprotocol/client";
 import { loadConfig, resolveConfigPath, ConfigError } from "../config/index.js";
 import { loadMergedConfig } from "../config/merged-loader.js";
 import {
@@ -17,6 +17,7 @@ import {
 } from "../credentials/index.js";
 import {
   clientInfoKey,
+  clientIssuerKey,
   clientSecretKey,
   findInlineClientSecrets,
   makeOriginPinningFetch,
@@ -308,7 +309,8 @@ export async function runAuthRemove(
     // starts cleanly. `--remove` is local-only — the OAuth server may still
     // hold a client registration for us until it's revoked there.
     const clientKey = clientInfoKey(canonical);
-    const removed = await store.deleteMany([tokenKey, secretKey, clientKey]);
+    const issuerKey = clientIssuerKey(canonical);
+    const removed = await store.deleteMany([tokenKey, secretKey, clientKey, issuerKey]);
     if (removed.length === 0) {
       errPrint(`No stored credentials for "${serverName}"`);
       return 1;
@@ -317,6 +319,7 @@ export async function runAuthRemove(
     if (removed.includes(tokenKey)) parts.push("token");
     if (removed.includes(secretKey)) parts.push("client secret");
     if (removed.includes(clientKey)) parts.push("registered client");
+    if (removed.includes(issuerKey)) parts.push("authorization-server binding");
     print(`Removed local ${parts.join(" + ")} for "${canonical}"`);
     return 0;
   } catch (err) {
@@ -499,6 +502,7 @@ export async function runAuthLogin(
     const result = await authFn(provider, {
       serverUrl: upstream.server.url,
       authorizationCode: callback.code,
+      ...(callback.iss ? { iss: callback.iss } : {}),
       fetchFn: pinningFetch,
     });
 
@@ -548,14 +552,16 @@ function formatErr(err: unknown): string {
     return msg;
   }
   if (err instanceof CredentialError || err instanceof OAuthError) return err.message;
-  // SDK throws `OAuthError` subclasses (server-auth/errors) with an
-  // `errorCode` field carrying machine-readable codes (`invalid_grant`,
-  // `invalid_client`, …). Surface the code so users can diagnose without
-  // having to dig through SDK source.
+  if (err instanceof IssuerMismatchError) {
+    const expected = err.expected ?? "(none recorded)";
+    return err.kind === "authorization_response"
+      ? `Authorization response came from a different issuer than expected (${expected}) — possible authorization-server mix-up; aborting.`
+      : `Authorization server metadata issuer does not match ${expected} — aborting.`;
+  }
   if (err instanceof Error) {
-    const errorCode = (err as { errorCode?: unknown }).errorCode;
-    if (typeof errorCode === "string") {
-      return `[${errorCode}] ${err.message}`;
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "string") {
+      return `[${code}] ${err.message}`;
     }
   }
   return err instanceof Error ? err.message : String(err);

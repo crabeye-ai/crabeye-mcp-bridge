@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { IdempotencyTable } from "../../src/upstream/idempotency-table.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/server";
 
 function req(id: number | string, method: string): JSONRPCMessage {
   return { jsonrpc: "2.0", id, method } as JSONRPCMessage;

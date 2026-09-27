@@ -1,16 +1,10 @@
-import {
-  ErrorCode,
-  McpError,
-} from "@modelcontextprotocol/sdk/types.js";
-import type {
-  ElicitRequestFormParams,
-  ElicitResult,
-} from "@modelcontextprotocol/sdk/types.js";
+import type { ElicitRequestFormParams } from "@modelcontextprotocol/server";
 import type { ToolPolicy, ServerBridgeConfig } from "../config/schema.js";
 
-export type ElicitFn = (
-  params: ElicitRequestFormParams,
-) => Promise<ElicitResult>;
+export type PolicyDecision =
+  | { kind: "allow" }
+  | { kind: "deny"; reason: string }
+  | { kind: "prompt"; request: ElicitRequestFormParams };
 
 export class PolicyEngine {
   private globalPolicy: ToolPolicy;
@@ -44,43 +38,29 @@ export class PolicyEngine {
     return this.globalPolicy;
   }
 
-  async enforce(
+  evaluate(
     source: string,
     toolName: string,
     args: Record<string, unknown> | undefined,
-    elicitFn: ElicitFn,
-  ): Promise<void> {
+  ): PolicyDecision {
     const policy = this.resolvePolicy(source, toolName);
 
-    if (policy === "always") return;
+    if (policy === "always") return { kind: "allow" };
 
     if (policy === "never") {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Tool ${source}__${toolName} is disabled by policy`,
-      );
+      return {
+        kind: "deny",
+        reason: `Tool ${source}__${toolName} is disabled by policy`,
+      };
     }
 
     // policy === "prompt"
-    try {
-      const result = await elicitFn({
+    return {
+      kind: "prompt",
+      request: {
         message: `Allow ${source}__${toolName} to run?\n\nArguments:\n${JSON.stringify(args ?? {}, null, 2)}`,
         requestedSchema: { type: "object", properties: {} },
-      });
-
-      if (result.action !== "accept") {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Tool ${source}__${toolName} was declined by user`,
-        );
-      }
-    } catch (err) {
-      if (err instanceof McpError) throw err;
-      // Client doesn't support elicitation — block the call
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Tool ${source}__${toolName} requires confirmation but the client does not support elicitation`,
-      );
-    }
+      },
+    };
   }
 }

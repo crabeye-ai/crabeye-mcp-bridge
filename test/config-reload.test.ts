@@ -1,11 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
+import type { Tool } from "@modelcontextprotocol/server";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
 import { diffConfigs } from "../src/config/config-diff.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
@@ -28,8 +23,8 @@ function createMockServer(tools: Tool[]) {
     { capabilities: { tools: { listChanged: true } } },
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools }));
-  server.setRequestHandler(CallToolRequestSchema, (request) => ({
+  server.setRequestHandler("tools/list", () => ({ tools }));
+  server.setRequestHandler("tools/call", (request) => ({
     content: [{ type: "text" as const, text: `Called ${request.params.name}` }],
   }));
 

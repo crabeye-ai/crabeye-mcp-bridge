@@ -1,16 +1,25 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-  ErrorCode,
-  McpError,
-} from "@modelcontextprotocol/sdk/types.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+  serveStdio,
+  StdioServerTransport,
+  type StdioServerHandle,
+} from "@modelcontextprotocol/server/stdio";
+import { Server, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+import type {
+  CallToolResult,
+  InputRequiredResult,
+  ProtocolEra,
+  ServerContext,
+  Transport,
+} from "@modelcontextprotocol/server";
 import type { Readable, Writable } from "node:stream";
 import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
+import {
+  ApprovalFlow,
+  cannotServeFormElicitation,
+  elicitationCapability,
+  type ElicitationCapability,
+} from "./policy-approval.js";
 import type { ConnectionStatus, UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
@@ -71,12 +80,44 @@ export interface BridgeServerOptions {
   buildPassthrough?: () => string;
 }
 
+interface ConnectionInfo {
+  lacksElicitation(ctx: ServerContext): boolean;
+}
+
+function observeStart(transport: Transport): {
+  started: Promise<void>;
+  stopObserving: () => void;
+} {
+  const originalStart = transport.start;
+  let settleWith!: (startResult: Promise<void>) => void;
+  const started = new Promise<void>((resolve, reject) => {
+    settleWith = (startResult) => startResult.then(resolve, reject);
+  });
+  transport.start = () => {
+    const startResult = originalStart.call(transport);
+    settleWith(startResult);
+    return startResult;
+  };
+  return {
+    started,
+    stopObserving: () => {
+      transport.start = originalStart;
+    },
+  };
+}
+
+function errorResult(text: string): CallToolResult {
+  return { content: [{ type: "text", text }], isError: true };
+}
+
 export class BridgeServer {
-  private server: Server;
+  private server: Server | undefined;
+  private handle: StdioServerHandle | undefined;
   private toolRegistry: ToolRegistry;
   private toolSearchService: ToolSearchService | undefined;
   private policyEngine: PolicyEngine | undefined;
   private sessionStats: SessionStats | undefined;
+  private approval = new ApprovalFlow();
   private unsubscribe: (() => void) | undefined;
   private options: BridgeServerOptions;
 
@@ -93,157 +134,167 @@ export class BridgeServer {
       );
     }
 
-    const instructions = this.composeInstructions();
+    this.subscribeToolListChanged();
+  }
 
-    this.server = new Server(
+  private subscribeToolListChanged(): void {
+    if (this.unsubscribe) return;
+    const notify = () => {
+      this.server?.sendToolListChanged().catch(() => {
+      });
+    };
+    this.unsubscribe = this.toolSearchService
+      ? this.toolSearchService.onVisibleToolsChanged(notify)
+      : this.toolRegistry.onChanged(notify);
+  }
+
+  private buildServer(era: ProtocolEra): Server {
+    const server = new Server(
       { name: APP_NAME, version: APP_VERSION },
       {
         capabilities: { tools: { listChanged: true } },
-        instructions,
+        instructions: this.composeInstructions(),
+        requestState: { verify: this.approval.verify },
       },
     );
 
-    this.server.setRequestHandler(ListToolsRequestSchema, () => {
+    const connection: ConnectionInfo = {
+      lacksElicitation: (ctx) =>
+        cannotServeFormElicitation(elicitationCapability(ctx)) &&
+        cannotServeFormElicitation(
+          server.getClientCapabilities()?.elicitation as ElicitationCapability,
+        ),
+    };
+
+    server.setRequestHandler("tools/list", () => {
       if (this.toolSearchService) {
         return { tools: this.toolSearchService.getVisibleTools() };
       }
       return { tools: this.toolRegistry.listTools() };
     });
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler("tools/call", async (request, ctx) => {
       const { name, arguments: args } = request.params;
 
-      // Handle search_tools call
       if (this.toolSearchService && name === SEARCH_TOOL_NAME) {
-        const params = (args ?? {}) as unknown as SearchToolsParams;
-
-        if (!Array.isArray(params.queries) || params.queries.length === 0) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: 'queries' must be a non-empty array of query objects.",
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        for (let i = 0; i < params.queries.length; i++) {
-          const q = params.queries[i];
-          if (!q.tool && !q.provider && !q.category) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `Error: queries[${i}] must have at least one of 'tool', 'provider', or 'category'.`,
-                },
-              ],
-              isError: true,
-            };
-          }
-        }
-
-        const result = this.toolSearchService.search(params);
-        let response: object = result;
-        if (this.sessionStats) {
-          const responseJson = JSON.stringify(result);
-          this.sessionStats.recordSearchResponse(responseJson);
-          const snapshot = this.sessionStats.getSnapshot();
-          if (this.options.showStats) {
-            response = { session_stats: snapshot, ...result };
-          }
-          this.options.onSearchStats?.(snapshot);
-        }
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(response) }],
-        };
+        return this.handleSearchTools(this.toolSearchService, args);
       }
-
-      // Handle run_tool call
       if (this.toolSearchService && name === RUN_TOOL_NAME) {
-        const toolName = (args as { name?: string })?.name;
-        const toolArgs = (args as { arguments?: Record<string, unknown> })?.arguments;
-
-        if (!toolName) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: 'name' is required — provide the full namespaced tool name (e.g. 'linear__create_issue').",
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        return this.routeToUpstream(toolName, toolArgs);
+        return this.handleRunTool(args, ctx, connection);
       }
 
       // Direct tool call (tool must be in registry)
-      const registered = this.toolRegistry.getTool(name);
-      if (!registered) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          `Unknown tool: ${name}`,
-        );
+      if (!this.toolRegistry.getTool(name)) {
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown tool: ${name}`);
       }
-
-      return this.routeToUpstream(name, args);
+      return this.routeToUpstream(name, args, ctx, connection);
     });
 
-    if (this.toolSearchService) {
-      this.unsubscribe = this.toolSearchService.onVisibleToolsChanged(() => {
-        this.server.sendToolListChanged().catch(() => {
-          // Ignore errors when no client is connected
-        });
-      });
-    } else {
-      this.unsubscribe = this.toolRegistry.onChanged(() => {
-        this.server.sendToolListChanged().catch(() => {
-          // Ignore errors when no client is connected
-        });
-      });
+    this.options.logger?.info("server instance built", { component: "bridge", era });
+
+    this.server = server;
+    return server;
+  }
+
+  private handleSearchTools(
+    service: ToolSearchService,
+    args: Record<string, unknown> | undefined,
+  ): CallToolResult {
+    const params = (args ?? {}) as unknown as SearchToolsParams;
+
+    if (!Array.isArray(params.queries) || params.queries.length === 0) {
+      return errorResult("Error: 'queries' must be a non-empty array of query objects.");
     }
+    for (let i = 0; i < params.queries.length; i++) {
+      const q = params.queries[i];
+      if (!q.tool && !q.provider && !q.category) {
+        return errorResult(
+          `Error: queries[${i}] must have at least one of 'tool', 'provider', or 'category'.`,
+        );
+      }
+    }
+
+    const result = service.search(params);
+    let response: object = result;
+    if (this.sessionStats) {
+      this.sessionStats.recordSearchResponse(JSON.stringify(result));
+      const snapshot = this.sessionStats.getSnapshot();
+      if (this.options.showStats) {
+        response = { session_stats: snapshot, ...result };
+      }
+      this.options.onSearchStats?.(snapshot);
+    }
+    return { content: [{ type: "text", text: JSON.stringify(response) }] };
+  }
+
+  private handleRunTool(
+    args: Record<string, unknown> | undefined,
+    ctx: ServerContext,
+    connection: ConnectionInfo,
+  ): Promise<CallToolResult | InputRequiredResult> | CallToolResult {
+    const toolName = (args as { name?: string })?.name;
+    const toolArgs = (args as { arguments?: Record<string, unknown> })?.arguments;
+
+    if (!toolName) {
+      return errorResult(
+        "Error: 'name' is required — provide the full namespaced tool name (e.g. 'linear__create_issue').",
+      );
+    }
+    return this.routeToUpstream(toolName, toolArgs, ctx, connection);
   }
 
   private async routeToUpstream(
     name: string,
-    args?: Record<string, unknown>,
-  ): Promise<CallToolResult> {
+    args: Record<string, unknown> | undefined,
+    ctx: ServerContext,
+    connection: ConnectionInfo,
+  ): Promise<CallToolResult | InputRequiredResult> {
     const parsed = parseNamespacedName(name);
     if (!parsed) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
         `Invalid tool name (missing namespace): ${name}`,
       );
     }
 
     if (this.policyEngine) {
-      const elicitFn = this.server.elicitInput.bind(this.server);
-      await this.policyEngine.enforce(parsed.source, parsed.toolName, args, elicitFn);
+      const toolKey = `${parsed.source}__${parsed.toolName}`;
+      const decision = this.policyEngine.evaluate(parsed.source, parsed.toolName, args);
+      if (decision.kind === "deny") {
+        throw new ProtocolError(ProtocolErrorCode.InvalidRequest, decision.reason);
+      }
+      if (decision.kind === "prompt") {
+        if (connection.lacksElicitation(ctx)) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidRequest,
+            `Tool ${toolKey} requires confirmation but the client does not support elicitation`,
+          );
+        }
+        const outcome = await this.approval.resolve(toolKey, args, decision.request, ctx);
+        if (outcome !== "approved") return outcome;
+      }
     }
 
     const getClient = this.options.getUpstreamClient;
     if (!getClient) {
-      throw new McpError(
-        ErrorCode.InternalError,
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
         `No upstream client resolver configured`,
       );
     }
 
     const client = getClient(parsed.source);
     if (!client) {
-      throw new McpError(
-        ErrorCode.InternalError,
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
         `Upstream server not found: ${parsed.source}`,
       );
     }
 
     if (client.status !== "connected") {
       if (client.status === "error") {
-        throw new McpError(
-          ErrorCode.InternalError,
+        throw new ProtocolError(
+          ProtocolErrorCode.InternalError,
           `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
         );
       }
@@ -263,13 +314,13 @@ export class BridgeServer {
         // narrowing TS inferred before the await is no longer accurate.
         const statusAfterWait = client.status as ConnectionStatus;
         if (statusAfterWait === "error") {
-          throw new McpError(
-            ErrorCode.InternalError,
+          throw new ProtocolError(
+            ProtocolErrorCode.InternalError,
             `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
           );
         }
-        throw new McpError(
-          ErrorCode.InternalError,
+        throw new ProtocolError(
+          ProtocolErrorCode.InternalError,
           `Upstream server "${parsed.source}" did not reconnect within ${WAIT_FOR_RESPAWN_MS / 1000}s. Please retry in 30 seconds.`,
         );
       }
@@ -286,7 +337,7 @@ export class BridgeServer {
         await rateLimiter.acquire();
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        throw new McpError(ErrorCode.InternalError, message);
+        throw new ProtocolError(ProtocolErrorCode.InternalError, message);
       }
     }
 
@@ -297,8 +348,8 @@ export class BridgeServer {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      throw new McpError(
-        ErrorCode.InternalError,
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
         `Upstream server "${parsed.source}" error: ${message}`,
       );
     }
@@ -336,7 +387,35 @@ export class BridgeServer {
   }
 
   async connect(transport: Transport): Promise<void> {
-    await this.server.connect(transport);
+    if (this.handle) {
+      throw new Error("BridgeServer is already connected — close() first");
+    }
+
+    const { started, stopObserving } = observeStart(transport);
+
+    this.subscribeToolListChanged();
+
+    const handle = serveStdio((mcpCtx) => this.buildServer(mcpCtx.era), {
+      transport,
+      onerror: (error) => {
+        this.options.logger?.warn("serve transport error", {
+          component: "bridge",
+          error: error.message,
+        });
+      },
+    });
+    this.handle = handle;
+
+    try {
+      await started;
+    } catch (err) {
+      this.handle = undefined;
+      this.server = undefined;
+      await handle.close().catch(() => {});
+      throw err;
+    } finally {
+      stopObserving();
+    }
   }
 
   async start(): Promise<void> {
@@ -351,7 +430,9 @@ export class BridgeServer {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     this.sessionStats?.dispose();
-    await this.server.close();
+    await this.handle?.close();
+    this.handle = undefined;
+    this.server = undefined;
   }
 
   getToolRegistry(): ToolRegistry {
@@ -362,25 +443,5 @@ export class BridgeServer {
     const passthrough = this.options.buildPassthrough?.() ?? "";
     if (passthrough.length === 0) return BASE_INSTRUCTIONS;
     return `${BASE_INSTRUCTIONS}\n\n${passthrough}`;
-  }
-
-  /**
-   * SDK `Server` has no public setter for `instructions`. We mutate its
-   * private `_instructions` field so the next `initialize` reads the new
-   * text. Active sessions are unaffected — MCP has no mid-session push for
-   * instructions. If the SDK is ever upgraded and the field is renamed,
-   * `_instructions` won't be present on the instance and we no-op with a
-   * warn log instead of silently breaking hot-reload.
-   */
-  regenerateInstructions(): void {
-    const target = this.server as unknown as { _instructions?: string };
-    if (!("_instructions" in target)) {
-      this.options.logger?.warn(
-        "MCP SDK Server has no _instructions field; instructions hot-reload disabled",
-        { component: "bridge" },
-      );
-      return;
-    }
-    target._instructions = this.composeInstructions();
   }
 }

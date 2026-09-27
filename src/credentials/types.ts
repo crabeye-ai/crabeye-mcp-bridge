@@ -17,6 +17,7 @@ export const OAuth2CredentialSchema = z.object({
   token_endpoint: z.string().url().optional(),
   client_id: z.string().min(1).optional(),
   expires_at: z.number().int().nonnegative().finite().optional(),
+  issuer: z.string().min(1).optional(),
 });
 
 export const SecretCredentialSchema = z.object({

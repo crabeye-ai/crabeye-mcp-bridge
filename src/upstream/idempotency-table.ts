@@ -1,4 +1,4 @@
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/client";
 
 const RETRYABLE_METHODS: ReadonlySet<string> = new Set([
   "tools/list",

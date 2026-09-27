@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
+import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { APP_VERSION } from "../../src/constants.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
@@ -38,9 +38,6 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
           captured.push(frame);
           // Reply OK to OPEN so the transport's start() resolves, then close
           // the socket. The fake daemon doesn't proxy a real MCP child, so
-          // the SDK's subsequent `initialize` (and `listTools`) would hang
-          // forever; closing forces connect() to fail fast. The OPEN frame is
-          // already captured by the time we close.
           const f = frame as { id?: string; method?: string };
           if (f.method === "OPEN" && typeof f.id === "string") {
             sock.write(encodeFrame({ id: f.id, result: { ok: true } }));

@@ -1,16 +1,23 @@
 import { randomBytes } from "node:crypto";
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
-  OAuthClientInformation,
+  OAuthClientProvider,
+  OAuthClientInformationContext,
   OAuthClientInformationFull,
   OAuthClientMetadata,
-  OAuthTokens,
-} from "@modelcontextprotocol/sdk/shared/auth.js";
+  OAuthDiscoveryState,
+  StoredOAuthClientInformation,
+  StoredOAuthTokens,
+} from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
 import type { Logger } from "../logging/index.js";
-import { clientInfoKey, oauthCredentialKey } from "./client-secret.js";
+import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "./client-secret.js";
 import { OAuthError } from "./errors.js";
+import {
+  isIssuerStampOnly,
+  issuersMatch,
+  parseStoredClientInfo,
+} from "./issuer-binding.js";
 
 export interface BridgeOAuthProviderOptions {
   serverName: string;
@@ -113,9 +120,18 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   // refuses to write the cache from a stale read whose result predates a
   // concurrent invalidate.
   private _invalidateEpoch = 0;
+  private _discoveryState: OAuthDiscoveryState | undefined;
 
   constructor(opts: BridgeOAuthProviderOptions) {
     this._opts = opts;
+  }
+
+  discoveryState(): OAuthDiscoveryState | undefined {
+    return this._discoveryState;
+  }
+
+  saveDiscoveryState(state: OAuthDiscoveryState): void {
+    this._discoveryState = state;
   }
 
   get redirectUrl(): string | URL {
@@ -141,19 +157,45 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     return meta;
   }
 
-  async clientInformation(): Promise<
-    OAuthClientInformation | OAuthClientInformationFull | undefined
-  > {
+  async clientInformation(
+    ctx?: OAuthClientInformationContext,
+  ): Promise<StoredOAuthClientInformation | undefined> {
     if (this._opts.clientId) {
+      const binding = parseStoredClientInfo(
+        await this._opts.store.get(clientIssuerKey(this._opts.serverName)),
+      );
+      const recorded =
+        binding?.client_id === this._opts.clientId ? binding.issuer : undefined;
+      if (ctx?.issuer && recorded && !issuersMatch(recorded, ctx.issuer)) {
+        throw new OAuthError(
+          "issuer_mismatch",
+          `Authorization server for "${this._opts.serverName}" is no longer ${recorded}. ` +
+          `Refusing to send the configured client credentials to a different authorization server — ` +
+          `if you did not expect this change, treat it as a possible mix-up attack and verify the server. ` +
+          `If the change is legitimate, run \`${APP_NAME} auth --remove ${this._opts.serverName}\` first.`,
+        );
+      }
+      if (ctx?.issuer && !recorded) {
+        await this._opts.store.set(clientIssuerKey(this._opts.serverName), {
+          type: "secret",
+          value: JSON.stringify({ client_id: this._opts.clientId, issuer: ctx.issuer }),
+        });
+      }
+      const issuer = recorded ?? ctx?.issuer;
       return {
         client_id: this._opts.clientId,
         ...(this._opts.clientSecret ? { client_secret: this._opts.clientSecret } : {}),
+        ...(issuer ? { issuer } : {}),
       };
     }
     const stored = await this._opts.store.get(clientInfoKey(this._opts.serverName));
-    if (!stored || stored.type !== "secret") return undefined;
+    if (!stored || stored.type !== "secret") {
+      if (this._opts.runtime) throw this._runtimeRegistrationError();
+      return undefined;
+    }
+    let info: StoredOAuthClientInformation;
     try {
-      return JSON.parse(stored.value) as OAuthClientInformationFull;
+      info = JSON.parse(stored.value) as StoredOAuthClientInformation;
     } catch (err) {
       this._opts.logger?.warn(
         `stored client information for "${this._opts.serverName}" is not valid JSON — discarding and re-registering`,
@@ -162,23 +204,47 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       // Self-heal: drop the corrupt entry so the next registration attempt
       // can write a fresh one instead of repeatedly bouncing off this branch.
       await this._opts.store.delete(clientInfoKey(this._opts.serverName));
+      if (this._opts.runtime) throw this._runtimeRegistrationError();
       return undefined;
     }
+    if (
+      this._opts.runtime &&
+      ctx?.issuer &&
+      info.issuer &&
+      !issuersMatch(info.issuer, ctx.issuer)
+    ) {
+      throw this._runtimeRegistrationError();
+    }
+    return info as OAuthClientInformationFull;
   }
 
-  async saveClientInformation(
-    info: OAuthClientInformation | OAuthClientInformationFull,
-  ): Promise<void> {
+  private _runtimeRegistrationError(): Error {
+    return new Error(
+      `Dynamic client registration is not available at runtime for "${this._opts.serverName}" — ` +
+      `run \`${APP_NAME} auth ${this._opts.serverName}\` from a terminal to register and authorize.`,
+    );
+  }
+
+  async saveClientInformation(info: StoredOAuthClientInformation): Promise<void> {
+    if (this._opts.clientId) return;
+
     if (this._opts.runtime) {
+      const stored = parseStoredClientInfo(
+        await this._opts.store.get(clientInfoKey(this._opts.serverName)),
+      );
+      if (isIssuerStampOnly(stored, info)) {
+        await this._opts.store.set(clientInfoKey(this._opts.serverName), {
+          type: "secret",
+          value: JSON.stringify(info),
+        });
+        return;
+      }
       // The runtime provider's `redirectUrl` is portless (the daemon has no
       // listener), so a dynamic registration here would advertise a redirect
       // that the CLI flow's port-bound listener can never match. Refuse and
       // let the SDK surface the auth error so the user runs `mcp-bridge auth`
       // from a CLI, which registers (and persists) with the correct URI.
-      throw new Error(
-        `Dynamic client registration is not available at runtime for "${this._opts.serverName}" — ` +
-        `run \`${APP_NAME} auth ${this._opts.serverName}\` from a terminal to register and authorize.`,
-      );
+      throw this._runtimeRegistrationError();
     }
     await this._opts.store.set(clientInfoKey(this._opts.serverName), {
       type: "secret",
@@ -186,7 +252,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     });
   }
 
-  async tokens(): Promise<OAuthTokens | undefined> {
+  async tokens(): Promise<StoredOAuthTokens | undefined> {
     if (this._refreshExhausted) {
       // Force the SDK to take the authorization path, where
       // `redirectToAuthorization` throws a clear "run mcp-bridge auth" error.
@@ -224,10 +290,15 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       token_type: cred.token_type ?? "Bearer",
       ...(cred.refresh_token ? { refresh_token: cred.refresh_token } : {}),
       ...(expiresIn !== undefined ? { expires_in: expiresIn } : {}),
+      ...(cred.issuer ? { issuer: cred.issuer } : {}),
     };
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  async saveTokens(
+    tokens: StoredOAuthTokens,
+    ctx?: OAuthClientInformationContext,
+  ): Promise<void> {
+    const issuer = tokens.issuer ?? ctx?.issuer;
     const expiresAt =
       typeof tokens.expires_in === "number"
         ? Math.floor(Date.now() / 1000) + tokens.expires_in
@@ -250,6 +321,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       ...(refreshToken ? { refresh_token: refreshToken } : {}),
       ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
       ...(this._opts.clientId ? { client_id: this._opts.clientId } : {}),
+      ...(issuer ? { issuer } : {}),
     });
 
     // Refresh-loop circuit breaker — only meaningful for the runtime provider
@@ -379,61 +451,14 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       await this._opts.store.delete(oauthCredentialKey(this._opts.serverName));
     }
     if (scope === "client" || scope === "all") {
-      // Only invalidate dynamically-registered client info, never config-supplied.
-      if (!this._opts.clientId) {
+      if (this._opts.clientId) {
+        await this._opts.store.delete(clientIssuerKey(this._opts.serverName));
+      } else {
         await this._opts.store.delete(clientInfoKey(this._opts.serverName));
       }
     }
+    if (scope === "discovery" || scope === "all") {
+      this._discoveryState = undefined;
+    }
   }
-}
-
-/**
- * Wraps `fetch` so RFC 8414 / 9728 metadata responses are inspected for
- * `authorization_endpoint` + `token_endpoint` and the two are pinned to the
- * same origin. A tampered AS metadata response that points the token endpoint
- * at an attacker-controlled origin would otherwise let the SDK POST the
- * authorization code + PKCE verifier + client_secret to that host.
- *
- * Non-JSON responses, opaque errors, and metadata without both fields pass
- * through unchanged. Origin mismatch throws `OAuthError` so the whole `auth()`
- * call rejects before any token-exchange POST.
- */
-export function makeOriginPinningFetch(baseFetch: FetchLike = fetch): FetchLike {
-  return async (input, init) => {
-    const response = await baseFetch(input, init);
-    if (!response.ok) return response;
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!contentType.includes("json")) return response;
-
-    let body: unknown;
-    try {
-      body = await response.clone().json();
-    } catch {
-      return response;
-    }
-    if (!body || typeof body !== "object") return response;
-    const obj = body as Record<string, unknown>;
-    const auth =
-      typeof obj.authorization_endpoint === "string" ? obj.authorization_endpoint : undefined;
-    const tok =
-      typeof obj.token_endpoint === "string" ? obj.token_endpoint : undefined;
-    if (!auth || !tok) return response;
-
-    let authOrigin: string;
-    let tokOrigin: string;
-    try {
-      authOrigin = new URL(auth).origin;
-      tokOrigin = new URL(tok).origin;
-    } catch {
-      return response;
-    }
-    if (authOrigin !== tokOrigin) {
-      throw new OAuthError(
-        "token_endpoint_origin_mismatch",
-        `Token endpoint origin (${tokOrigin}) does not match authorization endpoint origin (${authOrigin}). ` +
-          `Refusing to exchange the authorization code at a non-AS origin.`,
-      );
-    }
-    return response;
-  };
 }

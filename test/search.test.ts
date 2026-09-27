@@ -1,10 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
+import { PolicyEngine } from "../src/policy/policy-engine.js";
 import { ToolSearchService, SEARCH_TOOL_NAME, RUN_TOOL_NAME } from "../src/search/index.js";
 import type { QueryResult } from "../src/search/index.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
@@ -739,7 +738,15 @@ describe("ToolSearchService", () => {
 // --- BridgeServer integration tests ---
 
 describe("BridgeServer with ToolSearchService", () => {
-  async function createSearchTestPair(tools?: { source: string; tools: Tool[] }[]) {
+  async function createSearchTestPair(
+    tools?: { source: string; tools: Tool[] }[],
+    opts?: {
+      modern?: boolean;
+      policyEngine?: PolicyEngine;
+      autoAccept?: boolean;
+      onToolsChanged?: () => void;
+    },
+  ) {
     const toolRegistry = new ToolRegistry();
     for (const { source, tools: t } of tools ?? []) {
       toolRegistry.setToolsForSource(source, t);
@@ -756,10 +763,30 @@ describe("BridgeServer with ToolSearchService", () => {
     const server = new BridgeServer({
       toolRegistry,
       toolSearchService,
+      policyEngine: opts?.policyEngine,
       getUpstreamClient: (name) => (name === "linear" ? linearClient : undefined),
     });
 
-    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const client = new Client(
+      { name: "test-client", version: "1.0.0" },
+      {
+        ...(opts?.modern ? { versionNegotiation: { mode: "auto" as const } } : {}),
+        ...(opts?.autoAccept ? { capabilities: { elicitation: {} } } : {}),
+        ...(opts?.onToolsChanged
+          ? {
+              listChanged: {
+                tools: { autoRefresh: false, onChanged: () => opts.onToolsChanged?.() },
+              },
+            }
+          : {}),
+      },
+    );
+    if (opts?.autoAccept) {
+      client.setRequestHandler("elicitation/create", async () => ({
+        action: "accept",
+        content: {},
+      }));
+    }
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
     await server.connect(serverTransport);
@@ -788,6 +815,39 @@ describe("BridgeServer with ToolSearchService", () => {
     const names = result.tools.map((t) => t.name);
     expect(names).toContain(SEARCH_TOOL_NAME);
     expect(names).toContain(RUN_TOOL_NAME);
+
+    await cleanup();
+  });
+
+  it("serves a modern-era client end to end: discover, search_tools, run_tool", async () => {
+    const { client, linearClient, cleanup } = await createSearchTestPair(
+      [{ source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] }],
+      { modern: true },
+    );
+
+    expect(client.getProtocolEra()).toBe("modern");
+
+    const listed = await client.listTools();
+    expect(listed.tools.map((t) => t.name)).toEqual(
+      expect.arrayContaining([SEARCH_TOOL_NAME, RUN_TOOL_NAME]),
+    );
+
+    const search = await client.callTool({
+      name: SEARCH_TOOL_NAME,
+      arguments: { queries: [{ tool: "create" }] },
+    });
+    const text = (search.content as { text: string }[])[0].text;
+    expect(text).toContain("linear__create_issue");
+
+    const run = await client.callTool({
+      name: RUN_TOOL_NAME,
+      arguments: { name: "linear__create_issue", arguments: { title: "Bug" } },
+    });
+    expect(run.content).toEqual([{ type: "text", text: "upstream result" }]);
+    expect(linearClient.callTool).toHaveBeenCalledWith({
+      name: "create_issue",
+      arguments: { title: "Bug" },
+    });
 
     await cleanup();
   });
@@ -893,17 +953,16 @@ describe("BridgeServer with ToolSearchService", () => {
     await cleanup();
   });
 
-  it("tools/list_changed notification sent after search", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
-    ]);
-
+  it.each([false, true])("tools/list_changed reaches the client after search (modern: %s)", async (modern) => {
+    let resolveChanged!: () => void;
     const notificationReceived = new Promise<void>((resolve) => {
-      client.setNotificationHandler(
-        ToolListChangedNotificationSchema,
-        () => { resolve(); },
-      );
+      resolveChanged = resolve;
     });
+    const { client, cleanup } = await createSearchTestPair(
+      [{ source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] }],
+      { modern, onToolsChanged: () => resolveChanged() },
+    );
+    expect(client.getProtocolEra()).toBe(modern ? "modern" : "legacy");
 
     await client.callTool({
       name: SEARCH_TOOL_NAME,
@@ -918,6 +977,29 @@ describe("BridgeServer with ToolSearchService", () => {
         ),
       ]),
     ).resolves.toBeUndefined();
+
+    await cleanup();
+  });
+
+  it("run_tool honors a prompt policy through the MRTR approval round (modern era)", async () => {
+    const { client, linearClient, cleanup } = await createSearchTestPair(
+      [{ source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] }],
+      {
+        modern: true,
+        autoAccept: true,
+        policyEngine: new PolicyEngine("always", { linear: { toolPolicy: "prompt" } }),
+      },
+    );
+
+    const run = await client.callTool({
+      name: RUN_TOOL_NAME,
+      arguments: { name: "linear__create_issue", arguments: { title: "Bug" } },
+    });
+    expect(run.content).toEqual([{ type: "text", text: "upstream result" }]);
+    expect(linearClient.callTool).toHaveBeenCalledWith({
+      name: "create_issue",
+      arguments: { title: "Bug" },
+    });
 
     await cleanup();
   });

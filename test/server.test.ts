@@ -1,9 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { PassThrough } from "node:stream";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 import { APP_VERSION } from "../src/constants.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
@@ -198,7 +196,7 @@ describe("BridgeServer initialize", () => {
     await server.close();
   });
 
-  it("regenerateInstructions updates the text seen by the next initialize (AIT-183)", async () => {
+  it("each new connection re-reads instructions, so late passthrough blocks appear (AIT-183)", async () => {
     const toolRegistry = new ToolRegistry();
     let block = "";
     const server = new BridgeServer({
@@ -216,12 +214,10 @@ describe("BridgeServer initialize", () => {
       expect(instr).toBeDefined();
       expect(instr).not.toContain("## fs");
       await client.close();
+      await server.close();
     }
 
-    // Simulate a late-connecting upstream: regenerate, then a fresh client
-    // initialize should see the new text.
     block = "## fs\n\nFile-system server.";
-    server.regenerateInstructions();
 
     {
       const client = new Client({ name: "t", version: "0" });
@@ -519,7 +515,7 @@ describe("notifications", () => {
 
     const notificationReceived = new Promise<void>((resolve) => {
       client.setNotificationHandler(
-        ToolListChangedNotificationSchema,
+        "notifications/tools/list_changed",
         () => {
           resolve();
         },

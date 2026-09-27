@@ -1,12 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
+import type { Tool, CallToolResult, Transport } from "@modelcontextprotocol/server";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
 import { DaemonStdioClient } from "../src/upstream/daemon-stdio-client.js";
@@ -30,11 +24,11 @@ function createMockServer(tools: Tool[], toolHandler?: (name: string, args: Reco
 
   let currentTools = tools;
 
-  server.setRequestHandler(ListToolsRequestSchema, () => {
+  server.setRequestHandler("tools/list", () => {
     return { tools: currentTools };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, (request) => {
+  server.setRequestHandler("tools/call", (request) => {
     const { name, arguments: args } = request.params;
     if (toolHandler) {
       return toolHandler(name, (args ?? {}) as Record<string, unknown>);
@@ -300,7 +294,7 @@ describe("HttpUpstreamClient", () => {
           { name: "temp", version: "1.0.0" },
           { capabilities: { tools: {} } },
         );
-        srv.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
+        srv.setRequestHandler("tools/list", () => ({ tools: [] }));
         srv.connect(sSide);
         clientTransport = cSide;
         return cSide;
@@ -1005,7 +999,7 @@ describe("DaemonStdioClient", () => {
           { name: "temp", version: "1.0.0" },
           { capabilities: { tools: {} } },
         );
-        srv.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
+        srv.setRequestHandler("tools/list", () => ({ tools: [] }));
         srv.connect(sSide);
         clientTransport = cSide;
         return cSide;

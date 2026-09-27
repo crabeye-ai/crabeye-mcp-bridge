@@ -1,6 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { Client } from "@modelcontextprotocol/client";
+import type { Transport, Tool, CallToolResult, ProtocolEra } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
@@ -11,6 +10,8 @@ import type {
   StatusChangeCallback,
   ToolsChangedCallback,
 } from "./types.js";
+
+const PROBE_TIMEOUT_MS = 10_000;
 
 export interface BaseUpstreamClientOptions {
   name: string;
@@ -59,6 +60,10 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     return this._tools;
   }
 
+  protocolEra(): ProtocolEra | undefined {
+    return this._client?.getProtocolEra();
+  }
+
   get instructions(): string | undefined {
     return this._client?.getInstructions();
   }
@@ -95,6 +100,10 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       const client = new Client(
         { name: `${APP_NAME}/${this.name}`, version: APP_VERSION },
         {
+          versionNegotiation: {
+            mode: "auto",
+            probe: { timeoutMs: PROBE_TIMEOUT_MS },
+          },
           listChanged: {
             tools: {
               autoRefresh: true,
@@ -132,6 +141,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         this._logger.info("reconnected", { attempts: this._reconnectAttempt });
       }
       this._reconnectAttempt = 0;
+      this._logger.info("connected", { era: client.getProtocolEra() });
       this._setStatus("connected");
       this._afterConnect(transport);
       this._notifyToolsChanged();
@@ -194,7 +204,12 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     if (!this._client || this._status !== "connected") {
       throw new Error(`Cannot ping: client "${this.name}" is not connected`);
     }
-    await this._client.ping({ signal: AbortSignal.timeout(timeoutMs) });
+    const signal = AbortSignal.timeout(timeoutMs);
+    if (this._client.getProtocolEra() === "modern") {
+      await this._client.discover({ signal });
+      return;
+    }
+    await this._client.ping({ signal });
   }
 
   async reconnect(): Promise<void> {

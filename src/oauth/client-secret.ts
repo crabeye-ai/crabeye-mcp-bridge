@@ -37,6 +37,10 @@ export function clientSecretKey(serverName: string): string {
   return `oauth-client-secret:${encodeURIComponent(serverName)}`;
 }
 
+export function clientIssuerKey(serverName: string): string {
+  return `oauth-issuer:${encodeURIComponent(serverName)}`;
+}
+
 /** Credential-store key for dynamically-registered client info (RFC 7591).
  * Single source of truth so `auth --remove` and the SDK provider can't drift. */
 export function clientInfoKey(serverName: string): string {

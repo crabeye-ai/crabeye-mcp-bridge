@@ -1,9 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import {
-  LATEST_PROTOCOL_VERSION,
-  type JSONRPCMessage,
-} from "@modelcontextprotocol/sdk/types.js";
+import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/client";
+import type { Transport, JSONRPCMessage } from "@modelcontextprotocol/client";
 import type { StdioServerConfig } from "../config/schema.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import {
@@ -143,7 +140,12 @@ interface DaemonStdioTransportOpts {
  * inbound `RPC` frames matching this transport's `sessionId` are forwarded
  * to `onmessage`.
  */
-class DaemonStdioTransport implements Transport {
+interface ClassifiedAsStdioByEraProbe {
+  readonly stderr: null;
+  readonly pid: null;
+}
+
+class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
   // Intentionally NOT exposing this as `sessionId` on the transport — the
   // MCP SDK Client treats a preset `transport.sessionId` as a reconnect
   // signal and SKIPS the initialize handshake. We need init to run every
@@ -151,6 +153,9 @@ class DaemonStdioTransport implements Transport {
   onmessage?: (message: JSONRPCMessage) => void;
   onclose?: () => void;
   onerror?: (error: Error) => void;
+
+  readonly stderr = null;
+  readonly pid = null;
 
   private readonly _daemonSessionId: string;
   private readonly opts: DaemonStdioTransportOpts;

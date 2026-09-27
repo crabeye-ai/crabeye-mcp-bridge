@@ -1,5 +1,5 @@
 import MiniSearch from "minisearch";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool } from "@modelcontextprotocol/server";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { parseNamespacedName } from "../server/tool-namespacing.js";
 import type { PolicyEngine } from "../policy/index.js";

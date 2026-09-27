@@ -10,6 +10,7 @@ import {
   runAuthRemove,
 } from "../../src/commands/auth.js";
 import {
+  clientIssuerKey,
   clientSecretKey,
   oauthCredentialKey,
 } from "../../src/oauth/index.js";
@@ -204,6 +205,24 @@ describe("runAuthRemove", () => {
     expect(await store.get("oauth-client:notion")).toBeUndefined();
   });
 
+  it("clears the authorization-server binding the issuer_mismatch error points at", async () => {
+    await store.set(clientIssuerKey("notion"), {
+      type: "secret",
+      value: '{"client_id":"client-1","issuer":"https://as.example.com"}',
+    });
+    const out: string[] = [];
+
+    const code = await runAuthRemove(
+      "notion",
+      {},
+      { store, print: (l) => out.push(l), errPrint: () => {}, loadConfig: noConfig },
+    );
+
+    expect(code).toBe(0);
+    expect(await store.get(clientIssuerKey("notion"))).toBeUndefined();
+    expect(out.join("\n")).toMatch(/Removed local authorization-server binding for "notion"/);
+  });
+
   it("returns non-zero when no credential exists", async () => {
     const err: string[] = [];
     const code = await runAuthRemove(
@@ -320,7 +339,7 @@ describe("runAuthLogin", () => {
     let issuedState: string | undefined;
     let authCallCount = 0;
     const fakeAuth = async (
-      provider: import("@modelcontextprotocol/sdk/client/auth.js").OAuthClientProvider,
+      provider: import("@modelcontextprotocol/client").OAuthClientProvider,
       options: { serverUrl: string | URL; authorizationCode?: string },
     ): Promise<"AUTHORIZED" | "REDIRECT"> => {
       authCallCount++;
@@ -394,7 +413,7 @@ describe("runAuthLogin", () => {
     const cbPromise = new Promise<{ code: string; state: string }>((res) => { resolveCb = res; });
     let issuedState: string | undefined;
     const fakeAuth = async (
-      provider: import("@modelcontextprotocol/sdk/client/auth.js").OAuthClientProvider,
+      provider: import("@modelcontextprotocol/client").OAuthClientProvider,
       options: { serverUrl: string | URL; authorizationCode?: string },
     ): Promise<"AUTHORIZED" | "REDIRECT"> => {
       if (options.authorizationCode === undefined) {
@@ -439,10 +458,62 @@ describe("runAuthLogin", () => {
     expect(out.join("\n")).toMatch(/Authenticated "notion"/);
   });
 
+  it("forwards the callback's RFC 9207 iss parameter to the code-exchange leg", async () => {
+    let resolveCb!: (cb: { code: string; state: string; iss?: string }) => void;
+    const cbPromise = new Promise<{ code: string; state: string; iss?: string }>((res) => {
+      resolveCb = res;
+    });
+    let issuedState: string | undefined;
+    let exchangeOptions: { authorizationCode?: string; iss?: string } | undefined;
+
+    const fakeAuth = async (
+      provider: import("@modelcontextprotocol/client").OAuthClientProvider,
+      options: { serverUrl: string | URL; authorizationCode?: string; iss?: string },
+    ): Promise<"AUTHORIZED" | "REDIRECT"> => {
+      if (options.authorizationCode === undefined) {
+        issuedState = await provider.state?.();
+        await provider.redirectToAuthorization(
+          new URL(`https://provider.example.com/authorize?state=${issuedState}`),
+        );
+        return "REDIRECT";
+      }
+      exchangeOptions = options;
+      await provider.saveTokens({ access_token: "at", token_type: "Bearer" });
+      return "AUTHORIZED";
+    };
+
+    const code = await runAuthLogin(
+      { serverName: "notion" },
+      {
+        store,
+        print: () => {},
+        errPrint: () => {},
+        loadConfig: async () => makeConfig(),
+        startCallbackServer: async () => ({
+          port: 12345,
+          redirectUri: "http://127.0.0.1:12345/callback",
+          result: cbPromise,
+          close: async () => {},
+        }),
+        openBrowser: async () => {
+          resolveCb({ code: "auth-code", state: issuedState ?? "", iss: "https://as.example.com" });
+          return true;
+        },
+        auth: fakeAuth as never,
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(exchangeOptions).toMatchObject({
+      authorizationCode: "auth-code",
+      iss: "https://as.example.com",
+    });
+  });
+
   it("refuses to open the browser on a non-HTTPS authorization URL", async () => {
     const err: string[] = [];
     const fakeAuth = async (
-      provider: import("@modelcontextprotocol/sdk/client/auth.js").OAuthClientProvider,
+      provider: import("@modelcontextprotocol/client").OAuthClientProvider,
     ): Promise<"AUTHORIZED" | "REDIRECT"> => {
       // SDK derives this URL from discovery — a compromised metadata response
       // or a tampered config could plausibly hand us plain http. The provider
@@ -479,7 +550,7 @@ describe("runAuthLogin", () => {
     const cbPromise = new Promise<{ code: string; state: string }>((res) => { resolveCb = res; });
 
     const fakeAuth = async (
-      provider: import("@modelcontextprotocol/sdk/client/auth.js").OAuthClientProvider,
+      provider: import("@modelcontextprotocol/client").OAuthClientProvider,
       options: { serverUrl: string | URL; authorizationCode?: string },
     ): Promise<"AUTHORIZED" | "REDIRECT"> => {
       if (options.authorizationCode === undefined) {
@@ -539,6 +610,65 @@ describe("runAuthLogin", () => {
     );
     expect(code).toBe(0);
     expect(out.join("\n")).toMatch(/Already authenticated/);
+  });
+
+  it("prefixes SDK OAuth errors with their machine-readable code", async () => {
+    const err: string[] = [];
+    const code = await runAuthLogin(
+      { serverName: "notion" },
+      {
+        store,
+        print: () => {},
+        errPrint: (l) => err.push(l),
+        loadConfig: async () => makeConfig(),
+        startCallbackServer: async () => ({
+          port: 12345,
+          redirectUri: "http://127.0.0.1:12345/callback",
+          result: new Promise(() => {}),
+          close: async () => {},
+        }),
+        openBrowser: async () => true,
+        auth: (async () => {
+          const { OAuthError: SdkOAuthError } = await import("@modelcontextprotocol/client");
+          throw new SdkOAuthError("invalid_grant", "refresh token expired");
+        }) as never,
+      },
+    );
+    expect(code).toBe(1);
+    expect(err.join("\n")).toMatch(/\[invalid_grant\] refresh token expired/);
+  });
+
+  it("does not echo the attacker-controlled issuer on a mix-up mismatch", async () => {
+    const err: string[] = [];
+    const code = await runAuthLogin(
+      { serverName: "notion" },
+      {
+        store,
+        print: () => {},
+        errPrint: (l) => err.push(l),
+        loadConfig: async () => makeConfig(),
+        startCallbackServer: async () => ({
+          port: 12345,
+          redirectUri: "http://127.0.0.1:12345/callback",
+          result: new Promise(() => {}),
+          close: async () => {},
+        }),
+        openBrowser: async () => true,
+        auth: (async () => {
+          const { IssuerMismatchError } = await import("@modelcontextprotocol/client");
+          throw new IssuerMismatchError(
+            "authorization_response",
+            "https://good.example.com",
+            "https://evil.example.com/PAYLOAD",
+          );
+        }) as never,
+      },
+    );
+    expect(code).toBe(1);
+    const text = err.join("\n");
+    expect(text).toMatch(/mix-up/i);
+    expect(text).toContain("https://good.example.com");
+    expect(text).not.toContain("PAYLOAD");
   });
 
   it("surfaces errors thrown from auth() cleanly", async () => {

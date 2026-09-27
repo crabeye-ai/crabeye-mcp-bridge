@@ -5,6 +5,7 @@ import { OAuthError } from "./errors.js";
 export interface CallbackResult {
   code: string;
   state: string;
+  iss?: string;
 }
 
 export interface CallbackServerHandle {
@@ -201,6 +202,7 @@ export async function startCallbackServer(
     const errorDescription = url.searchParams.get("error_description") ?? undefined;
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
+    const iss = url.searchParams.get("iss") ?? undefined;
 
     const sendError = (
       page: { error: string; description?: string },
@@ -238,7 +240,8 @@ export async function startCallbackServer(
 
     if (
       code.length > MAX_CALLBACK_PARAM_LENGTH ||
-      state.length > MAX_CALLBACK_PARAM_LENGTH
+      state.length > MAX_CALLBACK_PARAM_LENGTH ||
+      (iss !== undefined && iss.length > MAX_CALLBACK_PARAM_LENGTH)
     ) {
       sendError(
         { error: "invalid_response", description: "Callback parameters too long" },
@@ -254,7 +257,9 @@ export async function startCallbackServer(
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     // Settle only after the response flushes so `server.close()` (in cleanup)
     // drains this connection rather than racing the body to the wire.
-    res.end(successPage(), () => settle(null, { code, state }));
+    res.end(successPage(), () =>
+      settle(null, { code, state, ...(iss ? { iss } : {}) }),
+    );
   });
 
   await new Promise<void>((resolve, reject) => {

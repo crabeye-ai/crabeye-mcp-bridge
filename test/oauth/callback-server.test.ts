@@ -42,6 +42,24 @@ describe("startCallbackServer", () => {
     }
   });
 
+  it("forwards the RFC 9207 iss parameter when present", async () => {
+    const handle = await startCallbackServer({ timeoutMs: 5000 });
+    try {
+      const url = new URL(handle.redirectUri);
+      url.searchParams.set("code", "abc");
+      url.searchParams.set("state", "xyz");
+      url.searchParams.set("iss", "https://as.example.com");
+      await fetch(url);
+      expect(await handle.result).toEqual({
+        code: "abc",
+        state: "xyz",
+        iss: "https://as.example.com",
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
   it("rejects when provider returns an error", async () => {
     const handle = await startCallbackServer({ timeoutMs: 5000 });
     // Attach rejection handler before triggering the callback so a

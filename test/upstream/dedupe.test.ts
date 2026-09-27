@@ -1,7 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
 import { DaemonStdioClient } from "../../src/upstream/daemon-stdio-client.js";
 import { UpstreamManager } from "../../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
@@ -37,7 +35,7 @@ function makeStubServer(toolName: string): { server: Server; serverSide: ReturnT
     { name: "stub", version: "1.0.0" },
     { capabilities: { tools: { listChanged: true } } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, () => ({
+  server.setRequestHandler("tools/list", () => ({
     tools: [{ name: toolName, description: "tool", inputSchema: { type: "object" as const } }],
   }));
   const [, serverSide] = InMemoryTransport.createLinkedPair();

@@ -9,6 +9,7 @@ export { openBrowser } from "./browser.js";
 export {
   resolveClientSecret,
   clientSecretKey,
+  clientIssuerKey,
   clientInfoKey,
   oauthCredentialKey,
   findInlineClientSecrets,
@@ -16,6 +17,6 @@ export {
 } from "./client-secret.js";
 export {
   BridgeOAuthClientProvider,
-  makeOriginPinningFetch,
   type BridgeOAuthProviderOptions,
 } from "./sdk-provider.js";
+export { makeOriginPinningFetch } from "./origin-pinning.js";

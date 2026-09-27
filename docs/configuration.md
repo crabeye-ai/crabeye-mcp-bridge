@@ -34,7 +34,9 @@ Remote servers accessible via HTTP:
 }
 ```
 
-`type` defaults to `"streamable-http"`. Use `"sse"` for servers that use Server-Sent Events transport.
+`type` defaults to `"streamable-http"`. Use `"sse"` for servers that use the legacy HTTP+SSE transport.
+
+> **Deprecation.** The HTTP+SSE transport was superseded by Streamable HTTP in the MCP 2025-03-26 spec, and the MCP SDK now marks it deprecated. The bridge plans to remove `"sse"` support on **2027-07-28** (tracked in #201). If your server offers both, prefer `"streamable-http"` now.
 
 HTTP/SSE upstreams are **not** routed through the manager; each bridge connects directly.
 

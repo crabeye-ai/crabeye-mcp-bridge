@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool, CallToolResult } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "../src/config/schema.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";

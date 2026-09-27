@@ -1,14 +1,13 @@
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { StreamableHTTPClientTransport, SSEClientTransport } from "@modelcontextprotocol/client";
+import type { Transport } from "@modelcontextprotocol/client";
 import type { HttpServerConfig } from "../config/schema.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
 import { hasCredentialTemplates, resolveCredentialTemplates } from "../credentials/resolve-templates.js";
 import { hasStoredOAuthCredential, resolveClientSecret } from "../oauth/client-secret.js";
 import {
   BridgeOAuthClientProvider,
-  makeOriginPinningFetch,
 } from "../oauth/sdk-provider.js";
+import { makeOriginPinningFetch } from "../oauth/origin-pinning.js";
 import { BaseUpstreamClient } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 
@@ -19,6 +18,7 @@ export interface HttpUpstreamClientOptions extends BaseUpstreamClientOptions {
 
 export class HttpUpstreamClient extends BaseUpstreamClient {
   private _config: HttpServerConfig;
+  private _warnedSseDeprecated = false;
   private _credentialStore: CredentialStore | undefined;
   private _resolvedHeaders: Record<string, string> | undefined;
   private _resolvedClientSecret: string | undefined;
@@ -159,6 +159,12 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
 
     if (this._config.type !== "sse") {
       return new StreamableHTTPClientTransport(url, transportOpts);
+    }
+    if (!this._warnedSseDeprecated) {
+      this._warnedSseDeprecated = true;
+      this._logger.warn(
+        'transport type "sse" is deprecated and will be removed on 2027-07-28 — switch to "streamable-http" if the server supports it',
+      );
     }
     return new SSEClientTransport(url, transportOpts);
   }

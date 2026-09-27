@@ -1,4 +1,4 @@
-import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 
 export type ConnectionStatus =
   | "disconnected"
@@ -35,7 +35,6 @@ export interface UpstreamClient {
   }): Promise<CallToolResult>;
   close(): Promise<void>;
 
-  /** Ping the upstream server. Throws if not connected or if ping times out. */
   ping(timeoutMs?: number): Promise<void>;
 
   /** Fresh reconnection: resets backoff, closes inner client, reconnects. */

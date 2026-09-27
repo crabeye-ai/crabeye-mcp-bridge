@@ -1,10 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
 import {
   hasCredentialTemplates,
   resolveCredentialTemplates,
@@ -187,8 +182,8 @@ function createMockServer() {
     { name: "mock-upstream", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
-  server.setRequestHandler(CallToolRequestSchema, (req) => ({
+  server.setRequestHandler("tools/list", () => ({ tools: [] }));
+  server.setRequestHandler("tools/call", (req) => ({
     content: [{ type: "text" as const, text: `Called ${req.params.name}` }],
   }));
   return server;

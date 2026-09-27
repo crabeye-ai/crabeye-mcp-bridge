@@ -3,8 +3,8 @@ import type { CredentialStore } from "../../src/credentials/credential-store.js"
 import type { Credential } from "../../src/credentials/types.js";
 import {
   BridgeOAuthClientProvider,
-  makeOriginPinningFetch,
 } from "../../src/oauth/sdk-provider.js";
+import { makeOriginPinningFetch } from "../../src/oauth/origin-pinning.js";
 import { OAuthError } from "../../src/oauth/errors.js";
 import { oauthCredentialKey } from "../../src/oauth/index.js";
 import { makeTestStore } from "../_helpers/credential-store.js";

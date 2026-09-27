@@ -50,8 +50,10 @@ A browser tab opens, you authorize, and the bridge stores the resulting tokens i
 |---------|-------------|
 | `auth <server>` | Run the OAuth flow for a server. Opens a browser and listens on a loopback redirect URL. |
 | `auth --list` (or bare `auth`) | Show per-server auth status: `authenticated`, `auth-required`, or `advertises-oauth` for non-configured HTTP upstreams that surface OAuth via discovery. |
-| `auth --remove <server>` | Delete local OAuth tokens, client secret, and stored dynamic-client registration for a server. Does not call any provider revocation endpoint. |
+| `auth --remove <server>` | Delete local OAuth tokens, client secret, stored dynamic-client registration, and the authorization-server binding for a server. Does not call any provider revocation endpoint. |
 | `auth help` (or `--help` / `-h`) | Full usage. |
+
+**Authorization-server binding.** When a server's `_bridge.auth.clientId` comes from config, the bridge remembers which authorization server it first contacted. If a later discovery points somewhere else, `auth` and the runtime refuse to send your client credentials there and report that the authorization server is no longer the one it was bound to. If you did not expect the change, treat it as a possible authorization-server mix-up and check the upstream before doing anything else. If the move is legitimate, run `auth --remove <server>` and authenticate again — or, if you are also switching to a new client, update `clientId` in config; a changed `clientId` rebinds automatically.
 
 The flow:
 
