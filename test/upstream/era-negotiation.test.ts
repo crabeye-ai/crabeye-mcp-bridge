@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
+import { CLIENT_INFO_META_KEY, Server, InMemoryTransport } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import type { Tool, Transport, JSONRPCMessage } from "@modelcontextprotocol/server";
 import { HttpUpstreamClient } from "../../src/upstream/http-client.js";
+import { APP_NAME, APP_VERSION } from "../../src/constants.js";
 
 function makeTool(name: string): Tool {
   return {
@@ -21,6 +22,24 @@ function createMockServer(tools: Tool[]): Server {
   server.setRequestHandler("tools/call", (request) => ({
     content: [{ type: "text" as const, text: `Called ${request.params.name}` }],
   }));
+  return server;
+}
+
+interface SeenIdentity {
+  envelopeClientInfo: unknown;
+  handshakeClientInfo: unknown;
+}
+
+function identityCapturingServer(seen: SeenIdentity[]): Server {
+  const server = createMockServer([makeTool("tool-a")]);
+  server.setRequestHandler("tools/call", (_request, ctx) => {
+    const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined;
+    seen.push({
+      envelopeClientInfo: envelope?.[CLIENT_INFO_META_KEY],
+      handshakeClientInfo: server.getClientVersion(),
+    });
+    return { content: [] };
+  });
   return server;
 }
 
@@ -63,6 +82,7 @@ function linkClient(
 }
 
 describe("upstream era negotiation", () => {
+  const bridgeIdentity = { name: `${APP_NAME}/mock`, version: APP_VERSION };
   let client: HttpUpstreamClient | undefined;
 
   afterEach(async () => {
@@ -96,5 +116,30 @@ describe("upstream era negotiation", () => {
     expect(result.content).toEqual([{ type: "text", text: "Called tool-a" }]);
 
     await expect(client.ping()).resolves.toBeUndefined();
+  });
+
+  it("sends the bridge identity in the request envelope to a modern upstream", async () => {
+    const seen: SeenIdentity[] = [];
+    client = linkClient(() => identityCapturingServer(seen));
+    await client.connect();
+    expect(client.protocolEra()).toBe("modern");
+
+    await client.callTool({ name: "tool-a", arguments: {} });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].envelopeClientInfo).toEqual(expect.objectContaining(bridgeIdentity));
+  });
+
+  it("sends the same identity at initialize to a legacy upstream", async () => {
+    const seen: SeenIdentity[] = [];
+    client = linkClient(() => identityCapturingServer(seen), { legacyOnly: true });
+    await client.connect();
+    expect(client.protocolEra()).toBe("legacy");
+
+    await client.callTool({ name: "tool-a", arguments: {} });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].envelopeClientInfo).toBeUndefined();
+    expect(seen[0].handshakeClientInfo).toEqual(expect.objectContaining(bridgeIdentity));
   });
 });

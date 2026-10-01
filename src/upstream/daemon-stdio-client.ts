@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/client";
 import type { Transport, JSONRPCMessage } from "@modelcontextprotocol/client";
 import type { StdioServerConfig } from "../config/schema.js";
-import { APP_NAME, APP_VERSION } from "../constants.js";
 import {
   DaemonLivenessSupervisor,
   ensureDaemonRunning,
@@ -14,7 +13,7 @@ import {
 } from "../daemon/index.js";
 import type { LivenessFailureKind } from "../daemon/liveness-supervisor.js";
 import { createNoopLogger, type Logger } from "../logging/index.js";
-import { BaseUpstreamClient } from "./base-client.js";
+import { BaseUpstreamClient, upstreamClientInfo } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 import { IdempotencyTable } from "./idempotency-table.js";
 
@@ -246,14 +245,7 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
         resolvedEnv: this.opts.resolvedEnv,
         cwd: this.opts.cwd,
         sharing: this.opts.sharing,
-        // `${APP_NAME}/${serverName}` matches the per-upstream Client
-        // identity in BaseUpstreamClient — the daemon-spawned child sees the
-        // same `clientInfo.name` it would see if the bridge spawned it
-        // directly.
-        clientInfo: {
-          name: `${APP_NAME}/${this.opts.serverName}`,
-          version: APP_VERSION,
-        },
+        clientInfo: upstreamClientInfo(this.opts.serverName),
         // The bridge currently advertises no client-side MCP features (no
         // sampling, roots, or elicitation handlers), so we ship `{}`.
         clientCapabilities: {},

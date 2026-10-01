@@ -1,22 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   SSEClientTransport,
   StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { HttpUpstreamClient } from "../../src/upstream/http-client.js";
-import type { Logger } from "../../src/logging/index.js";
-
-function spyLogger(): Logger & { warn: ReturnType<typeof vi.fn> } {
-  const logger = {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    setLevel: vi.fn(),
-    child: () => logger,
-  };
-  return logger;
-}
+import { spyLogger } from "../_helpers/spy-logger.js";
 
 describe("HttpUpstreamClient transport selection", () => {
   function buildTransport(type: "sse" | "streamable-http", logger = spyLogger()) {

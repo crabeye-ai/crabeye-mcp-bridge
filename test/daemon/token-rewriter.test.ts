@@ -1,4 +1,10 @@
 import { describe, it, expect } from "vitest";
+import {
+  CLIENT_CAPABILITIES_META_KEY,
+  CLIENT_INFO_META_KEY,
+  PROTOCOL_VERSION_META_KEY,
+  SERVER_INFO_META_KEY,
+} from "@modelcontextprotocol/client";
 import { InflightOverflowError, TokenRewriter } from "../../src/daemon/token-rewriter.js";
 
 describe("TokenRewriter (phase C opaque-int)", () => {
@@ -135,5 +141,80 @@ describe("TokenRewriter — internal-id classifier (Phase D)", () => {
     // Positive id with no inflight registration → drop (existing behavior).
     const routing = rw.inboundFromChild({ jsonrpc: "2.0", id: 99999, result: {} });
     expect(routing.kind).toBe("drop");
+  });
+});
+
+describe("TokenRewriter — 2026-07-28 envelope _meta passthrough", () => {
+  const envelope = {
+    [PROTOCOL_VERSION_META_KEY]: "2026-07-28",
+    [CLIENT_INFO_META_KEY]: { name: "crabeye-mcp-bridge/notes", version: "1.2.3" },
+    [CLIENT_CAPABILITIES_META_KEY]: { elicitation: { form: {} } },
+  };
+  const serverInfoMeta = { [SERVER_INFO_META_KEY]: { name: "notes", version: "0.1.0" } };
+
+  it("keeps envelope keys verbatim while rewriting progressToken toward the child", () => {
+    const rw = new TokenRewriter();
+    rw.attachSession("s1");
+    const out = rw.outboundForChild(
+      {
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: { name: "t", _meta: { ...envelope, progressToken: "p-1" } },
+      },
+      "s1",
+    ) as { params: { _meta: Record<string, unknown> } };
+
+    const { progressToken, ...rest } = out.params._meta;
+    expect(rest).toEqual(envelope);
+    expect(progressToken).not.toBe("p-1");
+    expect(typeof progressToken).toBe("number");
+  });
+
+  it("restores the progressToken and keeps extra _meta on progress notifications", () => {
+    const rw = new TokenRewriter();
+    rw.attachSession("s1");
+    const out = rw.outboundForChild(
+      {
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: { _meta: { ...envelope, progressToken: "p-1" } },
+      },
+      "s1",
+    ) as { params: { _meta: { progressToken: number } } };
+    const outerToken = out.params._meta.progressToken;
+
+    const routing = rw.inboundFromChild({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: outerToken, progress: 1, _meta: serverInfoMeta },
+    });
+
+    expect(routing.kind).toBe("progress");
+    expect(routing.payload).toEqual({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: "p-1", progress: 1, _meta: serverInfoMeta },
+    });
+  });
+
+  it("restores the original id on responses and keeps result _meta intact", () => {
+    const rw = new TokenRewriter();
+    rw.attachSession("s1");
+    const out = rw.outboundForChild(
+      { jsonrpc: "2.0", id: "req-a", method: "tools/list", params: { _meta: envelope } },
+      "s1",
+    ) as { id: number; params: { _meta: Record<string, unknown> } };
+    expect(out.params._meta).toEqual(envelope);
+
+    const result = { tools: [], _meta: serverInfoMeta };
+    const routing = rw.inboundFromChild({ jsonrpc: "2.0", id: out.id, result });
+
+    expect(routing).toEqual({
+      sessionIds: ["s1"],
+      kind: "response",
+      payload: { jsonrpc: "2.0", id: "req-a", result },
+    });
   });
 });

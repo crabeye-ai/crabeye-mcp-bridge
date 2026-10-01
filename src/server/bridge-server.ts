@@ -14,12 +14,8 @@ import type {
 import type { Readable, Writable } from "node:stream";
 import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
-import {
-  ApprovalFlow,
-  cannotServeFormElicitation,
-  elicitationCapability,
-  type ElicitationCapability,
-} from "./policy-approval.js";
+import { ApprovalFlow } from "./policy-approval.js";
+import { ClientMetadata } from "./client-metadata.js";
 import type { ConnectionStatus, UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
@@ -80,8 +76,9 @@ export interface BridgeServerOptions {
   buildPassthrough?: () => string;
 }
 
-interface ConnectionInfo {
-  lacksElicitation(ctx: ServerContext): boolean;
+interface Connection {
+  readonly client: ClientMetadata;
+  clientLogged: boolean;
 }
 
 function observeStart(transport: Transport): {
@@ -158,15 +155,14 @@ export class BridgeServer {
       },
     );
 
-    const connection: ConnectionInfo = {
-      lacksElicitation: (ctx) =>
-        cannotServeFormElicitation(elicitationCapability(ctx)) &&
-        cannotServeFormElicitation(
-          server.getClientCapabilities()?.elicitation as ElicitationCapability,
-        ),
+    const connection: Connection = {
+      client: new ClientMetadata(era, server),
+      clientLogged: false,
     };
+    server.oninitialized = () => this.logClientOnce(connection);
 
-    server.setRequestHandler("tools/list", () => {
+    server.setRequestHandler("tools/list", (_request, ctx) => {
+      this.logClientOnce(connection, ctx);
       if (this.toolSearchService) {
         return { tools: this.toolSearchService.getVisibleTools() };
       }
@@ -174,6 +170,7 @@ export class BridgeServer {
     });
 
     server.setRequestHandler("tools/call", async (request, ctx) => {
+      this.logClientOnce(connection, ctx);
       const { name, arguments: args } = request.params;
 
       if (this.toolSearchService && name === SEARCH_TOOL_NAME) {
@@ -194,6 +191,20 @@ export class BridgeServer {
 
     this.server = server;
     return server;
+  }
+
+  private logClientOnce(connection: Connection, ctx?: ServerContext): void {
+    if (connection.clientLogged) return;
+    const identity = connection.client.identity(ctx);
+    if (!identity) return;
+    connection.clientLogged = true;
+    this.options.logger?.info("client connected", {
+      component: "bridge",
+      era: connection.client.era,
+      clientName: identity.name,
+      clientVersion: identity.version,
+      protocolVersion: identity.protocolVersion,
+    });
   }
 
   private handleSearchTools(
@@ -230,7 +241,7 @@ export class BridgeServer {
   private handleRunTool(
     args: Record<string, unknown> | undefined,
     ctx: ServerContext,
-    connection: ConnectionInfo,
+    connection: Connection,
   ): Promise<CallToolResult | InputRequiredResult> | CallToolResult {
     const toolName = (args as { name?: string })?.name;
     const toolArgs = (args as { arguments?: Record<string, unknown> })?.arguments;
@@ -247,7 +258,7 @@ export class BridgeServer {
     name: string,
     args: Record<string, unknown> | undefined,
     ctx: ServerContext,
-    connection: ConnectionInfo,
+    connection: Connection,
   ): Promise<CallToolResult | InputRequiredResult> {
     const parsed = parseNamespacedName(name);
     if (!parsed) {
@@ -264,7 +275,7 @@ export class BridgeServer {
         throw new ProtocolError(ProtocolErrorCode.InvalidRequest, decision.reason);
       }
       if (decision.kind === "prompt") {
-        if (connection.lacksElicitation(ctx)) {
+        if (!connection.client.supportsFormElicitation(ctx)) {
           throw new ProtocolError(
             ProtocolErrorCode.InvalidRequest,
             `Tool ${toolKey} requires confirmation but the client does not support elicitation`,

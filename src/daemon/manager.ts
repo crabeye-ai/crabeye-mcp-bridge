@@ -1157,14 +1157,7 @@ export class ManagerDaemon {
                 pid: group.child.pid,
               },
             );
-            // The child's onClose callback fires once kill() lands and runs
-            // through handleChildExit → unregisterGroup. `handleChildExit`
-            // checks `childPing.isWedged` to pass `"wedged"` (not the
-            // default `"crash"`) into telemetry, so this path doesn't need
-            // to record the kill itself.
-            void group.child.kill(this.killGraceMsValue).catch(() => {
-              /* best-effort */
-            });
+            this.handleChildExit(group);
           },
         },
       });
@@ -1478,8 +1471,6 @@ export class ManagerDaemon {
       void this.detachSession(sid, "child process exited").catch(() => {});
     }
 
-    // If the child-ping supervisor flagged this child as wedged before exit,
-    // record the kill under `wedged` instead of the generic `crash`.
     const reason: KilledReason = group.childPing?.isWedged === true ? "wedged" : "crash";
     void this.unregisterGroup(group, reason).catch(() => {});
   }

@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import {
-  CLIENT_CAPABILITIES_META_KEY,
   createRequestStateCodec,
   inputRequired,
   inputResponse,
@@ -13,20 +12,6 @@ import type {
   InputRequiredResult,
   ServerContext,
 } from "@modelcontextprotocol/server";
-
-export type ElicitationCapability = { form?: unknown; url?: unknown } | undefined;
-
-export function elicitationCapability(ctx: ServerContext): ElicitationCapability {
-  const envelope = ctx.mcpReq.envelope as
-    | Record<string, { elicitation?: ElicitationCapability } | undefined>
-    | undefined;
-  return envelope?.[CLIENT_CAPABILITIES_META_KEY]?.elicitation;
-}
-
-export function cannotServeFormElicitation(cap: ElicitationCapability): boolean {
-  if (cap === undefined) return true;
-  return cap.url !== undefined && cap.form === undefined;
-}
 
 export interface ApprovalState {
   toolKey: string;

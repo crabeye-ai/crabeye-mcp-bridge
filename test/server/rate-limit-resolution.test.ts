@@ -12,6 +12,7 @@ import {
   type ServerConfig,
 } from "../../src/config/schema.js";
 import type { Logger } from "../../src/logging/index.js";
+import { spyLogger } from "../_helpers/spy-logger.js";
 
 const STDIO: Omit<Extract<ServerConfig, { command: string }>, "_bridge"> = {
   command: "node",
@@ -33,19 +34,6 @@ function global(
       ? {}
       : { defaultRateLimit: overrides.defaultRateLimit }),
   });
-}
-
-function fakeLogger(): { logger: Logger; info: ReturnType<typeof vi.fn> } {
-  const info = vi.fn();
-  const logger: Logger = {
-    debug: vi.fn(),
-    info,
-    warn: vi.fn(),
-    error: vi.fn(),
-    child: () => logger,
-    setLevel: vi.fn(),
-  };
-  return { logger, info };
 }
 
 describe("resolveRateLimitConfig", () => {
@@ -119,7 +107,7 @@ describe("resolveRateLimitConfig", () => {
 describe("applyRateLimiters — startup", () => {
   it("creates a limiter for every upstream when nothing is configured", () => {
     const map = new Map<string, RateLimiter>();
-    const { logger } = fakeLogger();
+    const logger = spyLogger();
 
     applyRateLimiters({
       upstreams: { a: stdio(undefined), b: stdio(undefined) },
@@ -135,7 +123,7 @@ describe("applyRateLimiters — startup", () => {
 
   it("skips disabled upstreams", () => {
     const map = new Map<string, RateLimiter>();
-    const { logger } = fakeLogger();
+    const logger = spyLogger();
 
     applyRateLimiters({
       upstreams: {
@@ -162,7 +150,7 @@ describe("applyRateLimiters — hot reload transitions", () => {
 
   beforeEach(() => {
     map = new Map();
-    logger = fakeLogger().logger;
+    logger = spyLogger();
   });
 
   afterEach(() => {
@@ -323,7 +311,7 @@ describe("applyRateLimiters — hot reload transitions", () => {
 describe("applyRateLimiters — default-block logging", () => {
   it("fires once per upstream on first default-block, silent after", async () => {
     const map = new Map<string, RateLimiter>();
-    const { logger, info } = fakeLogger();
+    const logger = spyLogger();
 
     applyRateLimiters({
       upstreams: {
@@ -339,8 +327,8 @@ describe("applyRateLimiters — default-block logging", () => {
     await api.acquire();
     api.acquire().catch(() => {});
 
-    expect(info).toHaveBeenCalledOnce();
-    const [msg, ctx] = info.mock.calls[0]!;
+    expect(logger.info).toHaveBeenCalledOnce();
+    const [msg, ctx] = logger.info.mock.calls[0]!;
     expect(msg).toContain('default rate limit (1 calls / 60s) reached for "api"');
     expect(msg).toContain("_bridge.rateLimit");
     expect(msg).toContain("_bridge.defaultRateLimit: false");
@@ -348,14 +336,14 @@ describe("applyRateLimiters — default-block logging", () => {
 
     // Second block on same upstream is silent.
     api.acquire().catch(() => {});
-    expect(info).toHaveBeenCalledOnce();
+    expect(logger.info).toHaveBeenCalledOnce();
 
     for (const rl of map.values()) rl.dispose();
   });
 
   it("does not fire for explicit per-server limits", async () => {
     const map = new Map<string, RateLimiter>();
-    const { logger, info } = fakeLogger();
+    const logger = spyLogger();
 
     applyRateLimiters({
       upstreams: { api: stdio({ maxCalls: 1, windowSeconds: 60 }) },
@@ -368,13 +356,13 @@ describe("applyRateLimiters — default-block logging", () => {
     await api.acquire();
     api.acquire().catch(() => {});
 
-    expect(info).not.toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalled();
     for (const rl of map.values()) rl.dispose();
   });
 
   it("config change on a default-following upstream re-arms the log", async () => {
     const map = new Map<string, RateLimiter>();
-    const { logger, info } = fakeLogger();
+    const logger = spyLogger();
 
     applyRateLimiters({
       upstreams: { api: stdio(undefined) },
@@ -386,7 +374,7 @@ describe("applyRateLimiters — default-block logging", () => {
     const api = map.get("api")!;
     await api.acquire(); // 1 timestamp; window full
     api.acquire().catch(() => {}); // blocks → first log fires
-    expect(info).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledTimes(1);
 
     // Bump the default. Reconfigure widens maxCalls to 2 and drains the queued
     // waiter (pushing a second timestamp), so the window is full again at 2/2.
@@ -399,8 +387,8 @@ describe("applyRateLimiters — default-block logging", () => {
 
     // Next acquire blocks → fires the re-armed callback with the new values.
     api.acquire().catch(() => {});
-    expect(info).toHaveBeenCalledTimes(2);
-    expect(info.mock.calls[1]![0]).toContain("2 calls / 30s");
+    expect(logger.info).toHaveBeenCalledTimes(2);
+    expect(logger.info.mock.calls[1]![0]).toContain("2 calls / 30s");
 
     for (const rl of map.values()) rl.dispose();
   });

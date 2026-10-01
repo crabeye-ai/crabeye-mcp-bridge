@@ -1,5 +1,11 @@
 import { Client } from "@modelcontextprotocol/client";
-import type { Transport, Tool, CallToolResult, ProtocolEra } from "@modelcontextprotocol/client";
+import type {
+  Transport,
+  Tool,
+  CallToolResult,
+  Implementation,
+  ProtocolEra,
+} from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
@@ -12,6 +18,10 @@ import type {
 } from "./types.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
+
+export function upstreamClientInfo(serverName: string): Implementation {
+  return { name: `${APP_NAME}/${serverName}`, version: APP_VERSION };
+}
 
 export interface BaseUpstreamClientOptions {
   name: string;
@@ -98,7 +108,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       const transport = this._createTransport();
       this._currentTransport = transport;
       const client = new Client(
-        { name: `${APP_NAME}/${this.name}`, version: APP_VERSION },
+        upstreamClientInfo(this.name),
         {
           versionNegotiation: {
             mode: "auto",

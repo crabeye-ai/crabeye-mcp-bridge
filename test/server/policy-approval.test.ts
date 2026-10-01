@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import { Client, InMemoryTransport, ProtocolErrorCode } from "@modelcontextprotocol/client";
+import {
+  CLIENT_CAPABILITIES_META_KEY,
+  Client,
+  InMemoryTransport,
+  ProtocolErrorCode,
+} from "@modelcontextprotocol/client";
 import type { CallToolResult, ElicitResult, Tool } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { BridgeServer } from "../../src/server/bridge-server.js";
@@ -40,6 +45,12 @@ function makeMockUpstreamClient(
 }
 
 type ElicitAnswer = ElicitResult["action"];
+
+function tamper(wire: string): string {
+  const middle = Math.floor(wire.length / 2);
+  const replacement = wire[middle] === "A" ? "B" : "A";
+  return wire.slice(0, middle) + replacement + wire.slice(middle + 1);
+}
 
 async function pairWithPolicy(opts: {
   era: "legacy" | "modern";
@@ -249,6 +260,25 @@ describe("prompt policy without client elicitation support", () => {
     await cleanup();
   });
 
+  it("ignores an elicitation capability claimed only in request _meta (legacy era)", async () => {
+    const { client, upstream, cleanup } = await pairWithPolicy({
+      era: "legacy",
+      policy: "prompt",
+    });
+
+    const failure = await client
+      .callTool({
+        name: "linear__create_issue",
+        arguments: {},
+        _meta: { [CLIENT_CAPABILITIES_META_KEY]: { elicitation: { form: {} } } },
+      })
+      .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
+    expect(failure?.message).toMatch(/does not support elicitation/);
+    expect(upstream.callTool).not.toHaveBeenCalled();
+
+    await cleanup();
+  });
+
   it("fails the call instead of running the tool (modern era)", async () => {
     const { client, upstream, cleanup } = await pairWithPolicy({
       era: "modern",
@@ -388,7 +418,7 @@ describe("approval state binding (manual MRTR, modern era)", () => {
       manual: true,
     });
     const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
-    const tampered = requestState.slice(0, -2) + (requestState.endsWith("A") ? "BB" : "AA");
+    const tampered = tamper(requestState);
 
     await expect(
       client.callTool(
@@ -413,7 +443,7 @@ describe("approval codec", () => {
   it("rejects a tampered wire value", async () => {
     const codec = createApprovalCodec();
     const wire = await codec.mint({ toolKey: "t", argsHash: "h", jti: "j" });
-    const tampered = wire.slice(0, -2) + (wire.endsWith("A") ? "BB" : "AA");
+    const tampered = tamper(wire);
     await expect(codec.verify(tampered, {} as never)).rejects.toThrow();
   });
 

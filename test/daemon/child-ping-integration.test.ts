@@ -20,11 +20,6 @@ async function tempPaths() {
   };
 }
 
-/**
- * The `_spawnChild` callback shape includes onMessage AND onClose. We need
- * onClose to fire when the manager kills the child, so the manager runs its
- * own teardown path. Build a full callback bag here.
- */
 interface SpawnCallbacks {
   onMessage: (payload: unknown) => void;
   onClose: () => void;
@@ -75,9 +70,6 @@ function makeStubChildFull(
         state.killCalls += 1;
         state.killed = true;
         handle.alive = false;
-        // Mirror the real handle: kill() resolves AND triggers onClose so the
-        // manager runs handleChildExit.
-        queueMicrotask(() => cb.onClose());
       }
     },
   };
@@ -209,6 +201,11 @@ describe.skipIf(isWindows)("ManagerDaemon — daemon-side child ping", () => {
       sessionId: "22222222-2222-2222-2222-222222222222",
       spec,
     });
+    const errorPayloads: unknown[] = [];
+    client.setNotificationHandler((notif) => {
+      const payload = (notif.params as { payload?: { error?: unknown } } | undefined)?.payload;
+      if (notif.method === "RPC" && payload?.error !== undefined) errorPayloads.push(payload);
+    });
     client.sendNotification("RPC", {
       sessionId: "22222222-2222-2222-2222-222222222222",
       payload: {
@@ -222,6 +219,10 @@ describe.skipIf(isWindows)("ManagerDaemon — daemon-side child ping", () => {
         },
       },
     });
+    client.sendNotification("RPC", {
+      sessionId: "22222222-2222-2222-2222-222222222222",
+      payload: { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "t" } },
+    });
 
     // 2 failures × (50 cadence + 50 timeout) = 200ms; pad to 400ms.
     await new Promise((r) => setTimeout(r, 400));
@@ -234,6 +235,13 @@ describe.skipIf(isWindows)("ManagerDaemon — daemon-side child ping", () => {
     const status = (await client.call("STATUS")) as StatusResult;
     expect(status.telemetry.children.killedTotal.wedged).toBeGreaterThanOrEqual(1);
     expect(status.children).toHaveLength(0);
+    expect(status.sessions).toEqual([]);
+    expect(errorPayloads).toEqual([
+      expect.objectContaining({
+        id: 2,
+        error: expect.objectContaining({ message: expect.stringContaining("child process exited") }),
+      }),
+    ]);
 
     client.close();
   });
