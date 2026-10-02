@@ -228,6 +228,7 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
 
     const bridges = Array.from({ length: 4 }, () => start([cliScript, "--config", configPath], env));
     await Promise.all(bridges.map((b) => stderrMentions(b, "ready —")));
+    await waitUntil(() => daemonPidsRunning(cliScript).length <= 1, 10_000);
 
     const daemons = daemonPidsRunning(cliScript);
     try {
