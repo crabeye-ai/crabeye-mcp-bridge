@@ -5,14 +5,12 @@
  * upgrade to `rpc_timeout` failures.
  */
 
-import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { EventEmitter } from "node:events";
 import { ensureDaemonRunning, isDaemonReachable, type EnsureAttemptOptions } from "./bootstrap.js";
 import { DaemonClient, DaemonRpcError } from "./client.js";
 import { acquireLock, LockBusyError, type LockHandle } from "./lockfile.js";
-import { isDaemonCommandLine } from "./daemon-identity.js";
-import { readProcessInfo } from "../process/process-utils.js";
+import { readPidFile, terminateDaemon } from "./daemon-process.js";
 import { netTransport } from "./net-transport.js";
 import {
   ERROR_CODE_RPC_TIMEOUT,
@@ -85,7 +83,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
       client.close();
       throw new Error("supervisor closed");
     }
-    this.connectedDaemonPid = await this.readManagerPid();
+    this.connectedDaemonPid = await readPidFile(this.opts.pidPath);
     this.startHeartbeat();
   }
 
@@ -215,7 +213,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
    * pid is dead the steal succeeds and no kill is needed. When the lock is
    * held by a live pid, SIGKILL only the daemon this supervisor was connected
    * to (its pid as reported by PONG, else the pidfile at connect time; never
-   * a successor), gated by `looksLikeOurDaemon` against recycled pids, then
+   * a successor), gated by the daemon identity check against recycled pids, then
    * wait for the lock or for any daemon to answer.
    */
   private async forceRespawn(reason: LivenessFailureKind): Promise<void> {
@@ -227,8 +225,8 @@ export class DaemonLivenessSupervisor extends EventEmitter {
       let handle = await this.tryAcquireLockOnce();
       if (handle === null) {
         if (this.connectedDaemonPid !== null) {
-          const killed = await this.killPid(this.connectedDaemonPid);
-          if (killed) this.sigkillsIssued++;
+          const result = await terminateDaemon(this.connectedDaemonPid, { graceMs: 0 });
+          if (result === "terminated") this.sigkillsIssued++;
         }
         await delay(50, undefined, { ref: false });
         handle = await this.acquireLockBounded();
@@ -282,49 +280,4 @@ export class DaemonLivenessSupervisor extends EventEmitter {
     }
     return handle;
   }
-
-  private async readManagerPid(): Promise<number | null> {
-    try {
-      const txt = await readFile(this.opts.pidPath, "utf-8");
-      const n = Number.parseInt(txt.trim(), 10);
-      return Number.isFinite(n) && n > 0 ? n : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private async killPid(pid: number): Promise<boolean> {
-    // Defense in depth against a recycled-pid hazard: never SIGKILL self,
-    // and refuse to kill a pid whose command line isn't a crabeye daemon.
-    // The lockfile-based liveness check (`process.kill(pid, 0)`) cannot
-    // distinguish a recycled pid from the original daemon, so we cross-check
-    // the process command line before signalling. Returns true iff the
-    // signal/taskkill was actually dispatched.
-    if (pid === process.pid) return false;
-    if (!(await looksLikeOurDaemon(pid))) return false;
-    try {
-      if (process.platform === "win32") {
-        const { spawn } = await import("node:child_process");
-        await new Promise<void>((resolve) => {
-          const c = spawn("taskkill", ["/F", "/PID", String(pid)], {
-            stdio: "ignore",
-          });
-          c.on("exit", () => resolve());
-          c.on("error", () => resolve());
-        });
-      } else {
-        process.kill(pid, "SIGKILL");
-      }
-      return true;
-    } catch {
-      // pid may have died between check and kill; the second lock attempt
-      // covers this.
-      return false;
-    }
-  }
-}
-
-async function looksLikeOurDaemon(pid: number): Promise<boolean> {
-  const info = await readProcessInfo(pid);
-  return info !== null && isDaemonCommandLine(info.cmdline);
 }

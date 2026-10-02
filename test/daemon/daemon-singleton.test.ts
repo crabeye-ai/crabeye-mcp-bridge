@@ -25,9 +25,9 @@ async function runPaths(): Promise<RunPaths> {
   const dir = await mkdtemp("/tmp/cbe-single-");
   return {
     dir,
-    sock: join(dir, "m.sock"),
-    pid: join(dir, "m.pid"),
-    lock: join(dir, "m.lock"),
+    sock: join(dir, "manager.sock"),
+    pid: join(dir, "manager.pid"),
+    lock: join(dir, "manager.lock"),
     proc: join(dir, "processes.json"),
   };
 }

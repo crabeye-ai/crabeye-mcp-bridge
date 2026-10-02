@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   acquireLock,
+  holdsLock,
   LockBusyError,
   LOCK_SETTLE_MS,
   sweepAbandonedLockFiles,
@@ -190,6 +191,68 @@ describe("daemon lockfile", () => {
     expect(await second.isHeld()).toBe(true);
     await second.release();
     await expect(stat(lockPath)).rejects.toThrow();
+  });
+
+  it("treats a lock older than maxAgeMs as stale even while its holder is alive", async () => {
+    await writeFile(lockPath, "4242\nold-token\n");
+    await backdate(lockPath, 120_000);
+
+    const handle = await acquireLock(lockPath, { pid: 1, isProcessAlive: () => true, maxAgeMs: 60_000 });
+
+    expect(await handle.isHeld()).toBe(true);
+    await handle.release();
+  });
+
+  it("keeps a young lock with a live holder even when maxAgeMs is set", async () => {
+    await writeFile(lockPath, "4242\nfresh-token\n");
+
+    await expect(
+      acquireLock(lockPath, { pid: 1, isProcessAlive: () => true, maxAgeMs: 60_000 }),
+    ).rejects.toBeInstanceOf(LockBusyError);
+  });
+
+  it("knows which tracked locks this process still holds", async () => {
+    const untracked = await acquireLock(`${lockPath}.untracked`, { pid: 1 });
+    const tracked = await acquireLock(lockPath, { pid: 1, track: true });
+
+    expect(await holdsLock(lockPath)).toBe(true);
+    expect(await holdsLock(`${lockPath}.untracked`)).toBe(false);
+    expect(await holdsLock(join(dir, "never-acquired.lock"))).toBe(false);
+
+    await writeFile(lockPath, "2\nsomeone-else\n");
+    expect(await holdsLock(lockPath)).toBe(false);
+
+    await tracked.release();
+    await untracked.release();
+    expect(await holdsLock(lockPath)).toBe(false);
+  });
+
+  it("stops reporting a tracked lock as held once released", async () => {
+    const tracked = await acquireLock(lockPath, { pid: 1, track: true });
+
+    await tracked.release();
+
+    expect(await holdsLock(lockPath)).toBe(false);
+  });
+
+  it("a second release is harmless and leaves no copies behind", async () => {
+    const handle = await acquireLock(lockPath, { pid: 1 });
+
+    await handle.release();
+    await handle.release();
+
+    await expect(stat(lockPath)).rejects.toThrow();
+    expect((await readdir(dir)).filter((name) => name.startsWith("manager.lock"))).toEqual([]);
+  });
+
+  it("sweeps a release copy left by a crash mid-release", async () => {
+    const abandoned = `${lockPath}.dead-token.release`;
+    await writeFile(abandoned, "1\ndead-token\n");
+    await backdate(abandoned, 60_000);
+
+    await sweepAbandonedLockFiles(lockPath);
+
+    await expect(stat(abandoned)).rejects.toThrow();
   });
 
   it("sweeps lock staging files left by a crash, but not ones still being written", async () => {

@@ -356,7 +356,7 @@ describe.skipIf(isWindows)("DaemonLivenessSupervisor — kill scope and lock wai
   afterEach(async () => {
     for (const m of managers.splice(0)) await m.stop(0).catch(() => {});
     for (const c of children.splice(0)) c.kill("SIGKILL");
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   function child(...args: string[]): ChildProcess {

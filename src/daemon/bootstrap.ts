@@ -4,19 +4,78 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { DaemonClient } from "./client.js";
-import { getDaemonSocketPath } from "./paths.js";
+import { daemonFilesFor, getDaemonSocketPath, type DaemonFiles } from "./paths.js";
 import { isServing, netTransport } from "./net-transport.js";
 import { DAEMON_LAUNCH_ARGS } from "./daemon-identity.js";
+import {
+  describeProcess,
+  identityOf,
+  isSameProcess,
+  recordedPids,
+  terminateDaemon,
+  waitForExit,
+  type DaemonProcess,
+} from "./daemon-process.js";
+import { acquireLock, holdsLock, isLockLive, LockBusyError, type LockHandle } from "./lockfile.js";
+import { APP_NAME } from "../constants.js";
+import { processExists, READ_PROCESS_INFO_MAX_MS, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
 
 /**
  * Backoff schedule for "wait for daemon to be reachable after spawn".
  * Cumulative: ~2.75 s. The daemon answers once it has reaped leaked
- * children; while its socket accepts connections but it hasn't answered yet,
+ * children; while its recorded process is alive but it hasn't answered yet,
  * probing continues for up to STARTING_DAEMON_WAIT_MS.
  */
 const CONNECT_BACKOFF_MS = [50, 200, 500, 1000, 1000] as const;
 const STARTING_DAEMON_WAIT_MS = 60_000;
-const STARTING_DAEMON_POLL_MS = 1_000;
+const DAEMON_POLL_MS = 1_000;
+const PROBE_TIMEOUT_MS = 1_000;
+const WEDGED_DAEMON_KILL_GRACE_MS = 2_000;
+const WEDGED_DAEMON_EXIT_WAIT_MS = 5_000;
+const PROBE_MAX_MS = 2 * PROBE_TIMEOUT_MS;
+const LAUNCH_PROBE_MAX_MS =
+  CONNECT_BACKOFF_MS.reduce((total, wait) => total + wait, 0) + CONNECT_BACKOFF_MS.length * PROBE_MAX_MS;
+const IDENTITY_CHECKS_PER_RECOVERY = 4;
+const RECOVERY_MAX_MS =
+  PROBE_MAX_MS +
+  IDENTITY_CHECKS_PER_RECOVERY * READ_PROCESS_INFO_MAX_MS +
+  WEDGED_DAEMON_KILL_GRACE_MS +
+  TASKKILL_TIMEOUT_MS +
+  WEDGED_DAEMON_EXIT_WAIT_MS +
+  LAUNCH_PROBE_MAX_MS;
+const RECOVERY_GUARD_MAX_AGE_MS = 2 * RECOVERY_MAX_MS;
+
+export class DaemonUnreachableError extends Error {
+  constructor() {
+    super("daemon did not become reachable within timeout");
+    this.name = "DaemonUnreachableError";
+  }
+}
+
+export type UnresponsiveReason = "unconfirmed" | "survived" | "unrecorded";
+
+export class DaemonUnresponsiveError extends Error {
+  constructor(
+    readonly reason: UnresponsiveReason,
+    socketPath: string,
+    readonly pid: number | null,
+  ) {
+    super(unresponsiveMessage(reason, socketPath, pid));
+    this.name = "DaemonUnresponsiveError";
+  }
+}
+
+function unresponsiveMessage(reason: UnresponsiveReason, socketPath: string, pid: number | null): string {
+  const stop = `run \`${APP_NAME} daemon stop\``;
+  switch (reason) {
+    case "unconfirmed":
+      return `daemon at ${socketPath} does not respond, and process ${pid} could not be confirmed as a ${APP_NAME} daemon, so it was left running; ${stop} to stop it`;
+    case "survived":
+      return `daemon process ${pid} at ${socketPath} does not respond and could not be stopped; ${stop}, or kill it manually`;
+    case "unrecorded":
+      return `something accepts connections at ${socketPath} without responding, and no daemon process is recorded for it; stop the process holding that socket, then retry`;
+  }
+}
 
 export interface EnsureAttemptOptions {
   freshAttempt?: boolean;
@@ -25,6 +84,14 @@ export interface EnsureAttemptOptions {
 export interface EnsureDaemonOptions extends EnsureAttemptOptions {
   socketPath?: string;
   launch?: () => void;
+  _startingDaemonWaitMs?: number;
+}
+
+interface Bootstrap {
+  socketPath: string;
+  files: DaemonFiles;
+  waitMs: number;
+  launch: () => void;
 }
 
 interface PendingEnsure {
@@ -52,22 +119,146 @@ export function ensureDaemonRunning(opts: EnsureDaemonOptions = {}): Promise<voi
 
 async function probeOrLaunch(socketPath: string, opts: EnsureDaemonOptions): Promise<void> {
   if (await isDaemonReachable(socketPath)) return;
+  const boot: Bootstrap = {
+    socketPath,
+    files: daemonFilesFor(socketPath),
+    waitMs: opts._startingDaemonWaitMs ?? STARTING_DAEMON_WAIT_MS,
+    launch: opts.launch ?? (await detachedDaemonLauncher()),
+  };
+  let launched = false;
+  let waitedOut: DaemonProcess | null = null;
 
-  const launch = opts.launch ?? (await detachedDaemonLauncher());
-  launch();
+  for (;;) {
+    if (await isDaemonReachable(socketPath)) return;
+    if (waitedOut !== null && (await recoveryInProgress(boot))) {
+      await delay(DAEMON_POLL_MS);
+      continue;
+    }
+    const daemon = await recordedDaemon(boot.files);
+    if (daemon === null) {
+      if (await recoveryInProgress(boot)) {
+        await delay(DAEMON_POLL_MS);
+        continue;
+      }
+      if (launched) throw new DaemonUnreachableError();
+      if (await isServing(socketPath)) {
+        await waitForUnrecordedServer(boot);
+        continue;
+      }
+      launched = true;
+      if (await launchAndProbe(boot)) return;
+      continue;
+    }
+    if (waitedOut === null || !isSameProcess(waitedOut, daemon)) {
+      const outcome = await waitWhileStarting(boot, daemon);
+      if (outcome === "ready") return;
+      if (outcome === "replaced") continue;
+      waitedOut = daemon;
+    }
+    if (launched) throw new DaemonUnreachableError();
+    const recovery = await recoverWedgedDaemon(boot, daemon);
+    if (recovery === "launched") launched = true;
+    if (recovery === "busy") await delay(DAEMON_POLL_MS);
+  }
+}
 
+async function recordedDaemon(files: DaemonFiles): Promise<DaemonProcess | null> {
+  for (const pid of await recordedPids(files)) {
+    if (pid === process.pid) {
+      if (await holdsLock(files.lockPath)) return describeProcess(pid);
+      continue;
+    }
+    const snapshot = await describeProcess(pid);
+    if (snapshot !== null && identityOf(snapshot) !== "foreign") return snapshot;
+  }
+  return null;
+}
+
+async function launchAndProbe(boot: Bootstrap): Promise<boolean> {
+  boot.launch();
   for (const wait of CONNECT_BACKOFF_MS) {
     await delay(wait);
-    if (await isDaemonReachable(socketPath)) return;
+    if (await isDaemonReachable(boot.socketPath)) return true;
   }
+  return false;
+}
 
-  const deadline = Date.now() + STARTING_DAEMON_WAIT_MS;
-  while (Date.now() < deadline && (await isServing(socketPath))) {
-    if (await isDaemonReachable(socketPath)) return;
-    await delay(STARTING_DAEMON_POLL_MS);
+async function waitWhileStarting(
+  boot: Bootstrap,
+  daemon: DaemonProcess,
+): Promise<"ready" | "replaced" | "expired"> {
+  const deadline = Date.now() + boot.waitMs;
+  for (;;) {
+    await delay(Math.min(DAEMON_POLL_MS, boot.waitMs));
+    if (await isDaemonReachable(boot.socketPath)) return "ready";
+    if (!(await recordedPids(boot.files)).includes(daemon.pid)) return "replaced";
+    if (Date.now() >= deadline) return "expired";
   }
+}
 
-  throw new Error("daemon did not become reachable within timeout");
+async function waitForUnrecordedServer(boot: Bootstrap): Promise<void> {
+  const deadline = Date.now() + boot.waitMs;
+  while (Date.now() < deadline) {
+    await delay(Math.min(DAEMON_POLL_MS, boot.waitMs));
+    if (await isDaemonReachable(boot.socketPath)) return;
+    if ((await recordedDaemon(boot.files)) !== null || !(await isServing(boot.socketPath))) return;
+  }
+  throw new DaemonUnresponsiveError("unrecorded", boot.socketPath, null);
+}
+
+async function recoverWedgedDaemon(
+  boot: Bootstrap,
+  daemon: DaemonProcess,
+): Promise<"busy" | "resolved" | "launched"> {
+  const guard = await tryAcquire(recoveryGuardPath(boot));
+  if (guard === null) return "busy";
+  try {
+    if (await isDaemonReachable(boot.socketPath)) return "resolved";
+    const current = await recordedDaemon(boot.files);
+    if (current === null || !isSameProcess(current, daemon)) return "resolved";
+    const result = await terminateDaemon(daemon.pid, {
+      graceMs: WEDGED_DAEMON_KILL_GRACE_MS,
+      startTime: daemon.startTime,
+    });
+    if (result === "not_ours") {
+      throw new DaemonUnresponsiveError("unconfirmed", boot.socketPath, daemon.pid);
+    }
+    if (result === "failed" || !(await waitForExit(daemon.pid, WEDGED_DAEMON_EXIT_WAIT_MS))) {
+      throw new DaemonUnresponsiveError("survived", boot.socketPath, daemon.pid);
+    }
+    await launchAndProbe(boot);
+    return "launched";
+  } finally {
+    await guard.release().catch(() => {});
+  }
+}
+
+function recoveryGuardPath(boot: Bootstrap): string {
+  return `${boot.files.lockPath}.recover`;
+}
+
+async function recoveryInProgress(boot: Bootstrap): Promise<boolean> {
+  const guardPath = recoveryGuardPath(boot);
+  if (await holdsLock(guardPath)) return false;
+  return isLockLive(guardPath, { maxAgeMs: RECOVERY_GUARD_MAX_AGE_MS, isProcessAlive: isOtherLiveProcess });
+}
+
+function isOtherLiveProcess(pid: number): boolean {
+  return pid !== process.pid && processExists(pid);
+}
+
+async function tryAcquire(path: string): Promise<LockHandle | null> {
+  try {
+    return await acquireLock(path, {
+      stealStale: true,
+      maxAgeMs: RECOVERY_GUARD_MAX_AGE_MS,
+      isProcessAlive: isOtherLiveProcess,
+      track: true,
+    });
+  } catch (err) {
+    if (err instanceof LockBusyError) return null;
+    throw err;
+  }
 }
 
 async function detachedDaemonLauncher(): Promise<() => void> {
@@ -87,8 +278,8 @@ export async function isDaemonReachable(socketPath: string): Promise<boolean> {
   const client = new DaemonClient({
     socketPath,
     transport: netTransport,
-    rpcTimeoutMs: 1_000,
-    connectTimeoutMs: 1_000,
+    rpcTimeoutMs: PROBE_TIMEOUT_MS,
+    connectTimeoutMs: PROBE_TIMEOUT_MS,
   });
   try {
     await client.connect();

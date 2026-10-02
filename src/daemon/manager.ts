@@ -482,6 +482,7 @@ export class ManagerDaemon {
     this.lock = await acquireLock(this.opts.lockPath, {
       pid: this.opts.pid ?? process.pid,
       isForeignProcess,
+      track: true,
     });
 
     try {

@@ -1,9 +1,20 @@
-import { link, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { link, readdir, readFile, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
+import { parsePid, processExists } from "../process/process-utils.js";
 
 export const LOCK_SETTLE_MS = 60_000;
 const ABANDONED_STAGING_AGE_MS = 5_000;
+
+const heldTokens = new Map<string, string>();
+const handleTokens = new WeakMap<LockHandle, string>();
+
+export async function holdsLock(path: string): Promise<boolean> {
+  const token = heldTokens.get(path);
+  if (token === undefined) return false;
+  const body = await readBodySafe(path);
+  return body !== null && tokenOf(body) === token;
+}
 
 export class LockHandle {
   private released = false;
@@ -11,7 +22,10 @@ export class LockHandle {
   constructor(
     public readonly path: string,
     private readonly token: string,
-  ) {}
+  ) {
+    handleTokens.set(this, token);
+  }
+
 
   async isHeld(): Promise<boolean> {
     if (this.released) return false;
@@ -22,7 +36,23 @@ export class LockHandle {
   async release(): Promise<void> {
     const held = await this.isHeld();
     this.released = true;
-    if (held) await unlink(this.path).catch(() => {});
+    if (heldTokens.get(this.path) === this.token) heldTokens.delete(this.path);
+    if (!held) return;
+    const claimed = `${this.path}.${this.token}.release`;
+    try {
+      await rename(this.path, claimed);
+    } catch (err) {
+      if (isEnoent(err)) return;
+      throw err;
+    }
+    const now = new Date();
+    await utimes(claimed, now, now).catch(() => {});
+    const body = await readBodySafe(claimed);
+    if (body === null || tokenOf(body) === this.token) {
+      await unlink(claimed).catch(() => {});
+      return;
+    }
+    await restoreLock(claimed, this.path, body);
   }
 }
 
@@ -31,6 +61,8 @@ export interface AcquireOptions {
   stealStale?: boolean;
   isProcessAlive?: (pid: number) => boolean;
   isForeignProcess?: (pid: number) => Promise<boolean>;
+  maxAgeMs?: number;
+  track?: boolean;
 }
 
 export class LockBusyError extends Error {
@@ -44,10 +76,13 @@ export class LockBusyError extends Error {
   }
 }
 
-export async function acquireLock(
-  path: string,
-  opts: AcquireOptions = {},
-): Promise<LockHandle> {
+export async function acquireLock(path: string, opts: AcquireOptions = {}): Promise<LockHandle> {
+  const handle = await acquireUntrackedLock(path, opts);
+  if (opts.track) heldTokens.set(path, handleTokens.get(handle)!);
+  return handle;
+}
+
+async function acquireUntrackedLock(path: string, opts: AcquireOptions): Promise<LockHandle> {
   const pid = opts.pid ?? process.pid;
   const stealStale = opts.stealStale ?? true;
 
@@ -60,11 +95,11 @@ export async function acquireLock(
     const body = await readBodySafe(path);
     if (body === null) continue;
     if (!stealStale || !(await isStale(path, body, opts))) {
-      throw new LockBusyError(path, pidOf(body));
+      throw new LockBusyError(path, parsePid(body));
     }
     return await stealLock(path, body, pid, opts);
   }
-  throw new LockBusyError(path, await readPidSafe(path));
+  throw new LockBusyError(path, await readLockHolderPid(path));
 }
 
 export async function sweepAbandonedLockFiles(lockPath: string): Promise<void> {
@@ -72,7 +107,7 @@ export async function sweepAbandonedLockFiles(lockPath: string): Promise<void> {
   const dir = dirname(lockPath);
   const entries = await readdir(dir).catch(() => [] as string[]);
   for (const name of entries) {
-    if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+    if (!name.startsWith(prefix) || !(name.endsWith(".tmp") || name.endsWith(".release"))) continue;
     const path = join(dir, name);
     if (await ageExceeds(path, ABANDONED_STAGING_AGE_MS)) await unlink(path).catch(() => {});
   }
@@ -94,19 +129,45 @@ async function createLock(path: string, pid: number): Promise<LockHandle> {
   return new LockHandle(path, token);
 }
 
+async function restoreLock(claimed: string, path: string, body: string): Promise<void> {
+  try {
+    await link(claimed, path);
+  } catch (err) {
+    if (isHardLinkUnsupported(err)) {
+      await writeFile(path, body, { encoding: "utf-8", mode: 0o600, flag: "wx" }).catch(() => {});
+    }
+  } finally {
+    await unlink(claimed).catch(() => {});
+  }
+}
+
 async function createLockOrBusy(path: string, pid: number, reportedPath = path): Promise<LockHandle> {
   try {
     return await createLock(path, pid);
   } catch (err) {
-    if (isEexist(err)) throw new LockBusyError(reportedPath, await readPidSafe(reportedPath));
+    if (isEexist(err)) throw new LockBusyError(reportedPath, await readLockHolderPid(reportedPath));
     throw err;
   }
 }
 
+export async function isLockLive(
+  path: string,
+  opts: Pick<AcquireOptions, "maxAgeMs" | "isProcessAlive"> = {},
+): Promise<boolean> {
+  const body = await readBodySafe(path);
+  return body !== null && !(await isStale(path, body, opts));
+}
+
+export async function readLockHolderPid(path: string): Promise<number | null> {
+  const body = await readBodySafe(path);
+  return body === null ? null : parsePid(body);
+}
+
 async function isStale(path: string, body: string, opts: AcquireOptions): Promise<boolean> {
-  const holder = pidOf(body);
+  if (opts.maxAgeMs !== undefined && (await ageExceeds(path, opts.maxAgeMs))) return true;
+  const holder = parsePid(body);
   if (holder === null) return ageExceeds(path, LOCK_SETTLE_MS);
-  const isAlive = opts.isProcessAlive ?? defaultIsProcessAlive;
+  const isAlive = opts.isProcessAlive ?? processExists;
   if (!isAlive(holder)) return true;
   return opts.isForeignProcess !== undefined && (await opts.isForeignProcess(holder));
 }
@@ -121,7 +182,7 @@ async function stealLock(
   try {
     const current = await readBodySafe(path);
     if (current !== null && current !== staleBody) {
-      throw new LockBusyError(path, pidOf(current));
+      throw new LockBusyError(path, parsePid(current));
     }
     await unlink(path).catch(ignoreEnoent);
     return await createLockOrBusy(path, pid);
@@ -144,7 +205,7 @@ async function acquireStealGuard(
   const guardBody = await readBodySafe(guardPath);
   if (guardBody === null) return createLockOrBusy(guardPath, pid, path);
   if (!(await isAbandonedGuard(guardPath, guardBody, opts))) {
-    throw new LockBusyError(path, await readPidSafe(path));
+    throw new LockBusyError(path, await readLockHolderPid(path));
   }
   if ((await readBodySafe(guardPath)) === guardBody) await unlink(guardPath).catch(ignoreEnoent);
   return createLockOrBusy(guardPath, pid, path);
@@ -155,8 +216,8 @@ async function isAbandonedGuard(
   guardBody: string,
   opts: AcquireOptions,
 ): Promise<boolean> {
-  const holder = pidOf(guardBody);
-  const isAlive = opts.isProcessAlive ?? defaultIsProcessAlive;
+  const holder = parsePid(guardBody);
+  const isAlive = opts.isProcessAlive ?? processExists;
   if (holder !== null && !isAlive(holder)) return true;
   return ageExceeds(guardPath, LOCK_SETTLE_MS);
 }
@@ -177,29 +238,8 @@ async function readBodySafe(path: string): Promise<string | null> {
   }
 }
 
-function pidOf(body: string): number | null {
-  const n = Number.parseInt(body.trim(), 10);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
 function tokenOf(body: string): string | null {
   return body.split("\n")[1] ?? null;
-}
-
-async function readPidSafe(path: string): Promise<number | null> {
-  const body = await readBodySafe(path);
-  return body === null ? null : pidOf(body);
-}
-
-function defaultIsProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // EPERM means the process exists but we lack permission — still "alive".
-    return code === "EPERM";
-  }
 }
 
 function ignoreEnoent(err: unknown): void {

@@ -1,6 +1,7 @@
 export {
-  isProcessAlive,
+  canSignalProcess,
   killProcessTree,
+  processExists,
   readProcessInfo,
   type KillProcessTreeOptions,
   type ProcessInfo,

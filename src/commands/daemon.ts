@@ -1,19 +1,22 @@
-import { readFile } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
 import {
   DaemonClient,
   DaemonRpcError,
   ManagerDaemon,
   ensureDaemonRunning,
   isDaemonReachable,
-  getDaemonLockPath,
-  getDaemonPidPath,
+  daemonFilesFor,
   getDaemonSocketPath,
   netTransport,
   LockBusyError,
   DaemonAlreadyRunningError,
+  readPidFile,
+  recordedPids,
+  terminateDaemon,
+  waitForExit,
   type StatusResult,
+  type TerminateResult,
 } from "../daemon/index.js";
+import { processExists } from "../process/index.js";
 import { loadBridgeOwnedConfig } from "../config/bridge-config.js";
 import { DaemonConfigSchema } from "../config/schema.js";
 import { APP_NAME } from "../constants.js";
@@ -28,7 +31,6 @@ export interface RestartUpstreamOpts {
 }
 
 const STOP_TIMEOUT_MS = 2_000;
-const STOP_POLL_MS = 50;
 
 export async function runDaemonCommand(action: DaemonAction): Promise<number> {
   switch (action) {
@@ -52,10 +54,10 @@ export async function runDaemonInternal(): Promise<number> {
     (await loadBridgeOwnedConfig().catch(() => null))?._bridge?.daemon ?? {},
   );
 
+  const socketPath = getDaemonSocketPath();
   const manager = new ManagerDaemon({
-    socketPath: getDaemonSocketPath(),
-    pidPath: getDaemonPidPath(),
-    lockPath: getDaemonLockPath(),
+    socketPath,
+    ...daemonFilesFor(socketPath),
     idleMs: cfg.idleMs,
     graceMs: cfg.graceMs,
     killGraceMs: cfg.killGraceMs,
@@ -112,26 +114,13 @@ async function runStart(): Promise<number> {
 
 async function runStop(): Promise<number> {
   const reachable = await isDaemonReachable(getDaemonSocketPath());
-  const pidBefore = await readPidfile();
+  const recorded = await recordedDaemonPids();
 
   if (!reachable) {
-    process.stderr.write("daemon not running\n");
-    // Wedged daemon: alive pid but no IPC. Send SIGTERM and escalate to
-    // SIGKILL after the same window the reachable path uses.
-    if (pidBefore !== null && isAlive(pidBefore)) {
-      try {
-        process.kill(pidBefore, "SIGTERM");
-      } catch {
-        /* ignore */
-      }
-      await waitForDeath(pidBefore, STOP_TIMEOUT_MS);
-      if (isAlive(pidBefore)) {
-        try {
-          process.kill(pidBefore, "SIGKILL");
-        } catch {
-          /* ignore */
-        }
-      }
+    if (recorded.length === 0) process.stderr.write("daemon not running\n");
+    for (const pid of recorded) {
+      const result = await terminateDaemon(pid, { graceMs: STOP_TIMEOUT_MS, allowUnidentified: true });
+      reportStop(pid, result, `unresponsive daemon ${pid} stopped`);
     }
     return 0;
   }
@@ -153,20 +142,33 @@ async function runStop(): Promise<number> {
     client.close();
   }
 
-  if (pidBefore !== null) {
-    await waitForDeath(pidBefore, STOP_TIMEOUT_MS);
-    if (isAlive(pidBefore)) {
-      try {
-        process.kill(pidBefore, "SIGKILL");
-      } catch {
-        /* ignore */
-      }
-      process.stderr.write("daemon force-stopped\n");
-      return 0;
-    }
+  const lingering: number[] = [];
+  for (const pid of recorded) {
+    if (!(await waitForExit(pid, STOP_TIMEOUT_MS))) lingering.push(pid);
   }
-  process.stderr.write("daemon stopped\n");
+  if (lingering.length === 0) process.stderr.write("daemon stopped\n");
+  for (const pid of lingering) {
+    reportStop(pid, await terminateDaemon(pid, { graceMs: 0, allowUnidentified: true }), `daemon ${pid} force-stopped`);
+  }
   return 0;
+}
+
+async function recordedDaemonPids(): Promise<number[]> {
+  const pids = await recordedPids(daemonFilesFor(getDaemonSocketPath()));
+  return pids.filter((pid) => pid !== process.pid);
+}
+
+function reportStop(pid: number, result: TerminateResult, stoppedMessage: string): void {
+  switch (result) {
+    case "terminated":
+      process.stderr.write(`${stoppedMessage}\n`);
+      return;
+    case "not_ours":
+      process.stderr.write(`pid ${pid} recorded for the daemon is a different program; not signalling it\n`);
+      return;
+    case "failed":
+      process.stderr.write(`could not stop pid ${pid} recorded for the daemon\n`);
+  }
 }
 
 async function runStatus(): Promise<number> {
@@ -188,8 +190,8 @@ async function runStatus(): Promise<number> {
     client.close();
   }
 
-  const pid = await readPidfile();
-  if (pid !== null && isAlive(pid)) {
+  const pid = await readPidFile(daemonFilesFor(getDaemonSocketPath()).pidPath);
+  if (pid !== null && processExists(pid)) {
     process.stdout.write(
       JSON.stringify({ running: true, pid, uptime: null }, null, 2) + "\n",
     );
@@ -267,33 +269,6 @@ function makeClient(opts: { rpcTimeoutMs?: number; connectTimeoutMs?: number } =
     rpcTimeoutMs: opts.rpcTimeoutMs,
     connectTimeoutMs: opts.connectTimeoutMs,
   });
-}
-
-async function readPidfile(): Promise<number | null> {
-  try {
-    const text = await readFile(getDaemonPidPath(), "utf-8");
-    const n = Number.parseInt(text.trim(), 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
-  } catch {
-    return null;
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function waitForDeath(pid: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isAlive(pid)) return;
-    await delay(STOP_POLL_MS);
-  }
 }
 
 function errMsg(err: unknown): string {

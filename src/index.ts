@@ -129,20 +129,17 @@ program
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
-      // Bootstrap the manager daemon ahead of upstream connects so the first
-      // STDIO connects find it already serving. HTTP-only configs skip this;
-      // the daemon is a no-op for them.
+      // Start the manager daemon early so the first STDIO connects find it
+      // serving, without holding up the client: recovering a wedged daemon
+      // can outlast the client's initialize timeout, and each STDIO upstream
+      // keeps retrying on its own. HTTP-only configs skip this.
       const hasStdio = Object.values(upstreams).some(isStdioServer);
       if (hasStdio) {
-        try {
-          await ensureDaemonRunning();
-        } catch (err) {
+        ensureDaemonRunning().catch((err: unknown) => {
           logger.error(`failed to start manager daemon: ${err instanceof Error ? err.message : String(err)}`, {
             component: "bridge",
           });
-          process.exitCode = 1;
-          return;
-        }
+        });
       }
 
       upstreamManager = new UpstreamManager({

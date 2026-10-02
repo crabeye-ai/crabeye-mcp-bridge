@@ -60,6 +60,7 @@ export type {
   LivenessFailureKind,
 } from "./liveness-supervisor.js";
 export {
+  daemonFilesFor,
   getDaemonRunDir,
   getDaemonSocketPath,
   getDaemonPidPath,
@@ -76,10 +77,13 @@ export { acquireLock, LockBusyError } from "./lockfile.js";
 export type { LockHandle } from "./lockfile.js";
 export { netTransport } from "./net-transport.js";
 export {
+  DaemonUnreachableError,
+  DaemonUnresponsiveError,
   ensureDaemonRunning,
   isDaemonReachable,
   resolveEntryScript,
   type EnsureAttemptOptions,
+  type UnresponsiveReason,
 } from "./bootstrap.js";
 export { TokenRewriter, type InnerId, type InboundRouting } from "./token-rewriter.js";
 export { ChildHandle, BackpressureError, type ChildHandleOptions } from "./child-handle.js";
@@ -90,3 +94,10 @@ export type {
   DaemonClientOptions,
   FrameChannel,
 } from "./transport.js";
+export {
+  readPidFile,
+  recordedPids,
+  terminateDaemon,
+  waitForExit,
+  type TerminateResult,
+} from "./daemon-process.js";

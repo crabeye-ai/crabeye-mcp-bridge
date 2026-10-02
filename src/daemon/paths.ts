@@ -1,5 +1,5 @@
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   APP_NAME,
   DAEMON_BASE,
@@ -39,6 +39,19 @@ export function getDaemonPidPath(): string {
 
 export function getDaemonLockPath(): string {
   return join(getDaemonRunDir(), DAEMON_LOCK_FILENAME);
+}
+
+export interface DaemonFiles {
+  lockPath: string;
+  pidPath: string;
+}
+
+export function daemonFilesFor(socketPath: string): DaemonFiles {
+  if (process.platform === "win32") return { lockPath: getDaemonLockPath(), pidPath: getDaemonPidPath() };
+  return {
+    lockPath: join(dirname(socketPath), DAEMON_LOCK_FILENAME),
+    pidPath: join(dirname(socketPath), DAEMON_PID_FILENAME),
+  };
 }
 
 export function getProcessTrackerPath(): string {

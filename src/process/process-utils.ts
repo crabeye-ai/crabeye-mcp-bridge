@@ -7,7 +7,9 @@ const execFileAsync = promisify(execFile);
 const POLL_INTERVAL_MS = 100;
 const PS_TIMEOUT_MS = 2000;
 const POWERSHELL_TIMEOUT_MS = 5000;
-const TASKKILL_TIMEOUT_MS = 5000;
+export const TASKKILL_TIMEOUT_MS = 5000;
+
+export const READ_PROCESS_INFO_MAX_MS = Math.max(2 * PS_TIMEOUT_MS, POWERSHELL_TIMEOUT_MS);
 
 export interface KillProcessTreeOptions {
   /** Time to wait after the graceful signal before escalating to force-kill. */
@@ -28,13 +30,27 @@ export interface ProcessInfo {
  * Send `process.kill(pid, 0)` to test whether the process exists and we can
  * signal it. Works on POSIX and Windows.
  */
-export function isProcessAlive(pid: number): boolean {
+export function canSignalProcess(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch {
     return false;
   }
+}
+
+export function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export function parsePid(text: string): number | null {
+  const n = Number.parseInt(text.trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /**
@@ -51,14 +67,14 @@ export async function killProcessTree(
   const forceMs = options.forceMs ?? 2000;
   const pollMs = options.pollMs ?? POLL_INTERVAL_MS;
 
-  if (!isProcessAlive(pid)) return true;
+  if (!canSignalProcess(pid)) return true;
 
   if (process.platform === "win32") {
     await runTaskkill(pid, false).catch(() => {});
     if (await waitForExit(pid, gracefulMs, pollMs)) return true;
     await runTaskkill(pid, true).catch(() => {});
     await waitForExit(pid, forceMs, pollMs);
-    return !isProcessAlive(pid);
+    return !canSignalProcess(pid);
   }
 
   // POSIX: process group first (catches grandchildren when the child was
@@ -68,7 +84,7 @@ export async function killProcessTree(
 
   sendPosixSignal(pid, "SIGKILL");
   await waitForExit(pid, forceMs, pollMs);
-  return !isProcessAlive(pid);
+  return !canSignalProcess(pid);
 }
 
 /**
@@ -238,13 +254,13 @@ async function waitForExit(
   timeoutMs: number,
   pollMs: number,
 ): Promise<boolean> {
-  if (timeoutMs <= 0) return !isProcessAlive(pid);
+  if (timeoutMs <= 0) return !canSignalProcess(pid);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return true;
+    if (!canSignalProcess(pid)) return true;
     await sleep(pollMs);
   }
-  return !isProcessAlive(pid);
+  return !canSignalProcess(pid);
 }
 
 function sleep(ms: number): Promise<void> {

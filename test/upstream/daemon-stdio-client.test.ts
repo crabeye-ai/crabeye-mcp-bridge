@@ -24,7 +24,7 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     if (server !== null) {
       await new Promise<void>((resolve) => server!.close(() => resolve()));
     }
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   function startCapturingServer(captured: unknown[]): Promise<void> {
@@ -220,7 +220,7 @@ describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () 
       if (server !== null) {
         await new Promise<void>((resolve) => server!.close(() => resolve()));
       }
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     },
     30000,
   );
@@ -383,7 +383,7 @@ describe.skipIf(isWindows)("DaemonStdioTransport — supervisor wiring (Phase E)
     if (server !== null) {
       await new Promise<void>((resolve) => server!.close(() => resolve()));
     }
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   it("synthesizes upstream_restarted errors for in-flight non-retryable requests on respawnFailed", async () => {

@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
 import {
-  isProcessAlive as defaultIsProcessAlive,
+  canSignalProcess as defaultCanSignalProcess,
   killProcessTree as defaultKillProcessTree,
   readProcessInfo as defaultReadProcessInfo,
   type KillProcessTreeOptions,
@@ -68,7 +68,7 @@ export class ProcessTracker {
     this._logger = options.logger ?? createNoopLogger();
     this._waitMs = options._waitMs;
     this._kill = options._killProcessTree ?? defaultKillProcessTree;
-    this._alive = options._isProcessAlive ?? defaultIsProcessAlive;
+    this._alive = options._isProcessAlive ?? defaultCanSignalProcess;
     this._readInfo = options._readProcessInfo ?? defaultReadProcessInfo;
   }
 

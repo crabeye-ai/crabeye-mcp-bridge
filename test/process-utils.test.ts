@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
 import {
-  isProcessAlive,
+  canSignalProcess,
   killProcessTree,
   readProcessInfo,
 } from "../src/process/process-utils.js";
@@ -9,16 +9,16 @@ import {
 const isWindows = process.platform === "win32";
 
 describe("process-utils", () => {
-  describe("isProcessAlive", () => {
+  describe("canSignalProcess", () => {
     it("returns true for the current process", () => {
-      expect(isProcessAlive(process.pid)).toBe(true);
+      expect(canSignalProcess(process.pid)).toBe(true);
     });
 
     it("returns false for a definitely-gone PID", () => {
       // PID 0 is the kernel scheduler on Linux, "swapper" on BSD; signal 0
       // either succeeds (kernel) or returns ESRCH/EPERM. We use a high pid
       // that is essentially guaranteed to be free.
-      expect(isProcessAlive(0x7fff_fffe)).toBe(false);
+      expect(canSignalProcess(0x7fff_fffe)).toBe(false);
     });
   });
 
@@ -43,7 +43,7 @@ describe("process-utils", () => {
         child.once("error", reject);
       });
       const pid = child.pid!;
-      expect(isProcessAlive(pid)).toBe(true);
+      expect(canSignalProcess(pid)).toBe(true);
 
       const closed = new Promise<void>((resolve) => {
         child.once("close", () => resolve());
@@ -60,7 +60,7 @@ describe("process-utils", () => {
       // child_process 'close' event before asserting aliveness.
       expect(dead).toBe(true);
       await closed;
-      expect(isProcessAlive(pid)).toBe(false);
+      expect(canSignalProcess(pid)).toBe(false);
     }, 10_000);
 
     it("returns true immediately for an already-dead PID", async () => {
