@@ -8,9 +8,11 @@
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { EventEmitter } from "node:events";
-import { ensureDaemonRunning } from "./bootstrap.js";
+import { ensureDaemonRunning, isDaemonReachable, type EnsureAttemptOptions } from "./bootstrap.js";
 import { DaemonClient, DaemonRpcError } from "./client.js";
 import { acquireLock, LockBusyError, type LockHandle } from "./lockfile.js";
+import { isDaemonCommandLine } from "./daemon-identity.js";
+import { readProcessInfo } from "../process/process-utils.js";
 import { netTransport } from "./net-transport.js";
 import {
   ERROR_CODE_RPC_TIMEOUT,
@@ -42,7 +44,7 @@ export interface DaemonLivenessSupervisorOpts {
   /** Test seam: disable the force-respawn flow so we can unit-test detection alone. */
   _disableForceRespawnForTest?: boolean;
   /** Test seam: pluggable spawn-detached. Returns once the new daemon is reachable. */
-  _ensureDaemonRunning?: () => Promise<void>;
+  _ensureDaemonRunning?: (opts?: EnsureAttemptOptions) => Promise<void>;
 }
 
 export class DaemonLivenessSupervisor extends EventEmitter {
@@ -55,6 +57,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
   private failed = false;
   private pingsSent = 0;
   private pongsReceived = 0;
+  private connectedDaemonPid: number | null = null;
   private respawnPromise: Promise<void> | null = null;
   private sigkillsIssued = 0;
   private daemonRespawns = 0;
@@ -66,15 +69,23 @@ export class DaemonLivenessSupervisor extends EventEmitter {
 
   async connect(): Promise<void> {
     if (this.closed) throw new Error("supervisor closed");
-    this.client = new DaemonClient({
+    const client = new DaemonClient({
       socketPath: this.opts.socketPath,
       transport: netTransport,
       rpcTimeoutMs: this.opts.rpcTimeoutMs,
       connectTimeoutMs: this.opts.rpcTimeoutMs,
       onNotification: (n) => this.opts.onNotification?.(n),
     });
-    this.client.onClose(() => this.handleSocketClose());
-    await this.client.connect();
+    this.client = client;
+    client.onClose(() => {
+      if (this.client === client) this.handleSocketClose();
+    });
+    await client.connect();
+    if (this.closed) {
+      client.close();
+      throw new Error("supervisor closed");
+    }
+    this.connectedDaemonPid = await this.readManagerPid();
     this.startHeartbeat();
   }
 
@@ -151,10 +162,12 @@ export class DaemonLivenessSupervisor extends EventEmitter {
     if (typeof watchdog.unref === "function") watchdog.unref();
     this.pendingPings.set(seq, watchdog);
 
-    this.client.call("PING", { seq }).then(
+    const client = this.client;
+    client.call("PING", { seq }).then(
       (result) => {
         const r = result as PingResult | undefined;
         if (r?.seq !== seq) return; // stale/duplicate
+        if (typeof r.pid === "number" && this.client === client) this.connectedDaemonPid = r.pid;
         const t = this.pendingPings.get(seq);
         if (t !== undefined) {
           clearTimeout(t);
@@ -166,6 +179,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
         // RPC-level failure (timeout / closed). Treat per-RPC timeout as a
         // dedicated `rpc_timeout` liveness failure; socket-close is handled
         // separately via handleSocketClose.
+        if (this.client !== client) return;
         if (err instanceof DaemonRpcError && err.code === ERROR_CODE_RPC_TIMEOUT) {
           this.failLiveness({
             kind: "rpc_timeout",
@@ -194,47 +208,55 @@ export class DaemonLivenessSupervisor extends EventEmitter {
   }
 
   /**
-   * Lock-first respawn: try `acquireLock({ stealStale: true })` first. If the
-   * previous daemon's lockholder pid is dead the steal succeeds and no kill is
-   * needed. Only when the lock is held by a live pid do we read `manager.pid`
-   * and SIGKILL — gated by `looksLikeOurDaemon` to mitigate the recycled-pid
-   * hazard inherent in the file-based pidcheck.
+   * When the connection dropped but a daemon still answers on the socket (an
+   * orphaned daemon stepped down for its successor), reconnect without
+   * touching the lock. Otherwise respawn lock-first: try
+   * `acquireLock({ stealStale: true })`; if the previous daemon's lockholder
+   * pid is dead the steal succeeds and no kill is needed. When the lock is
+   * held by a live pid, SIGKILL only the daemon this supervisor was connected
+   * to (its pid as reported by PONG, else the pidfile at connect time; never
+   * a successor), gated by `looksLikeOurDaemon` against recycled pids, then
+   * wait for the lock or for any daemon to answer.
    */
   private async forceRespawn(reason: LivenessFailureKind): Promise<void> {
     try {
+      if (reason === "socket_close" && (await isDaemonReachable(this.opts.socketPath))) {
+        await this.reconnect(reason);
+        return;
+      }
       let handle = await this.tryAcquireLockOnce();
       if (handle === null) {
-        const pid = await this.readManagerPid();
-        if (pid !== null) {
-          const killed = await this.killPid(pid);
+        if (this.connectedDaemonPid !== null) {
+          const killed = await this.killPid(this.connectedDaemonPid);
           if (killed) this.sigkillsIssued++;
         }
         await delay(50, undefined, { ref: false });
         handle = await this.acquireLockBounded();
-        if (handle === null) {
-          throw new Error(
-            "lock contention: another bridge owns the daemon respawn",
-          );
-        }
       }
-      await handle.release();
-      if (this.opts._ensureDaemonRunning !== undefined) {
-        await this.opts._ensureDaemonRunning();
-      } else {
-        await ensureDaemonRunning({ socketPath: this.opts.socketPath });
-      }
+      await handle?.release();
+      if (this.closed) return;
+      const ensure =
+        this.opts._ensureDaemonRunning ??
+        ((opts) => ensureDaemonRunning({ socketPath: this.opts.socketPath, ...opts }));
+      await ensure({ freshAttempt: true });
+      if (this.closed) return;
       this.daemonRespawns++;
-      this.client = null;
-      await this.connect();
-      // Clear the failed flag only AFTER connect succeeds. Setting it earlier
-      // would let a socket-close fired during connect() trip a re-entry into
-      // failLiveness that gets masked by `respawning`, leaving the supervisor
-      // wedged.
-      this.failed = false;
-      this.emit("respawned", reason);
+      await this.reconnect(reason);
     } catch (err) {
       this.emit("respawnFailed", err);
     }
+  }
+
+  private async reconnect(reason: LivenessFailureKind): Promise<void> {
+    this.client?.close();
+    this.client = null;
+    await this.connect();
+    // Clear the failed flag only AFTER connect succeeds. Setting it earlier
+    // would let a socket-close fired during connect() trip a re-entry into
+    // failLiveness that gets masked by `respawnPromise`, leaving the
+    // supervisor wedged.
+    this.failed = false;
+    this.emit("respawned", reason);
   }
 
   private async tryAcquireLockOnce(): Promise<LockHandle | null> {
@@ -253,7 +275,8 @@ export class DaemonLivenessSupervisor extends EventEmitter {
   private async acquireLockBounded(): Promise<LockHandle | null> {
     const deadline = Date.now() + this.opts.respawnLockWaitMs;
     let handle = await this.tryAcquireLockOnce();
-    while (handle === null && Date.now() < deadline) {
+    while (handle === null && Date.now() < deadline && !this.closed) {
+      if (await isDaemonReachable(this.opts.socketPath)) return null;
       await delay(100, undefined, { ref: false });
       handle = await this.tryAcquireLockOnce();
     }
@@ -272,7 +295,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
 
   private async killPid(pid: number): Promise<boolean> {
     // Defense in depth against a recycled-pid hazard: never SIGKILL self,
-    // and refuse to kill a pid whose binary doesn't look like a Node daemon.
+    // and refuse to kill a pid whose command line isn't a crabeye daemon.
     // The lockfile-based liveness check (`process.kill(pid, 0)`) cannot
     // distinguish a recycled pid from the original daemon, so we cross-check
     // the process command line before signalling. Returns true iff the
@@ -301,32 +324,7 @@ export class DaemonLivenessSupervisor extends EventEmitter {
   }
 }
 
-/**
- * Heuristic: verify pid's command-line argv looks like a Node process invoking
- * a `daemon` subcommand. Returns false on any error so we fail closed.
- *
- * Linux: read `/proc/<pid>/cmdline` (NUL-separated argv).
- * Other platforms (macOS, BSD): shell out to `ps -p <pid> -o args=`.
- */
 async function looksLikeOurDaemon(pid: number): Promise<boolean> {
-  try {
-    let cmdline: string;
-    if (process.platform === "linux") {
-      cmdline = (await readFile(`/proc/${pid}/cmdline`, "utf-8")).replace(/\0/g, " ");
-    } else {
-      const { spawn } = await import("node:child_process");
-      cmdline = await new Promise<string>((resolve, reject) => {
-        const c = spawn("ps", ["-p", String(pid), "-o", "args="], { stdio: ["ignore", "pipe", "ignore"] });
-        let buf = "";
-        c.stdout.on("data", (d: Buffer) => { buf += d.toString("utf-8"); });
-        c.on("exit", () => resolve(buf));
-        c.on("error", reject);
-      });
-    }
-    const lower = cmdline.toLowerCase();
-    return /\bnode\b/.test(lower) && /\bdaemon\b/.test(lower);
-  } catch {
-    return false;
-  }
+  const info = await readProcessInfo(pid);
+  return info !== null && isDaemonCommandLine(info.cmdline);
 }
-

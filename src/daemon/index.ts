@@ -1,4 +1,4 @@
-export { ManagerDaemon } from "./manager.js";
+export { ManagerDaemon, DaemonAlreadyRunningError } from "./manager.js";
 export type { ManagerOptions, ChildGroup, SessionAttachment } from "./manager.js";
 export { DaemonClient, DaemonRpcError } from "./client.js";
 export type { DaemonClientOpts } from "./client.js";
@@ -32,6 +32,7 @@ export {
   ERROR_CODE_INVALID_REQUEST,
   ERROR_CODE_NOT_IMPLEMENTED,
   ERROR_CODE_RPC_TIMEOUT,
+  ERROR_CODE_SESSION_IN_USE,
   ERROR_CODE_SESSION_NOT_FOUND,
   ERROR_CODE_SPAWN_FAILED,
   ERROR_CODE_TOO_MANY_CONNECTIONS,
@@ -74,7 +75,12 @@ export {
 export { acquireLock, LockBusyError } from "./lockfile.js";
 export type { LockHandle } from "./lockfile.js";
 export { netTransport } from "./net-transport.js";
-export { ensureDaemonRunning, resolveEntryScript } from "./bootstrap.js";
+export {
+  ensureDaemonRunning,
+  isDaemonReachable,
+  resolveEntryScript,
+  type EnsureAttemptOptions,
+} from "./bootstrap.js";
 export { TokenRewriter, type InnerId, type InboundRouting } from "./token-rewriter.js";
 export { ChildHandle, BackpressureError, type ChildHandleOptions } from "./child-handle.js";
 export type {

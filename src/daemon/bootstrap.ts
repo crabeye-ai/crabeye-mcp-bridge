@@ -5,49 +5,85 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { DaemonClient } from "./client.js";
 import { getDaemonSocketPath } from "./paths.js";
-import { netTransport } from "./net-transport.js";
+import { isServing, netTransport } from "./net-transport.js";
+import { DAEMON_LAUNCH_ARGS } from "./daemon-identity.js";
 
 /**
  * Backoff schedule for "wait for daemon to be reachable after spawn".
- * Cumulative: ~2.75 s. Daemon binds the IPC socket synchronously after the
- * lockfile and pidfile, so first or second probe usually wins.
+ * Cumulative: ~2.75 s. The daemon answers once it has reaped leaked
+ * children; while its socket accepts connections but it hasn't answered yet,
+ * probing continues for up to STARTING_DAEMON_WAIT_MS.
  */
 const CONNECT_BACKOFF_MS = [50, 200, 500, 1000, 1000] as const;
+const STARTING_DAEMON_WAIT_MS = 60_000;
+const STARTING_DAEMON_POLL_MS = 1_000;
 
-/**
- * Probe + spawn-on-miss. Tries the daemon socket; if unreachable, spawns the
- * detached daemon process and polls until it answers STATUS or the backoff
- * exhausts. Concurrent bridges that race here lose the lock contest inside
- * `runDaemonInternal` and harmlessly fall through to the survivor.
- */
-export async function ensureDaemonRunning(opts: {
+export interface EnsureAttemptOptions {
+  freshAttempt?: boolean;
+}
+
+export interface EnsureDaemonOptions extends EnsureAttemptOptions {
   socketPath?: string;
-  /** Override for tests: skip the actual spawn. */
-  spawnEntry?: string;
-} = {}): Promise<void> {
-  const socketPath = opts.socketPath ?? getDaemonSocketPath();
-  if (await isReachable(socketPath)) return;
+  launch?: () => void;
+}
 
-  const entry = opts.spawnEntry ?? (await resolveEntryScript());
-  const child = spawn(process.execPath, [entry, "daemon", "--internal-launch"], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
-  });
-  child.unref();
-  child.on("error", () => {
-    /* surfaced by the unreachable-after-backoff path below */
-  });
+interface PendingEnsure {
+  promise: Promise<void>;
+  fresh: boolean;
+}
+
+const pendingEnsures = new Map<string, PendingEnsure>();
+
+export function ensureDaemonRunning(opts: EnsureDaemonOptions = {}): Promise<void> {
+  const socketPath = opts.socketPath ?? getDaemonSocketPath();
+  const fresh = opts.freshAttempt ?? false;
+  const pending = pendingEnsures.get(socketPath);
+  if (pending && (pending.fresh || !fresh)) return pending.promise;
+  const attempt: PendingEnsure = { fresh, promise: Promise.resolve() };
+  const previous = pending?.promise.catch(() => {}) ?? Promise.resolve();
+  attempt.promise = previous
+    .then(() => probeOrLaunch(socketPath, opts))
+    .finally(() => {
+      if (pendingEnsures.get(socketPath) === attempt) pendingEnsures.delete(socketPath);
+    });
+  pendingEnsures.set(socketPath, attempt);
+  return attempt.promise;
+}
+
+async function probeOrLaunch(socketPath: string, opts: EnsureDaemonOptions): Promise<void> {
+  if (await isDaemonReachable(socketPath)) return;
+
+  const launch = opts.launch ?? (await detachedDaemonLauncher());
+  launch();
 
   for (const wait of CONNECT_BACKOFF_MS) {
     await delay(wait);
-    if (await isReachable(socketPath)) return;
+    if (await isDaemonReachable(socketPath)) return;
+  }
+
+  const deadline = Date.now() + STARTING_DAEMON_WAIT_MS;
+  while (Date.now() < deadline && (await isServing(socketPath))) {
+    if (await isDaemonReachable(socketPath)) return;
+    await delay(STARTING_DAEMON_POLL_MS);
   }
 
   throw new Error("daemon did not become reachable within timeout");
 }
 
-async function isReachable(socketPath: string): Promise<boolean> {
+async function detachedDaemonLauncher(): Promise<() => void> {
+  const entry = await resolveEntryScript();
+  return () => {
+    const child = spawn(process.execPath, [entry, ...DAEMON_LAUNCH_ARGS], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+    child.on("error", () => {});
+  };
+}
+
+export async function isDaemonReachable(socketPath: string): Promise<boolean> {
   const client = new DaemonClient({
     socketPath,
     transport: netTransport,

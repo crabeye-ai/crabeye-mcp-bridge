@@ -5,11 +5,13 @@ import {
   DaemonRpcError,
   ManagerDaemon,
   ensureDaemonRunning,
+  isDaemonReachable,
   getDaemonLockPath,
   getDaemonPidPath,
   getDaemonSocketPath,
   netTransport,
   LockBusyError,
+  DaemonAlreadyRunningError,
   type StatusResult,
 } from "../daemon/index.js";
 import { loadBridgeOwnedConfig } from "../config/bridge-config.js";
@@ -68,14 +70,8 @@ export async function runDaemonInternal(): Promise<number> {
   try {
     await manager.start();
   } catch (err) {
-    if (err instanceof LockBusyError) {
-      // Another daemon is already running. Concurrent launchers fall through
-      // to "connect to the survivor". Surface a diagnostic so a stale-lock
-      // condition (PID file points at a dead pid that lockfile mis-detected
-      // as live) is debuggable instead of silently exiting 0.
-      process.stderr.write(
-        `daemon: lock held by pid ${err.heldByPid ?? "?"} at ${err.path}; deferring to existing daemon\n`,
-      );
+    if (err instanceof LockBusyError || err instanceof DaemonAlreadyRunningError) {
+      process.stderr.write(`daemon: ${err.message}; deferring to existing daemon\n`);
       return 0;
     }
     process.stderr.write(`daemon failed to start: ${errMsg(err)}\n`);
@@ -99,7 +95,7 @@ export async function runDaemonInternal(): Promise<number> {
 }
 
 async function runStart(): Promise<number> {
-  if (await isDaemonReachable()) {
+  if (await isDaemonReachable(getDaemonSocketPath())) {
     process.stderr.write("daemon already running\n");
     return 0;
   }
@@ -115,7 +111,7 @@ async function runStart(): Promise<number> {
 }
 
 async function runStop(): Promise<number> {
-  const reachable = await isDaemonReachable();
+  const reachable = await isDaemonReachable(getDaemonSocketPath());
   const pidBefore = await readPidfile();
 
   if (!reachable) {
@@ -259,19 +255,6 @@ export async function runRestartUpstream(opts: RestartUpstreamOpts): Promise<num
   } catch (err) {
     process.stderr.write(`restart-upstream: ${errMsg(err)}\n`);
     return 1;
-  } finally {
-    client.close();
-  }
-}
-
-async function isDaemonReachable(): Promise<boolean> {
-  const client = makeClient({ rpcTimeoutMs: 1_000, connectTimeoutMs: 1_000 });
-  try {
-    await client.connect();
-    await client.call("STATUS");
-    return true;
-  } catch {
-    return false;
   } finally {
     client.close();
   }

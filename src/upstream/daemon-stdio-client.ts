@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/client";
 import type { Transport, JSONRPCMessage } from "@modelcontextprotocol/client";
 import type { StdioServerConfig } from "../config/schema.js";
@@ -9,13 +10,19 @@ import {
   getDaemonPidPath,
   getDaemonSocketPath,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
+  DaemonRpcError,
+  ERROR_CODE_SESSION_IN_USE,
   type DaemonNotification,
+  type EnsureAttemptOptions,
 } from "../daemon/index.js";
 import type { LivenessFailureKind } from "../daemon/liveness-supervisor.js";
 import { createNoopLogger, type Logger } from "../logging/index.js";
 import { BaseUpstreamClient, upstreamClientInfo } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 import { IdempotencyTable } from "./idempotency-table.js";
+
+const OPEN_ATTEMPTS = 5;
+const OPEN_RETRY_MS = 100;
 
 export interface DaemonStdioClientOptions extends BaseUpstreamClientOptions {
   config: StdioServerConfig;
@@ -31,7 +38,7 @@ export interface DaemonStdioClientOptions extends BaseUpstreamClientOptions {
   /** Override for tests: alternative socket path. */
   _socketPath?: string;
   /** Override for tests: skips real spawn + socket probe. */
-  _ensureDaemon?: () => Promise<void>;
+  _ensureDaemon?: (opts?: EnsureAttemptOptions) => Promise<void>;
   /**
    * Per-RPC timeout (ms) on outbound daemon calls. Plumbed from
    * `_bridge.daemon.rpcTimeoutMs`. Defaults to 30_000 when omitted.
@@ -56,7 +63,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
   private readonly _config: StdioServerConfig;
   private readonly _resolveEnv: () => Promise<Record<string, string>>;
   private readonly _socketPath: string;
-  private readonly _ensureDaemon: () => Promise<void>;
+  private readonly _ensureDaemon: (opts?: EnsureAttemptOptions) => Promise<void>;
   private readonly _rpcTimeoutMs: number;
   private readonly _heartbeatMs: number;
   private readonly _respawnLockWaitMs: number;
@@ -74,9 +81,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
     this._socketPath = options._socketPath ?? getDaemonSocketPath();
     this._ensureDaemon =
       options._ensureDaemon ??
-      (async () => {
-        await ensureDaemonRunning({ socketPath: this._socketPath });
-      });
+      ((opts) => ensureDaemonRunning({ socketPath: this._socketPath, ...opts }));
     this._rpcTimeoutMs = options.rpcTimeoutMs ?? 30_000;
     this._heartbeatMs = options.heartbeatMs ?? 5_000;
     this._respawnLockWaitMs = options.respawnLockWaitMs ?? 60_000;
@@ -122,7 +127,7 @@ interface DaemonStdioTransportOpts {
   lockPath: string;
   /** Daemon pidfile path. Required for SIGKILL fallback in force-respawn. */
   pidPath: string;
-  ensureDaemon: () => Promise<void>;
+  ensureDaemon: (opts?: EnsureAttemptOptions) => Promise<void>;
   /** Per-RPC timeout for outbound daemon calls. */
   rpcTimeoutMs: number;
   /** Heartbeat cadence. */
@@ -236,6 +241,20 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
 
   /** Issue a fresh OPEN against the (possibly newly-respawned) supervisor. */
   private async _issueOpen(): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this._sendOpen();
+        return;
+      } catch (err) {
+        const previousConnectionStillAttached =
+          err instanceof DaemonRpcError && err.code === ERROR_CODE_SESSION_IN_USE;
+        if (!previousConnectionStillAttached || attempt >= OPEN_ATTEMPTS) throw err;
+        await delay(OPEN_RETRY_MS);
+      }
+    }
+  }
+
+  private async _sendOpen(): Promise<void> {
     await this.supervisor.call("OPEN", {
       sessionId: this._daemonSessionId,
       spec: {

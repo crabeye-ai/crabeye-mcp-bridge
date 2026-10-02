@@ -137,6 +137,7 @@ export const ERROR_CODE_TOO_MANY_CONNECTIONS = "too_many_connections";
 export const ERROR_CODE_RPC_TIMEOUT = "rpc_timeout";
 export const ERROR_CODE_BACKPRESSURE = "backpressure";
 export const ERROR_CODE_SESSION_NOT_FOUND = "session_not_found";
+export const ERROR_CODE_SESSION_IN_USE = "session_in_use";
 export const ERROR_CODE_SPAWN_FAILED = "spawn_failed";
 export const ERROR_CODE_INVALID_PARAMS = "invalid_params";
 export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
@@ -170,6 +171,7 @@ export interface PingParams {
 
 export interface PingResult {
   seq: number;
+  pid?: number;
 }
 /** Inner JSON-RPC error: drain window exceeded autoForkDrainTimeoutMs with old-child requests still pending. */
 export const INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT = -32002;

@@ -14,10 +14,10 @@ describe.skipIf(isWindows)("ManagerDaemon — PING handler", () => {
     await fx.stop();
   });
 
-  it("echoes the seq", async () => {
+  it("echoes the seq and reports the daemon pid", async () => {
     const params: PingParams = { seq: 42 };
     const res = (await fx.client.call("PING", params)) as PingResult;
-    expect(res).toEqual({ seq: 42 });
+    expect(res).toEqual({ seq: 42, pid: process.pid });
   });
 
   it("rejects non-number seq with invalid_params", async () => {

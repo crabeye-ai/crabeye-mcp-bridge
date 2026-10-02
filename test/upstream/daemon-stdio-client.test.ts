@@ -92,6 +92,88 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     expect(spec.protocolVersion).toBe(LATEST_PROTOCOL_VERSION);
   });
 
+  it("retries OPEN while the daemon still holds the session from the previous connection", async () => {
+    const opens: unknown[] = [];
+    server = createServer((sock: Socket) => {
+      const decoder = new FrameDecoder();
+      sock.on("data", (chunk: Buffer) => {
+        decoder.push(chunk);
+        for (;;) {
+          const frame = decoder.next();
+          if (frame === null) break;
+          const f = frame as { id?: string; method?: string };
+          if (f.method !== "OPEN" || typeof f.id !== "string") continue;
+          opens.push(frame);
+          if (opens.length === 1) {
+            sock.write(
+              encodeFrame({ id: f.id, error: { code: "session_in_use", message: "sessionId already in use" } }),
+            );
+          } else {
+            sock.write(encodeFrame({ id: f.id, result: { ok: true } }));
+            setImmediate(() => sock.end());
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server!.listen(sockPath, resolve));
+
+    const client = new DaemonStdioClient({
+      name: "retrying-upstream",
+      config: { command: "node", args: ["-e", "0"] } as never,
+      resolvedEnv: {},
+      _socketPath: sockPath,
+      _ensureDaemon: async () => {},
+    });
+    try {
+      await client.connect().catch(() => {});
+    } finally {
+      await client.close().catch(() => {});
+    }
+
+    const sessionOf = (frame: unknown) => (frame as { params: { sessionId: string } }).params.sessionId;
+    expect(opens.length).toBeGreaterThanOrEqual(2);
+    expect(sessionOf(opens[1])).toBe(sessionOf(opens[0]));
+  });
+
+  it("gives up on OPEN after a bounded number of session_in_use retries", async () => {
+    const opens: unknown[] = [];
+    server = createServer((sock: Socket) => {
+      const decoder = new FrameDecoder();
+      sock.on("data", (chunk: Buffer) => {
+        decoder.push(chunk);
+        for (;;) {
+          const frame = decoder.next();
+          if (frame === null) break;
+          const f = frame as { id?: string; method?: string };
+          if (f.method !== "OPEN" || typeof f.id !== "string") continue;
+          opens.push(frame);
+          sock.write(
+            encodeFrame({ id: f.id, error: { code: "session_in_use", message: "sessionId already in use" } }),
+          );
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server!.listen(sockPath, resolve));
+
+    const client = new DaemonStdioClient({
+      name: "stuck-upstream",
+      config: { command: "node", args: ["-e", "0"] } as never,
+      resolvedEnv: {},
+      _socketPath: sockPath,
+      _ensureDaemon: async () => {},
+      maxReconnectAttempts: 0,
+    });
+    try {
+      await expect(client.connect()).rejects.toThrow();
+    } finally {
+      await client.close().catch(() => {});
+    }
+
+    const sessionOf = (frame: unknown) => (frame as { params: { sessionId: string } }).params.sessionId;
+    expect(opens).toHaveLength(5);
+    expect(new Set(opens.map(sessionOf)).size).toBe(1);
+  });
+
   it('defaults sharing to "auto" when _bridge is absent', async () => {
     const captured: unknown[] = [];
     await startCapturingServer(captured);

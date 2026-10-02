@@ -104,10 +104,10 @@ Bridge has hot-reload: it reads the saved config and reconciles upstream session
 
 ## Failure handling
 
-* **Manager crash / SIGKILL.** Bridge detects via socket close, force-respawns the manager (lock-first to mitigate recycled-pid hazards), re-OPENs every session. Read-only in-flight requests (`tools/list`, `prompts/list`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/get`) silently retry; everything else surfaces `ERR_UPSTREAM_RESTARTED { reason: "daemon_respawn" }`.
+* **Manager crash / SIGKILL.** Bridge detects via socket close and, unless another manager already answers on the socket, force-respawns the manager (lock-first to mitigate recycled-pid hazards), then re-OPENs every session. Read-only in-flight requests (`tools/list`, `prompts/list`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/get`) silently retry; everything else surfaces `ERR_UPSTREAM_RESTARTED { reason: "daemon_respawn" }`.
 * **Stalled manager (RPC handler sleeps).** Bridge's heartbeat watchdog or per-RPC timeout fires; the bridge SIGKILLs the manager via `manager.pid` and respawns.
-* **Two-bridge race.** Loser blocks on `manager.lock` for up to `rpcTimeoutMs * 2` (60s default), then connects to whichever manager process ended up bound to the socket. On lock-wait timeout, the bridge surfaces `ERR_UPSTREAM_RESTARTED` and stops attempting.
-* **Orphaned children from a dead manager.** Each manager runs `ProcessTracker.reapStale()` on startup so children leaked by a previous crashed manager get reaped before the new manager binds the socket.
+* **Two-bridge race.** Loser blocks on `manager.lock` for up to `rpcTimeoutMs * 2` (60s default), then ensures a manager anyway and connects to whichever manager process ended up bound to the socket. Only one manager can own the socket; extras exit on their own.
+* **Orphaned children from a dead manager.** Each manager runs `ProcessTracker.reapStale()` on startup so children leaked by a previous crashed manager get reaped before the new manager serves any connection.
 
 ## Notification fan-out
 
@@ -188,4 +188,4 @@ Bridge force-respawns of the manager are **not** counted in `killedTotal` — by
   "sessionId": "<uuid>", "sessionsReopened": 1 }
 ```
 
-Each manager-stdio transport in the bridge owns one session, so each transport emits one log line per respawn it observes.
+Each manager-stdio transport in the bridge owns one session, so each transport emits one log line per respawn it observes. A bridge that loses its connection while another manager already answers on the socket (for example a duplicate manager stepping down for the one that owns the socket) reconnects and re-OPENs without respawning; that reconnect logs the same `force_respawn` line with `reason: "socket_close"`.

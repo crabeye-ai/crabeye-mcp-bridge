@@ -1,55 +1,36 @@
-import { open, readFile, unlink } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
-import type { FileHandle } from "node:fs/promises";
+import { link, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 
-/**
- * Cross-platform exclusive-create lockfile.
- *
- * `acquire()` succeeds only when the lockfile does not already exist; the
- * returned handle owns the file until `release()` (or process exit).
- *
- * On Unix this is `O_CREAT | O_EXCL | O_WRONLY` — atomic per POSIX. On
- * Windows, the same flag combination on Node's `fs` translates to a
- * `CreateFile(CREATE_NEW, FILE_SHARE_NONE)` which is also atomic.
- *
- * The held handle keeps an OS file descriptor open for the daemon's lifetime;
- * if the daemon crashes the OS releases the fd, but the on-disk file remains.
- * `acquire({ stealStale })` therefore probes a stale lock by checking whether
- * the recorded pid is alive and unlinks if not.
- */
+export const LOCK_SETTLE_MS = 60_000;
+const ABANDONED_STAGING_AGE_MS = 5_000;
+
 export class LockHandle {
+  private released = false;
+
   constructor(
     public readonly path: string,
-    private fh: FileHandle | null,
+    private readonly token: string,
   ) {}
 
+  async isHeld(): Promise<boolean> {
+    if (this.released) return false;
+    const body = await readBodySafe(this.path);
+    return body !== null && tokenOf(body) === this.token;
+  }
+
   async release(): Promise<void> {
-    if (this.fh === null) return;
-    const fh = this.fh;
-    this.fh = null;
-    try {
-      await fh.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await unlink(this.path);
-    } catch {
-      /* ignore — best-effort cleanup */
-    }
+    const held = await this.isHeld();
+    this.released = true;
+    if (held) await unlink(this.path).catch(() => {});
   }
 }
 
 export interface AcquireOptions {
-  /** Write this pid into the lockfile body for diagnostics + stale-detection. */
   pid?: number;
-  /**
-   * If acquire fails with EEXIST, read the recorded pid; if that process is
-   * not alive, unlink and retry once. Default: true.
-   */
   stealStale?: boolean;
-  /** Override for tests: probes whether a pid is alive. */
   isProcessAlive?: (pid: number) => boolean;
+  isForeignProcess?: (pid: number) => Promise<boolean>;
 }
 
 export class LockBusyError extends Error {
@@ -69,59 +50,145 @@ export async function acquireLock(
 ): Promise<LockHandle> {
   const pid = opts.pid ?? process.pid;
   const stealStale = opts.stealStale ?? true;
-  const isAlive = opts.isProcessAlive ?? defaultIsProcessAlive;
 
-  try {
-    return await openExclusive(path, pid);
-  } catch (err) {
-    if (!isEexist(err)) throw err;
-
-    if (!stealStale) {
-      throw new LockBusyError(path, await readPidSafe(path));
-    }
-
-    const heldBy = await readPidSafe(path);
-    if (heldBy !== null && isAlive(heldBy)) {
-      throw new LockBusyError(path, heldBy);
-    }
-
-    // Stale: holder is dead (or pid unreadable). Unlink and retry once. If we
-    // race with a concurrent acquirer, our second attempt will fail with
-    // EEXIST and we surface LockBusyError.
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      await unlink(path);
-    } catch (unlinkErr) {
-      if (!isEnoent(unlinkErr)) throw unlinkErr;
+      return await createLock(path, pid);
+    } catch (err) {
+      if (!isEexist(err)) throw err;
     }
-    try {
-      return await openExclusive(path, pid);
-    } catch (err2) {
-      if (isEexist(err2)) {
-        throw new LockBusyError(path, await readPidSafe(path));
-      }
-      throw err2;
+    const body = await readBodySafe(path);
+    if (body === null) continue;
+    if (!stealStale || !(await isStale(path, body, opts))) {
+      throw new LockBusyError(path, pidOf(body));
     }
+    return await stealLock(path, body, pid, opts);
+  }
+  throw new LockBusyError(path, await readPidSafe(path));
+}
+
+export async function sweepAbandonedLockFiles(lockPath: string): Promise<void> {
+  const prefix = `${basename(lockPath)}.`;
+  const dir = dirname(lockPath);
+  const entries = await readdir(dir).catch(() => [] as string[]);
+  for (const name of entries) {
+    if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+    const path = join(dir, name);
+    if (await ageExceeds(path, ABANDONED_STAGING_AGE_MS)) await unlink(path).catch(() => {});
   }
 }
 
-async function openExclusive(path: string, pid: number): Promise<LockHandle> {
-  const fh = await open(
-    path,
-    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
-    0o600,
-  );
-  await fh.writeFile(`${pid}\n`, "utf-8");
-  return new LockHandle(path, fh);
+async function createLock(path: string, pid: number): Promise<LockHandle> {
+  const token = randomUUID();
+  const body = `${pid}\n${token}\n`;
+  const staging = `${path}.${token}.tmp`;
+  await writeFile(staging, body, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+  try {
+    await link(staging, path);
+  } catch (err) {
+    if (!isHardLinkUnsupported(err)) throw err;
+    await writeFile(path, body, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+  } finally {
+    await unlink(staging).catch(() => {});
+  }
+  return new LockHandle(path, token);
 }
 
-async function readPidSafe(path: string): Promise<number | null> {
+async function createLockOrBusy(path: string, pid: number, reportedPath = path): Promise<LockHandle> {
   try {
-    const txt = await readFile(path, "utf-8");
-    const n = Number.parseInt(txt.trim(), 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    return await createLock(path, pid);
+  } catch (err) {
+    if (isEexist(err)) throw new LockBusyError(reportedPath, await readPidSafe(reportedPath));
+    throw err;
+  }
+}
+
+async function isStale(path: string, body: string, opts: AcquireOptions): Promise<boolean> {
+  const holder = pidOf(body);
+  if (holder === null) return ageExceeds(path, LOCK_SETTLE_MS);
+  const isAlive = opts.isProcessAlive ?? defaultIsProcessAlive;
+  if (!isAlive(holder)) return true;
+  return opts.isForeignProcess !== undefined && (await opts.isForeignProcess(holder));
+}
+
+async function stealLock(
+  path: string,
+  staleBody: string,
+  pid: number,
+  opts: AcquireOptions,
+): Promise<LockHandle> {
+  const guard = await acquireStealGuard(path, pid, opts);
+  try {
+    const current = await readBodySafe(path);
+    if (current !== null && current !== staleBody) {
+      throw new LockBusyError(path, pidOf(current));
+    }
+    await unlink(path).catch(ignoreEnoent);
+    return await createLockOrBusy(path, pid);
+  } finally {
+    await guard.release();
+  }
+}
+
+async function acquireStealGuard(
+  path: string,
+  pid: number,
+  opts: AcquireOptions,
+): Promise<LockHandle> {
+  const guardPath = `${path}.steal`;
+  try {
+    return await createLock(guardPath, pid);
+  } catch (err) {
+    if (!isEexist(err)) throw err;
+  }
+  const guardBody = await readBodySafe(guardPath);
+  if (guardBody === null) return createLockOrBusy(guardPath, pid, path);
+  if (!(await isAbandonedGuard(guardPath, guardBody, opts))) {
+    throw new LockBusyError(path, await readPidSafe(path));
+  }
+  if ((await readBodySafe(guardPath)) === guardBody) await unlink(guardPath).catch(ignoreEnoent);
+  return createLockOrBusy(guardPath, pid, path);
+}
+
+async function isAbandonedGuard(
+  guardPath: string,
+  guardBody: string,
+  opts: AcquireOptions,
+): Promise<boolean> {
+  const holder = pidOf(guardBody);
+  const isAlive = opts.isProcessAlive ?? defaultIsProcessAlive;
+  if (holder !== null && !isAlive(holder)) return true;
+  return ageExceeds(guardPath, LOCK_SETTLE_MS);
+}
+
+async function ageExceeds(path: string, ageMs: number): Promise<boolean> {
+  try {
+    return Date.now() - (await stat(path)).mtimeMs > ageMs;
+  } catch {
+    return false;
+  }
+}
+
+async function readBodySafe(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf-8");
   } catch {
     return null;
   }
+}
+
+function pidOf(body: string): number | null {
+  const n = Number.parseInt(body.trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function tokenOf(body: string): string | null {
+  return body.split("\n")[1] ?? null;
+}
+
+async function readPidSafe(path: string): Promise<number | null> {
+  const body = await readBodySafe(path);
+  return body === null ? null : pidOf(body);
 }
 
 function defaultIsProcessAlive(pid: number): boolean {
@@ -133,6 +200,15 @@ function defaultIsProcessAlive(pid: number): boolean {
     // EPERM means the process exists but we lack permission — still "alive".
     return code === "EPERM";
   }
+}
+
+function ignoreEnoent(err: unknown): void {
+  if (!isEnoent(err)) throw err;
+}
+
+function isHardLinkUnsupported(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP";
 }
 
 function isEexist(err: unknown): boolean {

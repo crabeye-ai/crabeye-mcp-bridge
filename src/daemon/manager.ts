@@ -3,13 +3,20 @@ import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import { createNoopLogger, type Logger } from "../logging/index.js";
 import { upstreamHash } from "../upstream/upstream-hash.js";
-import { acquireLock, LockBusyError, type LockHandle } from "./lockfile.js";
+import {
+  acquireLock,
+  LockBusyError,
+  sweepAbandonedLockFiles,
+  type LockHandle,
+} from "./lockfile.js";
+import { isForeignProcess } from "./daemon-identity.js";
 import { ChildHandle, BackpressureError } from "./child-handle.js";
 import type { CachedInit } from "./child-handle.js";
 import { getProcessTrackerPath } from "./paths.js";
 import { ProcessTracker } from "./process-tracker.js";
 import {
   ERROR_CODE_INVALID_PARAMS,
+  ERROR_CODE_SESSION_IN_USE,
   ERROR_CODE_INVALID_REQUEST,
   ERROR_CODE_SESSION_NOT_FOUND,
   ERROR_CODE_SPAWN_FAILED,
@@ -47,9 +54,11 @@ import { NotificationRouter } from "./notification-router.js";
 import { AutoForkOrchestrator } from "./auto-fork.js";
 import { Telemetry, type KilledReason } from "./telemetry.js";
 import { ChildPing } from "./child-ping.js";
-import type { DaemonServer, FrameChannel, Transport } from "./transport.js";
+import { SocketInUseError, type DaemonServer, type FrameChannel, type Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
+const PUBLICATION_CHECK_MS = 5_000;
+const MAX_EARLY_MESSAGES = 64;
 
 /** Bound on simultaneous IPC clients. Same-UID DoS hardening. */
 const DEFAULT_MAX_CONNECTIONS = 256;
@@ -213,6 +222,7 @@ export interface ManagerOptions {
   lockPath: string;
   /** Daemon self-exits after `idleMs` of having no children/sessions. */
   idleMs: number;
+  publicationCheckMs?: number;
   /** Idle-child grace before kill is dispatched. Default 60_000ms. */
   graceMs?: number;
   /** SIGTERM→SIGKILL window. Default 2_000ms. */
@@ -279,6 +289,16 @@ export class ManagerDaemon {
   private server: DaemonServer | null = null;
   private lock: LockHandle | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
+  private publicationTimer: NodeJS.Timeout | null = null;
+  private ready = false;
+  private readonly pendingChannels = new Set<FrameChannel>();
+  private markReady: () => void = () => {};
+  private readonly readyPromise = new Promise<void>((resolve) => {
+    this.markReady = () => {
+      this.ready = true;
+      resolve();
+    };
+  });
   private connections = new Set<FrameChannel>();
   private groups = new Map<string, ChildGroup>();
   /** Phase D: index of currently-shareable groups, keyed by `${hash}:${sharing}`. dedicated entries never appear here. */
@@ -449,60 +469,120 @@ export class ManagerDaemon {
   }
 
   /**
-   * Acquires the lock, writes the pidfile, reaps any stale children left
-   * behind by a dead previous daemon, and binds the IPC server. Throws
-   * `LockBusyError` if another live daemon is already running.
+   * Acquires the lock and claims the IPC socket, then reaps children leaked
+   * by a dead previous daemon and writes the pidfile before serving
+   * connections (early ones are held until then). Throws `LockBusyError` when
+   * another daemon holds the lock and `DaemonAlreadyRunningError` when
+   * another daemon owns the socket; in both cases the pidfile, process
+   * tracker and live socket are left alone.
    */
   async start(): Promise<void> {
     await this.prepRunDir();
 
     this.lock = await acquireLock(this.opts.lockPath, {
       pid: this.opts.pid ?? process.pid,
+      isForeignProcess,
     });
 
-    let pidWritten = false;
     try {
+      await this.claimSocket();
+      await sweepAbandonedLockFiles(this.opts.lockPath);
+      await this.reapLeakedChildren();
       await writePidfile(this.opts.pidPath, this.opts.pid ?? process.pid);
-      pidWritten = true;
-
-      // Reap any subprocesses leaked by a previous daemon (crash, SIGKILL,
-      // power loss). Done before binding the socket so a fresh OPEN can't
-      // race with the reaper.
-      try {
-        const reaped = await this.tracker.reapStale();
-        if (reaped.killed > 0 || reaped.skipped > 0) {
-          this.logger.info(
-            `reaped ${reaped.killed} leaked subprocess${reaped.killed === 1 ? "" : "es"} from previous daemon` +
-              (reaped.skipped > 0 ? ` (${reaped.skipped} skipped due to PID reuse)` : ""),
-            { component: "daemon" },
-          );
-        }
-      } catch (err) {
-        this.logger.warn(
-          `failed to reap stale subprocesses: ${err instanceof Error ? err.message : String(err)}`,
-          { component: "daemon" },
-        );
-      }
-
-      this.server = this.opts.transport.createServer({
-        path: this.opts.socketPath,
-        onConnection: (channel) => this.handleConnection(channel),
-      });
-
-      await this.server.start();
       this.startedAt = Date.now();
+      this.markReady();
       this.armIdleTimer();
+      this.watchPublication();
     } catch (err) {
-      if (pidWritten) {
-        try {
-          await unlink(this.opts.pidPath);
-        } catch {
-          /* best-effort */
-        }
-      }
+      this.closePendingChannels();
+      await this.server?.stop().catch(() => {});
+      this.server = null;
       await this.releaseLock();
       throw err;
     }
+  }
+
+  private async claimSocket(): Promise<void> {
+    this.server = this.opts.transport.createServer({
+      path: this.opts.socketPath,
+      onConnection: (channel) => this.acceptWhenReady(channel),
+    });
+    try {
+      await this.server.start();
+    } catch (err) {
+      this.server = null;
+      if (err instanceof SocketInUseError) throw new DaemonAlreadyRunningError(this.opts.socketPath);
+      throw err;
+    }
+  }
+
+  private async reapLeakedChildren(): Promise<void> {
+    try {
+      const reaped = await this.tracker.reapStale();
+      if (reaped.killed > 0 || reaped.skipped > 0) {
+        this.logger.info(
+          `reaped ${reaped.killed} leaked subprocess${reaped.killed === 1 ? "" : "es"} from previous daemon` +
+            (reaped.skipped > 0 ? ` (${reaped.skipped} skipped due to PID reuse)` : ""),
+          { component: "daemon" },
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `failed to reap stale subprocesses: ${err instanceof Error ? err.message : String(err)}`,
+        { component: "daemon" },
+      );
+    }
+  }
+
+  private acceptWhenReady(channel: FrameChannel): void {
+    if (this.ready) {
+      this.handleConnection(channel);
+      return;
+    }
+    if (this.pendingChannels.size >= this.maxConnections) {
+      channel.close();
+      return;
+    }
+    const early: unknown[] = [];
+    const hold = (msg: unknown): void => {
+      if (early.length >= MAX_EARLY_MESSAGES) {
+        this.pendingChannels.delete(channel);
+        channel.close();
+        return;
+      }
+      early.push(msg);
+    };
+    const ignoreError = (): void => {};
+    this.pendingChannels.add(channel);
+    channel.on("message", hold);
+    channel.on("error", ignoreError);
+    channel.once("close", () => this.pendingChannels.delete(channel));
+    void this.readyPromise.then(() => {
+      channel.off("message", hold);
+      channel.off("error", ignoreError);
+      if (!this.pendingChannels.delete(channel)) return;
+      this.handleConnection(channel);
+      for (const msg of early) channel.emit("message", msg);
+    });
+  }
+
+  private closePendingChannels(): void {
+    for (const channel of this.pendingChannels) channel.close();
+    this.pendingChannels.clear();
+  }
+
+  private watchPublication(): void {
+    this.publicationTimer = setInterval(
+      () => void this.stepDownIfOrphaned(),
+      this.opts.publicationCheckMs ?? PUBLICATION_CHECK_MS,
+    );
+    this.publicationTimer.unref();
+  }
+
+  private async stepDownIfOrphaned(): Promise<void> {
+    if (this.stopping || this.server === null || (await this.server.isPublished())) return;
+    this.logger.warn("another daemon owns the socket now; shutting down", { component: "daemon" });
+    await this.stop(0);
   }
 
   /** Trigger graceful shutdown. Idempotent. */
@@ -513,6 +593,10 @@ export class ManagerDaemon {
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
+    }
+    if (this.publicationTimer !== null) {
+      clearInterval(this.publicationTimer);
+      this.publicationTimer = null;
     }
 
     // Tear down all sessions before dropping connections so children get
@@ -547,7 +631,7 @@ export class ManagerDaemon {
     }
 
     try {
-      await unlink(this.opts.pidPath);
+      if (await this.lock?.isHeld()) await unlink(this.opts.pidPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
         process.stderr.write(`pidfile cleanup: ${(err as Error).message}\n`);
@@ -665,7 +749,7 @@ export class ManagerDaemon {
             "PING params must be { seq: non-negative integer }",
           );
         }
-        const result: PingResult = { seq: params.seq };
+        const result: PingResult = { seq: params.seq, pid: this.opts.pid ?? process.pid };
         return { id: req.id, result };
       }
       default:
@@ -959,7 +1043,7 @@ export class ManagerDaemon {
       return errorResponse(requestId, ERROR_CODE_INVALID_PARAMS, "OPEN params malformed");
     }
     if (this.sessions.has(params.sessionId)) {
-      return errorResponse(requestId, ERROR_CODE_INVALID_PARAMS, "sessionId already in use");
+      return errorResponse(requestId, ERROR_CODE_SESSION_IN_USE, "sessionId already in use");
     }
     if (this.sessions.size >= this.maxSessionsTotal) {
       return errorResponse(
@@ -1923,4 +2007,11 @@ async function writePidfile(path: string, pid: number): Promise<void> {
 }
 
 export { LockBusyError };
+
+export class DaemonAlreadyRunningError extends Error {
+  constructor(public readonly socketPath: string) {
+    super(`a daemon is already serving ${socketPath}`);
+    this.name = "DaemonAlreadyRunningError";
+  }
+}
 export type { MigrationState };

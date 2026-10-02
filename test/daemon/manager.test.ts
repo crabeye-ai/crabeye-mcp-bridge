@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { ManagerDaemon, LockBusyError } from "../../src/daemon/manager.js";
 import { DaemonClient, DaemonRpcError } from "../../src/daemon/client.js";
@@ -126,23 +127,29 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
   });
 
   it("two managers on the same lock — only one starts", async () => {
+    const daemonLike = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "daemon", "--internal-launch"]);
     manager = new ManagerDaemon({
       socketPath: paths.sock,
       pidPath: paths.pid,
       lockPath: paths.lock,
       idleMs: 60_000,
       transport: netTransport,
+      pid: daemonLike.pid,
     });
-    await manager.start();
+    try {
+      await manager.start();
 
-    const second = new ManagerDaemon({
-      socketPath: paths.sock + ".2",
-      pidPath: paths.pid + ".2",
-      lockPath: paths.lock, // same lock
-      idleMs: 60_000,
-      transport: netTransport,
-    });
-    await expect(second.start()).rejects.toBeInstanceOf(LockBusyError);
+      const second = new ManagerDaemon({
+        socketPath: paths.sock + ".2",
+        pidPath: paths.pid + ".2",
+        lockPath: paths.lock, // same lock
+        idleMs: 60_000,
+        transport: netTransport,
+      });
+      await expect(second.start()).rejects.toBeInstanceOf(LockBusyError);
+    } finally {
+      daemonLike.kill();
+    }
   });
 
   it("idle exit fires after idleMs with no active connections", async () => {

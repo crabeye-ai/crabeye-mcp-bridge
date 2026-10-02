@@ -32,6 +32,9 @@ import {
   createKeychainAdapter,
   type Credential,
 } from "./credentials/index.js";
+import { onClientDisconnect } from "./process/client-disconnect.js";
+
+const SHUTDOWN_DEADLINE_MS = 5_000;
 
 function buildServerBridgeConfigs(
   upstreams: Record<string, ServerConfig>,
@@ -113,9 +116,9 @@ program
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
-      // Bootstrap the manager daemon ahead of upstream connects so parallel
-      // STDIO sessions don't race on lockfile acquisition. HTTP-only configs
-      // skip this; the daemon is a no-op for them.
+      // Bootstrap the manager daemon ahead of upstream connects so the first
+      // STDIO connects find it already serving. HTTP-only configs skip this;
+      // the daemon is a no-op for them.
       const hasStdio = Object.values(upstreams).some(isStdioServer);
       if (hasStdio) {
         try {
@@ -290,6 +293,7 @@ program
     const shutdown = async (exitCode = 0) => {
       if (shuttingDown) return;
       shuttingDown = true;
+      setTimeout(() => process.exit(exitCode), SHUTDOWN_DEADLINE_MS).unref();
       try {
         configWatcher?.stop();
         toolSearchService?.dispose();
@@ -313,6 +317,7 @@ program
     process.on("SIGINT", () => void shutdown(0));
     process.on("SIGTERM", () => void shutdown(0));
     process.on("SIGHUP", () => void shutdown(0));
+    onClientDisconnect(process.stdin, process.stdout, () => void shutdown(0));
     // If we crash, still try to cleanly shut down — at the very least the
     // process tracker reap will kill orphaned subprocesses on the way out.
     process.on("uncaughtException", (err) => {

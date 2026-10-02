@@ -10,9 +10,17 @@ export interface FrameChannel extends EventEmitter {
 
 export type ConnectionHandler = (channel: FrameChannel) => void;
 
+export class SocketInUseError extends Error {
+  constructor(public readonly path: string) {
+    super(`a daemon is already listening on ${path}`);
+    this.name = "SocketInUseError";
+  }
+}
+
 export interface DaemonServer {
   start(): Promise<void>;
   stop(): Promise<void>;
+  isPublished(): Promise<boolean>;
   readonly address: string;
 }
 
