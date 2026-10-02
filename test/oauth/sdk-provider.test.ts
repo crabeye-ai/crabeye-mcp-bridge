@@ -5,7 +5,7 @@ import {
   BridgeOAuthClientProvider,
 } from "../../src/oauth/sdk-provider.js";
 import { makeOriginPinningFetch } from "../../src/oauth/origin-pinning.js";
-import { OAuthError } from "../../src/oauth/errors.js";
+import { OAuthError, ReauthorizationRequiredError } from "../../src/oauth/errors.js";
 import { oauthCredentialKey } from "../../src/oauth/index.js";
 import { makeTestStore } from "../_helpers/credential-store.js";
 
@@ -154,9 +154,124 @@ describe("BridgeOAuthClientProvider", () => {
     // InvalidGrantError, finds no refresh_token, falls into redirect) and
     // the circuit-breaker trip (tokens() returns undefined) funnel here.
     // The error message must name the server and the exact CLI command.
-    await expect(
-      provider.redirectToAuthorization(new URL("https://provider/auth?state=x")),
-    ).rejects.toThrow(/Authentication for "srv" expired.*mcp-bridge auth srv/);
+    const redirect = provider.redirectToAuthorization(new URL("https://provider/auth?state=x"));
+    await expect(redirect).rejects.toThrow(/Authentication for "srv" expired.*mcp-bridge auth srv/);
+    await expect(redirect).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+  });
+
+  describe("redirectToAuthorization after a refresh attempt (runtime)", () => {
+    const AUTH_URL = new URL("https://provider/auth?state=x");
+
+    function runtimeProvider(onRedirect?: (url: URL) => Promise<void>) {
+      return new BridgeOAuthClientProvider({
+        serverName: "srv",
+        store,
+        redirectUrl: REDIRECT,
+        clientId: "ci",
+        runtime: true,
+        ...(onRedirect ? { onRedirect } : {}),
+      });
+    }
+
+    async function refreshThrough(provider: BridgeOAuthClientProvider, base: typeof fetch): Promise<void> {
+      await provider
+        .wrapFetch(base)("https://as.example/token", {
+          method: "POST",
+          body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: "rt" }),
+        })
+        .catch(() => {});
+    }
+
+    it.each<[string, typeof fetch]>([
+      ["the token endpoint was unreachable", (async () => { throw new TypeError("fetch failed"); }) as typeof fetch],
+      ...[500, 503, 429, 408].map((status): [string, typeof fetch] => [
+        `the token endpoint answered ${status}`,
+        (async () => new Response(null, { status })) as typeof fetch,
+      ]),
+    ])("reports a transient failure when %s", async (_label, base) => {
+      const provider = runtimeProvider();
+      await refreshThrough(provider, base);
+
+      const redirect = provider.redirectToAuthorization(AUTH_URL);
+      await expect(redirect).rejects.toThrow(/Could not refresh authorization for "srv"/);
+      await expect(redirect).rejects.not.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("asks for re-authorization when the refresh was rejected", async () => {
+      const provider = runtimeProvider();
+      await refreshThrough(provider, (async () => Response.json({ error: "invalid_grant" }, { status: 400 })) as typeof fetch);
+
+      await expect(provider.redirectToAuthorization(AUTH_URL)).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("asks for re-authorization when no refresh was attempted, even with a refresh token stored", async () => {
+      await store.set(oauthCredentialKey("srv"), {
+        type: "oauth2",
+        access_token: "at",
+        refresh_token: "rt",
+      });
+      const provider = runtimeProvider();
+      await provider.tokens();
+
+      await expect(provider.redirectToAuthorization(AUTH_URL)).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("gives every caller that shared one failed refresh the same transient answer", async () => {
+      const provider = runtimeProvider();
+      await refreshThrough(provider, (async () => new Response(null, { status: 503 })) as typeof fetch);
+
+      const outcomes = await Promise.all(
+        [1, 2, 3].map(() => provider.redirectToAuthorization(AUTH_URL).catch((err: unknown) => err)),
+      );
+
+      for (const outcome of outcomes) expect(outcome).not.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("asks for re-authorization after a later refresh succeeds and the tokens are then rejected", async () => {
+      const provider = runtimeProvider();
+      await refreshThrough(provider, (async () => new Response(null, { status: 503 })) as typeof fetch);
+      await refreshThrough(provider, (async () => Response.json({ access_token: "at", token_type: "Bearer" })) as typeof fetch);
+
+      await expect(provider.redirectToAuthorization(AUTH_URL)).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("asks for re-authorization when new tokens were saved after a failed refresh", async () => {
+      const provider = runtimeProvider();
+      await refreshThrough(provider, (async () => new Response(null, { status: 503 })) as typeof fetch);
+      await provider.saveTokens({ access_token: "fresh", token_type: "Bearer", refresh_token: "rt-fresh" });
+
+      await expect(provider.redirectToAuthorization(AUTH_URL)).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("asks for re-authorization when the tokens were invalidated after a failed refresh", async () => {
+      const provider = runtimeProvider();
+      await refreshThrough(provider, (async () => new Response(null, { status: 503 })) as typeof fetch);
+      await provider.invalidateCredentials("tokens");
+
+      await expect(provider.redirectToAuthorization(AUTH_URL)).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("asks for re-authorization once the refresh circuit breaker has tripped", async () => {
+      const provider = runtimeProvider();
+      for (let i = 0; i < 8; i++) {
+        await provider.saveTokens({ access_token: `at-${i}`, token_type: "Bearer", refresh_token: `rt-${i}` });
+      }
+      await refreshThrough(provider, (async () => new Response(null, { status: 503 })) as typeof fetch);
+
+      await expect(provider.redirectToAuthorization(AUTH_URL)).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+    });
+
+    it("still opens the browser for the interactive auth command after a failed refresh", async () => {
+      let redirected: URL | undefined;
+      const provider = runtimeProvider(async (url) => {
+        redirected = url;
+      });
+      await refreshThrough(provider, (async () => new Response(null, { status: 503 })) as typeof fetch);
+
+      await provider.redirectToAuthorization(AUTH_URL);
+
+      expect(redirected).toEqual(AUTH_URL);
+    });
   });
 
   it("saveTokens preserves the stored refresh_token when the SDK omits it", async () => {
@@ -328,9 +443,9 @@ describe("BridgeOAuthClientProvider", () => {
       redirectUrl: "http://127.0.0.1/callback",
       runtime: true,
     });
-    await expect(
-      provider.saveClientInformation({ client_id: "dyn-runtime" }),
-    ).rejects.toThrow(/Dynamic client registration is not available at runtime.*mcp-bridge auth srv/i);
+    const save = provider.saveClientInformation({ client_id: "dyn-runtime" });
+    await expect(save).rejects.toThrow(/Dynamic client registration is not available at runtime.*mcp-bridge auth srv/i);
+    await expect(save).rejects.toBeInstanceOf(ReauthorizationRequiredError);
   });
 
   it("tokens() returns undefined when access token is expired and no refresh token", async () => {

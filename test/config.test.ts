@@ -9,6 +9,7 @@ import {
   GlobalBridgeConfigSchema,
   isHttpServer,
   isStdioServer,
+  findRemovedReconnectLimit,
   resolveUpstreams,
   type ServerConfig,
   type BridgeConfig,
@@ -312,13 +313,12 @@ describe("invalid configs", () => {
   it("accepts reconnect config in global _bridge", () => {
     const input = {
       mcpServers: { s: { command: "node" } },
-      _bridge: { reconnect: { maxReconnectAttempts: 10, reconnectBaseDelay: 2000, reconnectMaxDelay: 60000 } },
+      _bridge: { reconnect: { reconnectBaseDelay: 2000, reconnectMaxDelay: 60000 } },
     };
     const result = BridgeConfigSchema.safeParse(input);
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data._bridge.reconnect).toEqual({
-        maxReconnectAttempts: 10,
         reconnectBaseDelay: 2000,
         reconnectMaxDelay: 60000,
       });
@@ -330,14 +330,14 @@ describe("invalid configs", () => {
       mcpServers: {
         s: {
           command: "node",
-          _bridge: { reconnect: { maxReconnectAttempts: 3 } },
+          _bridge: { reconnect: { reconnectMaxDelay: 5000 } },
         },
       },
     };
     const result = BridgeConfigSchema.safeParse(input);
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.mcpServers.s._bridge?.reconnect?.maxReconnectAttempts).toBe(3);
+      expect(result.data.mcpServers.s._bridge?.reconnect?.reconnectMaxDelay).toBe(5000);
     }
   });
 
@@ -350,17 +350,37 @@ describe("invalid configs", () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data._bridge.reconnect?.reconnectMaxDelay).toBe(120000);
-      expect(result.data._bridge.reconnect?.maxReconnectAttempts).toBeUndefined();
     }
   });
 
-  it("rejects negative maxReconnectAttempts", () => {
+  it("still loads a config that sets the removed maxReconnectAttempts, and reports where", () => {
     const input = {
-      mcpServers: { s: { command: "node" } },
+      mcpServers: {
+        s: { command: "node", _bridge: { reconnect: { maxReconnectAttempts: 5 } } },
+        t: { command: "node" },
+      },
       _bridge: { reconnect: { maxReconnectAttempts: -1 } },
     };
     const result = BridgeConfigSchema.safeParse(input);
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(findRemovedReconnectLimit(result.data)).toEqual(["_bridge", 'server "s"']);
+    }
+  });
+
+  it("reports nothing when no config sets maxReconnectAttempts", () => {
+    const result = BridgeConfigSchema.parse({ mcpServers: { s: { command: "node" } } });
+    expect(findRemovedReconnectLimit(result)).toEqual([]);
+  });
+
+  it.each([
+    [{ reconnectBaseDelay: 99 }, false],
+    [{ reconnectBaseDelay: 100 }, true],
+    [{ reconnectMaxDelay: 999 }, false],
+    [{ reconnectMaxDelay: 1000 }, true],
+  ])("enforces the reconnect delay floor: %o accepted=%s", (reconnect, accepted) => {
+    const result = BridgeConfigSchema.safeParse({ mcpServers: { s: { command: "node" } }, _bridge: { reconnect } });
+    expect(result.success).toBe(accepted);
   });
 
   it("rejects zero reconnectBaseDelay", () => {

@@ -7,6 +7,7 @@ import { hasStoredOAuthCredential, resolveClientSecret } from "../oauth/client-s
 import {
   BridgeOAuthClientProvider,
 } from "../oauth/sdk-provider.js";
+import { isDefinitiveAuthFailure, isReauthorizationRequired } from "../oauth/errors.js";
 import { makeOriginPinningFetch } from "../oauth/origin-pinning.js";
 import { BaseUpstreamClient } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
@@ -24,6 +25,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
   private _resolvedClientSecret: string | undefined;
   private _hasStoredOAuth = false;
   private _authShadowWarned = false;
+  private _authProvider: BridgeOAuthClientProvider | undefined;
 
   constructor(options: HttpUpstreamClientOptions) {
     super(options);
@@ -78,6 +80,12 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
     }
   }
 
+  protected override _isAuthFailure(err: unknown): boolean {
+    if (isDefinitiveAuthFailure(err)) return true;
+    if (this._authProvider?.refreshFailedTransiently) return false;
+    return isReauthorizationRequired(err);
+  }
+
   protected _buildTransport(): Transport {
     const url = new URL(this._config.url);
     const rawHeaders = this._resolvedHeaders ?? this._config.headers;
@@ -109,6 +117,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
             runtime: true,
           })
         : undefined;
+    this._authProvider = authProvider;
 
     // CRITICAL: strip (not just warn) any case-insensitive `Authorization`
     // header when an `authProvider` is in play. The SDK's

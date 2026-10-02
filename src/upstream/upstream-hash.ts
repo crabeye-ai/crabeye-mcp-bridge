@@ -7,7 +7,6 @@ import { createHash } from "node:crypto";
  * dropped because `BaseUpstreamClient` bakes them in at construction.
  */
 export interface UpstreamReconnectInputs {
-  maxReconnectAttempts?: number;
   reconnectBaseDelay?: number;
   reconnectMaxDelay?: number;
 }
@@ -69,14 +68,16 @@ export function upstreamHash(spec: UpstreamSpec): string {
     cwd: spec.cwd,
   };
   if (spec.reconnect && hasAnyReconnectField(spec.reconnect)) {
-    hashed.reconnect = spec.reconnect;
+    hashed.reconnect = {
+      reconnectBaseDelay: spec.reconnect.reconnectBaseDelay,
+      reconnectMaxDelay: spec.reconnect.reconnectMaxDelay,
+    };
   }
   return createHash("sha256").update(canonicalize(hashed)).digest("hex");
 }
 
 function hasAnyReconnectField(r: UpstreamReconnectInputs): boolean {
   return (
-    r.maxReconnectAttempts !== undefined ||
     r.reconnectBaseDelay !== undefined ||
     r.reconnectMaxDelay !== undefined
   );

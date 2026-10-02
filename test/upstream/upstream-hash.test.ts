@@ -56,6 +56,23 @@ describe("upstreamHash", () => {
     );
   });
 
+  it("separates upstreams whose reconnect delays differ", () => {
+    expect(upstreamHash({ ...baseSpec, reconnect: { reconnectBaseDelay: 1000 } })).not.toBe(
+      upstreamHash({ ...baseSpec, reconnect: { reconnectBaseDelay: 2000 } }),
+    );
+    expect(upstreamHash({ ...baseSpec, reconnect: { reconnectMaxDelay: 30_000 } })).not.toBe(
+      upstreamHash({ ...baseSpec, reconnect: { reconnectMaxDelay: 60_000 } }),
+    );
+  });
+
+  it("ignores reconnect keys other than the two delays", () => {
+    const delays = { reconnectBaseDelay: 1000, reconnectMaxDelay: 30_000 };
+    const withRemovedKey = { ...delays, maxReconnectAttempts: 5 } as UpstreamSpec["reconnect"];
+    expect(upstreamHash({ ...baseSpec, reconnect: withRemovedKey })).toBe(
+      upstreamHash({ ...baseSpec, reconnect: delays }),
+    );
+  });
+
   it("returns a sha256 hex string", () => {
     expect(upstreamHash(baseSpec)).toMatch(/^[0-9a-f]{64}$/);
   });

@@ -235,7 +235,6 @@ describe("HttpUpstreamClient", () => {
     let connectCount = 0;
 
     const { client } = createLinkedClient("test", mockServerHandle.server, {
-      maxReconnectAttempts: 3,
       reconnectBaseDelay: 100,
       reconnectMaxDelay: 1000,
     });
@@ -268,7 +267,7 @@ describe("HttpUpstreamClient", () => {
     vi.useRealTimers();
   });
 
-  it("gives up after max reconnect attempts → status error", async () => {
+  it("keeps retrying after many consecutive connection failures", async () => {
     vi.useFakeTimers();
 
     let shouldFail = false;
@@ -277,7 +276,6 @@ describe("HttpUpstreamClient", () => {
     const client = new HttpUpstreamClient({
       name: "test",
       config: { type: "streamable-http", url: "http://localhost:9999" },
-      maxReconnectAttempts: 2,
       reconnectBaseDelay: 50,
       reconnectMaxDelay: 200,
       _transportFactory: () => {
@@ -316,16 +314,14 @@ describe("HttpUpstreamClient", () => {
     clientTransport!.onclose?.();
     await vi.advanceTimersByTimeAsync(0);
 
-    // Reconnect attempt 1: delay = 50ms * 2^0 = 50ms
-    await vi.advanceTimersByTimeAsync(50);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const attemptsAfterFiveSeconds = statusHistory.filter((status) => status === "connecting").length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const attemptsAfterTenSeconds = statusHistory.filter((status) => status === "connecting").length;
 
-    // Reconnect attempt 2: delay = 50ms * 2^1 = 100ms
-    await vi.advanceTimersByTimeAsync(100);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(client.status).toBe("error");
-    expect(statusHistory).toContain("error");
+    expect(attemptsAfterFiveSeconds).toBeGreaterThan(6);
+    expect(attemptsAfterTenSeconds).toBeGreaterThan(attemptsAfterFiveSeconds);
+    expect(["disconnected", "connecting"]).toContain(client.status);
 
     vi.useRealTimers();
   });
@@ -373,7 +369,6 @@ describe("HttpUpstreamClient", () => {
     const client = new HttpUpstreamClient({
       name: "test",
       config: { type: "streamable-http", url: "http://localhost:9999" },
-      maxReconnectAttempts: 0,
       _transportFactory: () => ({
         async start() { throw new Error("Connection refused"); },
         async send() {},
@@ -519,50 +514,6 @@ describe("UpstreamManager", () => {
     await stdioServer.server.close();
   });
 
-  it("tools removed from ToolRegistry when upstream reaches error state", async () => {
-    const mockServer = createMockServer([makeTool("tool-x")]);
-
-    const config = makeConfig({
-      "upstream-a": { type: "streamable-http", url: "http://localhost:9999" },
-    });
-
-    let clientRef: HttpUpstreamClient | undefined;
-    const manager = new UpstreamManager({
-      config,
-      toolRegistry,
-      _clientFactory: (name) => {
-        const { client } = createLinkedClient(name, mockServer.server, {
-          maxReconnectAttempts: 0,
-        });
-        clientRef = client;
-        return client;
-      },
-    });
-
-    await manager.connectAll();
-    expect(toolRegistry.listTools()).toHaveLength(1);
-
-    // With maxReconnectAttempts=0, disconnect → scheduleReconnect → immediately error
-    const errorReached = new Promise<void>((resolve) => {
-      clientRef!.onStatusChange((event) => {
-        if (event.current === "error") resolve();
-      });
-    });
-
-    await mockServer.server.close();
-
-    await Promise.race([
-      errorReached,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Timeout waiting for error")), 2000),
-      ),
-    ]);
-
-    expect(toolRegistry.listTools()).toHaveLength(0);
-
-    await manager.closeAll();
-  });
-
   it("tools preserved in ToolRegistry on transient upstream disconnect", async () => {
     const mockServer = createMockServer([makeTool("tool-x")]);
 
@@ -575,9 +526,7 @@ describe("UpstreamManager", () => {
       config,
       toolRegistry,
       _clientFactory: (name) => {
-        const { client } = createLinkedClient(name, mockServer.server, {
-          maxReconnectAttempts: 3,
-        });
+        const { client } = createLinkedClient(name, mockServer.server);
         clientRef = client;
         return client;
       },
@@ -619,7 +568,6 @@ describe("UpstreamManager", () => {
           return new HttpUpstreamClient({
             name,
             config: { type: "streamable-http", url: "http://localhost:1111" },
-            maxReconnectAttempts: 0,
             _transportFactory: () => ({
               async start() { throw new Error("Connection refused"); },
               async send() {},
@@ -943,7 +891,6 @@ describe("DaemonStdioClient", () => {
     let connectCount = 0;
 
     const { client } = createLinkedStdioClient("test", mockServerHandle.server, {
-      maxReconnectAttempts: 3,
       reconnectBaseDelay: 100,
       reconnectMaxDelay: 1000,
     });
@@ -973,7 +920,7 @@ describe("DaemonStdioClient", () => {
     vi.useRealTimers();
   });
 
-  it("gives up after max reconnect attempts → status error", async () => {
+  it("keeps retrying after many consecutive connection failures", async () => {
     vi.useFakeTimers();
 
     let shouldFail = false;
@@ -983,7 +930,6 @@ describe("DaemonStdioClient", () => {
       name: "test",
       config: { command: "node", args: ["server.js"] },
       resolvedEnv: {},
-      maxReconnectAttempts: 2,
       reconnectBaseDelay: 50,
       reconnectMaxDelay: 200,
       _transportFactory: () => {
@@ -1018,16 +964,14 @@ describe("DaemonStdioClient", () => {
     clientTransport!.onclose?.();
     await vi.advanceTimersByTimeAsync(0);
 
-    // Reconnect attempt 1: delay = 50ms * 2^0 = 50ms
-    await vi.advanceTimersByTimeAsync(50);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const attemptsAfterFiveSeconds = statusHistory.filter((status) => status === "connecting").length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const attemptsAfterTenSeconds = statusHistory.filter((status) => status === "connecting").length;
 
-    // Reconnect attempt 2: delay = 50ms * 2^1 = 100ms
-    await vi.advanceTimersByTimeAsync(100);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(client.status).toBe("error");
-    expect(statusHistory).toContain("error");
+    expect(attemptsAfterFiveSeconds).toBeGreaterThan(6);
+    expect(attemptsAfterTenSeconds).toBeGreaterThan(attemptsAfterFiveSeconds);
+    expect(["disconnected", "connecting"]).toContain(client.status);
 
     vi.useRealTimers();
   });
@@ -1062,7 +1006,6 @@ describe("DaemonStdioClient", () => {
       name: "test",
       config: { command: "node", args: ["server.js"] },
       resolvedEnv: {},
-      maxReconnectAttempts: 0,
       _transportFactory: () => ({
         async start() { throw new Error("Connection refused"); },
         async send() {},

@@ -161,7 +161,6 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
       resolvedEnv: {},
       _socketPath: sockPath,
       _ensureDaemon: async () => {},
-      maxReconnectAttempts: 0,
     });
     try {
       await expect(client.connect()).rejects.toThrow();

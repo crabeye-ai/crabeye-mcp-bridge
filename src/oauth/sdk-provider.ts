@@ -12,7 +12,7 @@ import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
 import type { Logger } from "../logging/index.js";
 import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "./client-secret.js";
-import { OAuthError } from "./errors.js";
+import { OAuthError, ReauthorizationRequiredError } from "./errors.js";
 import {
   isIssuerStampOnly,
   issuersMatch,
@@ -65,6 +65,10 @@ const REFRESH_BURST_LIMIT = 6;
 
 type FetchLike = typeof fetch;
 
+function isTransientStatus(status: number): boolean {
+  return status >= 500 || status === 429 || status === 408;
+}
+
 /**
  * True when `init` describes an OAuth 2.0 refresh-token request: a POST whose
  * URL-encoded body carries `grant_type=refresh_token`. Used by
@@ -108,6 +112,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   private _state: string | undefined;
   private _recentSaves: number[] = [];
   private _refreshExhausted = false;
+  private _refreshFailedTransiently = false;
   // In-flight token-endpoint refresh, used by `wrapFetch` to coalesce
   // parallel refresh attempts. See `wrapFetch` for the lifecycle.
   private _refreshFetchPromise: Promise<Response> | undefined;
@@ -121,6 +126,10 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   // concurrent invalidate.
   private _invalidateEpoch = 0;
   private _discoveryState: OAuthDiscoveryState | undefined;
+
+  get refreshFailedTransiently(): boolean {
+    return this._refreshFailedTransiently && !this._refreshExhausted;
+  }
 
   constructor(opts: BridgeOAuthProviderOptions) {
     this._opts = opts;
@@ -219,7 +228,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   }
 
   private _runtimeRegistrationError(): Error {
-    return new Error(
+    return new ReauthorizationRequiredError(
       `Dynamic client registration is not available at runtime for "${this._opts.serverName}" — ` +
       `run \`${APP_NAME} auth ${this._opts.serverName}\` from a terminal to register and authorize.`,
     );
@@ -298,6 +307,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     tokens: StoredOAuthTokens,
     ctx?: OAuthClientInformationContext,
   ): Promise<void> {
+    this._refreshFailedTransiently = false;
     const issuer = tokens.issuer ?? ctx?.issuer;
     const expiresAt =
       typeof tokens.expires_in === "number"
@@ -344,13 +354,17 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
 
   async redirectToAuthorization(url: URL): Promise<void> {
     if (!this._opts.onRedirect) {
-      // Runtime: no interactive user. Reached when either the stored
-      // refresh_token is permanently invalid (SDK retried after
-      // InvalidGrantError, wiped tokens, then re-entered auth) or the
-      // refresh-loop circuit breaker tripped and `tokens()` returned
-      // undefined. Both paths surface here as the single actionable
-      // message the LLM/tool-caller sees.
-      throw new Error(
+      if (this.refreshFailedTransiently) {
+        throw new Error(
+          `Could not refresh authorization for "${this._opts.serverName}"; the authorization server may be unreachable.`,
+        );
+      }
+      // Runtime: no interactive user. Reached when the stored refresh_token
+      // is permanently invalid (the SDK wiped the tokens after
+      // InvalidGrantError), when there are no usable tokens, when the
+      // upstream demands a wider scope, or when the refresh-loop circuit
+      // breaker tripped.
+      throw new ReauthorizationRequiredError(
         `Authentication for "${this._opts.serverName}" expired. ` +
         `Run: ${APP_NAME} auth ${this._opts.serverName}`,
       );
@@ -377,6 +391,14 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       if (!p) {
         p = baseFetch(input, init);
         this._refreshFetchPromise = p;
+        p.then(
+          (response) => {
+            this._refreshFailedTransiently = isTransientStatus(response.status);
+          },
+          () => {
+            this._refreshFailedTransiently = true;
+          },
+        );
         // Clear the slot once the in-flight call settles. Both branches
         // (resolve, reject) drain awaiters; the catch on the cleanup chain
         // is purely to silence the otherwise-unhandled rejection warning
@@ -448,6 +470,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       this._lastRefreshToken = undefined;
       this._recentSaves = [];
       this._refreshExhausted = false;
+      this._refreshFailedTransiently = false;
       await this._opts.store.delete(oauthCredentialKey(this._opts.serverName));
     }
     if (scope === "client" || scope === "all") {

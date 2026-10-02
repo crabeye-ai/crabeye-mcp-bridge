@@ -79,6 +79,8 @@ class MockUpstreamClient implements UpstreamClient {
     return this.reconnectFn();
   }
 
+  async retryNow(): Promise<void> {}
+
   onStatusChange(callback: StatusChangeCallback): () => void {
     this._statusListeners.add(callback);
     return () => this._statusListeners.delete(callback);
@@ -190,6 +192,34 @@ describe("Health monitoring", () => {
     await manager.closeAll();
   });
 
+  it("does not reconnect when the third failed ping paused the upstream for authorization", async () => {
+    const mockClient = new MockUpstreamClient("srv", [makeTool("t")]);
+    let pings = 0;
+    mockClient.pingFn = () => {
+      if (++pings === 3) mockClient.status = "auth_required";
+      return Promise.reject(new Error(pings === 3 ? "unauthorized" : "timeout"));
+    };
+    const reconnectSpy = vi.fn(() => Promise.resolve());
+    mockClient.reconnectFn = reconnectSpy;
+
+    const manager = new UpstreamManager({
+      config: makeConfig(
+        { srv: { type: "streamable-http", url: "http://localhost:9999" } },
+        { healthCheckInterval: 10 },
+      ),
+      toolRegistry,
+      _clientFactory: () => mockClient,
+    });
+    await manager.connectAll();
+    manager.startHealthChecks();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(pings).toBe(3);
+    expect(reconnectSpy).not.toHaveBeenCalled();
+    await manager.closeAll();
+  });
+
   it("resets failure counter after successful ping", async () => {
     const mockClient = new MockUpstreamClient("srv", [makeTool("t")]);
     let failCount = 0;
@@ -254,7 +284,7 @@ describe("Health monitoring", () => {
     await manager.closeAll();
   });
 
-  it("skips non-connected clients during health check", async () => {
+  it.each<ConnectionStatus>(["disconnected", "connecting", "auth_required"])("skips %s clients during health check", async (status) => {
     const connectedClient = new MockUpstreamClient("connected-srv", [makeTool("t")]);
     const disconnectedClient = new MockUpstreamClient("disconnected-srv", [makeTool("t2")]);
     const connectedPingSpy = vi.fn(() => Promise.resolve());
@@ -283,8 +313,7 @@ describe("Health monitoring", () => {
 
     await manager.connectAll();
 
-    // Disconnect one client
-    disconnectedClient.status = "disconnected";
+    disconnectedClient.status = status;
 
     manager.startHealthChecks();
 

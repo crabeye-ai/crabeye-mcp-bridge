@@ -18,6 +18,7 @@ import type {
 } from "./types.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
+const STABLE_CONNECTION_MS = 60_000;
 
 export function upstreamClientInfo(serverName: string): Implementation {
   return { name: `${APP_NAME}/${serverName}`, version: APP_VERSION };
@@ -26,7 +27,6 @@ export function upstreamClientInfo(serverName: string): Implementation {
 export interface BaseUpstreamClientOptions {
   name: string;
   logger?: Logger;
-  maxReconnectAttempts?: number;
   reconnectBaseDelay?: number;
   reconnectMaxDelay?: number;
   /** Injectable transport factory for testing. */
@@ -43,8 +43,9 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   private _epoch = 0;
   private _connectPromise: Promise<void> | undefined;
   private _reconnectAttempt = 0;
+  private _connectedAt = 0;
+  private _lastAttemptEndedAt = 0;
   private _reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  private _maxReconnectAttempts: number;
   private _reconnectBaseDelay: number;
   private _reconnectMaxDelay: number;
   private _transportFactory: (() => Transport) | undefined;
@@ -55,7 +56,6 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
 
   constructor(options: BaseUpstreamClientOptions) {
     this.name = options.name;
-    this._maxReconnectAttempts = options.maxReconnectAttempts ?? 5;
     this._reconnectBaseDelay = options.reconnectBaseDelay ?? 1000;
     this._reconnectMaxDelay = options.reconnectMaxDelay ?? 30000;
     this._transportFactory = options._transportFactory;
@@ -79,11 +79,30 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   }
 
   async connect(): Promise<void> {
-    if (this._connectPromise) return this._connectPromise;
-    this._connectPromise = this._doConnect().finally(() => {
-      this._connectPromise = undefined;
-    });
+    if (!this._connectPromise) {
+      const attempt = this._doConnect().finally(() => {
+        this._connectPromise = undefined;
+        this._lastAttemptEndedAt = Date.now();
+      });
+      attempt.catch(() => {
+        if (this._status === "disconnected") this._scheduleReconnect();
+      });
+      this._connectPromise = attempt;
+    }
     return this._connectPromise;
+  }
+
+  async retryNow(): Promise<void> {
+    if (this._closed || this._status === "connected") return;
+    if (!this._connectPromise && !this._attemptedRecently()) {
+      this._clearReconnectTimer();
+      void this.connect().catch(() => {});
+    }
+    await this._connectPromise?.catch(() => {});
+  }
+
+  private _attemptedRecently(): boolean {
+    return Date.now() - this._lastAttemptEndedAt < this._reconnectBaseDelay;
   }
 
   private async _doConnect(): Promise<void> {
@@ -105,6 +124,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
 
     try {
       await this._prepareConnect();
+      this._abandonIfSuperseded(myEpoch);
       const transport = this._createTransport();
       this._currentTransport = transport;
       const client = new Client(
@@ -128,7 +148,8 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       );
 
       transport.onclose = () => {
-        if (this._closed || this._epoch !== myEpoch) return;
+        if (this._isSuperseded(myEpoch)) return;
+        this._endConnection();
         this._client = undefined;
         this._currentTransport = undefined;
         this._onTransportClosed();
@@ -145,12 +166,16 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       await this._onTransportStarted(transport);
 
       const result = await client.listTools();
+      if (this._isSuperseded(myEpoch)) {
+        await client.close().catch(() => {});
+        throw this._supersededError();
+      }
       this._tools = result.tools;
       this._client = client;
       if (this._reconnectAttempt > 0) {
         this._logger.info("reconnected", { attempts: this._reconnectAttempt });
       }
-      this._reconnectAttempt = 0;
+      this._connectedAt = Date.now();
       this._logger.info("connected", { era: client.getProtocolEra() });
       this._setStatus("connected");
       this._afterConnect(transport);
@@ -169,7 +194,10 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         await failed.close().catch(() => {});
       }
       this._onTransportClosed();
-      this._setStatus("disconnected");
+      this._setStatus(
+        this._isAuthFailure(err) ? "auth_required" : "disconnected",
+        err instanceof Error ? err : undefined,
+      );
       throw err;
     }
   }
@@ -183,11 +211,18 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         `Cannot call tool "${params.name}": client "${this.name}" is not connected`,
       );
     }
-    return this._client.callTool(params) as Promise<CallToolResult>;
+    const client = this._client;
+    try {
+      return (await client.callTool(params)) as CallToolResult;
+    } catch (err) {
+      this._pauseIfAuthFailure(client, err);
+      throw err;
+    }
   }
 
   async close(): Promise<void> {
     this._closed = true;
+    this._connectedAt = 0;
     this._clearReconnectTimer();
 
     if (this._client) {
@@ -215,16 +250,23 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       throw new Error(`Cannot ping: client "${this.name}" is not connected`);
     }
     const signal = AbortSignal.timeout(timeoutMs);
-    if (this._client.getProtocolEra() === "modern") {
-      await this._client.discover({ signal });
-      return;
+    const client = this._client;
+    try {
+      if (client.getProtocolEra() === "modern") {
+        await client.discover({ signal });
+        return;
+      }
+      await client.ping({ signal });
+    } catch (err) {
+      this._pauseIfAuthFailure(client, err);
+      throw err;
     }
-    await this._client.ping({ signal });
   }
 
   async reconnect(): Promise<void> {
-    this._reconnectAttempt = 0;
-    this._closed = false;
+    await this._connectPromise?.catch(() => {});
+    if (this._closed) return;
+    this._endConnection();
     this._clearReconnectTimer();
     this._epoch++;
 
@@ -232,6 +274,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       const old = this._client;
       this._client = undefined;
       await old.close().catch(() => {});
+      if (this._closed) return;
     }
 
     this._logger.info("reconnecting");
@@ -282,6 +325,41 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   /** Hook called from close() so subclasses can release per-client resources. */
   protected async _onClose(): Promise<void> {}
 
+  protected _isAuthFailure(err: unknown): boolean {
+    void err;
+    return false;
+  }
+
+  private _pauseIfAuthFailure(failedClient: Client, err: unknown): void {
+    if (this._client !== failedClient || this._status !== "connected" || !this._isAuthFailure(err)) return;
+    this._epoch++;
+    this._endConnection();
+    this._client = undefined;
+    this._currentTransport = undefined;
+    void failedClient.close().catch(() => {});
+    this._onTransportClosed();
+    this._setStatus("auth_required", err instanceof Error ? err : undefined);
+  }
+
+  private _endConnection(): void {
+    if (this._connectedAt > 0 && Date.now() - this._connectedAt >= STABLE_CONNECTION_MS) {
+      this._reconnectAttempt = 0;
+    }
+    this._connectedAt = 0;
+  }
+
+  private _isSuperseded(epoch: number): boolean {
+    return this._closed || this._epoch !== epoch;
+  }
+
+  private _abandonIfSuperseded(epoch: number): void {
+    if (this._isSuperseded(epoch)) throw this._supersededError();
+  }
+
+  private _supersededError(): Error {
+    return new Error(`connection attempt for "${this.name}" was superseded`);
+  }
+
   /** Subclasses create the real transport here. */
   protected abstract _buildTransport(): Transport;
 
@@ -319,25 +397,22 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     if (this._reconnectTimer !== undefined) return;
     if (this._connectPromise) return;
 
-    if (this._reconnectAttempt >= this._maxReconnectAttempts) {
-      this._logger.warn("max reconnect attempts reached");
-      this._setStatus("error", new Error("Max reconnect attempts exceeded"));
-      return;
-    }
-
-    const delay = Math.min(
-      this._reconnectBaseDelay * Math.pow(2, this._reconnectAttempt),
-      this._reconnectMaxDelay,
-    );
+    const delay = this._backoffDelay(this._reconnectAttempt);
+    const alreadyAtCap = this._reconnectAttempt > 0 && this._backoffDelay(this._reconnectAttempt - 1) === delay;
     this._reconnectAttempt++;
-    this._logger.info(`reconnecting in ${delay}ms`, { attempt: this._reconnectAttempt });
+    const message = `reconnecting in ${delay}ms`;
+    const context = { attempt: this._reconnectAttempt };
+    if (alreadyAtCap) this._logger.debug(message, context);
+    else this._logger.info(message, context);
 
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = undefined;
-      this.connect().catch(() => {
-        this._scheduleReconnect();
-      });
+      this.connect().catch(() => {});
     }, delay);
+  }
+
+  private _backoffDelay(attempt: number): number {
+    return Math.min(this._reconnectBaseDelay * Math.pow(2, attempt), this._reconnectMaxDelay);
   }
 
   private _clearReconnectTimer(): void {

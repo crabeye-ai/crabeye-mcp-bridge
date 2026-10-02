@@ -4,7 +4,7 @@ export type ConnectionStatus =
   | "disconnected"
   | "connecting"
   | "connected"
-  | "error";
+  | "auth_required";
 
 export type HealthState = "unknown" | "healthy" | "unhealthy";
 
@@ -37,8 +37,11 @@ export interface UpstreamClient {
 
   ping(timeoutMs?: number): Promise<void>;
 
-  /** Fresh reconnection: resets backoff, closes inner client, reconnects. */
+  /** Replaces the current connection; backoff resets only if that connection had been stable. */
   reconnect(): Promise<void>;
+
+  /** Connects now instead of waiting out the backoff (throttled to the base delay); keeps the backoff level. */
+  retryNow(): Promise<void>;
 
   onStatusChange(callback: StatusChangeCallback): () => void;
   onToolsChanged(callback: ToolsChangedCallback): () => void;

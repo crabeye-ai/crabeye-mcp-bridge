@@ -31,6 +31,7 @@ function makeMockUpstreamClient(
     close: vi.fn().mockResolvedValue(undefined),
     ping: vi.fn().mockResolvedValue(undefined),
     reconnect: vi.fn().mockResolvedValue(undefined),
+    retryNow: vi.fn().mockResolvedValue(undefined),
     onStatusChange: vi.fn().mockReturnValue(() => {}),
     onToolsChanged: vi.fn().mockReturnValue(() => {}),
     ...overrides,

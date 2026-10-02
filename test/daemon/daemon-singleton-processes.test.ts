@@ -54,6 +54,13 @@ function stderrMentions(child: ChildProcessWithoutNullStreams, text: string): Pr
   });
 }
 
+function childCommands(parentPid: number): string[] {
+  return execFileSync("ps", ["-axo", "ppid=,command="], { encoding: "utf-8" })
+    .split("\n")
+    .filter((line) => Number(line.trim().split(/\s+/)[0]) === parentPid)
+    .map((line) => line.trim().split(/\s+/).slice(1).join(" "));
+}
+
 async function waitUntil(condition: () => boolean, withinMs: number): Promise<void> {
   const deadline = Date.now() + withinMs;
   while (!condition() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
@@ -233,6 +240,32 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
       expect(exits).toEqual(bridges.map(() => 0));
     }
   }, 30_000);
+
+  it("a bridge's STDIO upstream recovers after its daemon is killed", async () => {
+    dir = await mkdtemp("/tmp/cbe-recover-");
+    const stub = join(dir, "stub-alpha.cjs");
+    await writeFile(stub, STUB_SERVER);
+    const configPath = join(dir, "client.json");
+    await writeFile(configPath, JSON.stringify({ mcpServers: { alpha: { command: process.execPath, args: [stub] } } }));
+    const bridge = start([cliScript, "--config", configPath], { ...process.env, HOME: dir });
+    let stderr = "";
+    bridge.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    await waitUntil(() => /\[upstream:alpha\] connected/.test(stderr), 10_000);
+    const [firstDaemon] = daemonPidsRunning(cliScript);
+    expect(firstDaemon).toBeDefined();
+
+    process.kill(firstDaemon!, "SIGKILL");
+    const servedByNewDaemon = () => {
+      const successor = daemonPidsRunning(cliScript).find((pid) => pid !== firstDaemon);
+      return successor !== undefined && childCommands(successor).some((cmd) => cmd.includes(stub));
+    };
+    await waitUntil(servedByNewDaemon, 20_000);
+
+    expect(stderr).toMatch(/\[daemon-stdio:alpha\] force_respawn .*sessionsReopened=1/);
+    expect(servedByNewDaemon()).toBe(true);
+  }, 40_000);
 
   it("a bridge exits when its client closes stdin", async () => {
     dir = await mkdtemp("/tmp/cbe-cli-");

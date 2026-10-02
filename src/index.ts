@@ -7,8 +7,9 @@ import {
   ConfigWatcher,
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
-import { resolveUpstreams, isStdioServer } from "./config/schema.js";
+import { findRemovedReconnectLimit, resolveUpstreams, isStdioServer } from "./config/schema.js";
 import type {
+  BridgeConfig,
   ServerBridgeConfig,
   ServerConfig,
   HttpServerConfig,
@@ -25,6 +26,7 @@ import { UpstreamManager } from "./upstream/index.js";
 import { ensureDaemonRunning } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
+import type { Logger } from "./logging/index.js";
 import {
   CredentialStore,
   CredentialSchema,
@@ -35,6 +37,16 @@ import {
 import { onClientDisconnect } from "./process/client-disconnect.js";
 
 const SHUTDOWN_DEADLINE_MS = 5_000;
+
+function warnRemovedReconnectLimit(config: BridgeConfig, logger: Logger): void {
+  const locations = findRemovedReconnectLimit(config);
+  if (locations.length === 0) return;
+  logger.warn(
+    `maxReconnectAttempts is no longer supported and is ignored (${locations.join(", ")}); ` +
+      "upstreams now retry indefinitely with capped backoff",
+    { component: "config" },
+  );
+}
 
 function buildServerBridgeConfigs(
   upstreams: Record<string, ServerConfig>,
@@ -113,6 +125,7 @@ program
         return;
       }
 
+      warnRemovedReconnectLimit(config, logger);
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
@@ -192,6 +205,7 @@ program
       // Config hot-reload handler
       const onConfigReload = async (newConfig: typeof config) => {
         const diff = diffConfigs(config, newConfig);
+        warnRemovedReconnectLimit(newConfig, logger);
 
         // Bridge-level hot-reloadable settings
         if (diff.bridge.logLevel) {
@@ -240,6 +254,8 @@ program
         if (hasServerChanges) {
           await upstreamManager!.applyConfigDiff(diff, newConfig);
         }
+
+        upstreamManager!.retryAuthPaused();
 
         config = newConfig;
       };

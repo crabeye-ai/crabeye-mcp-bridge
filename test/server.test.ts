@@ -63,6 +63,7 @@ function makeMockUpstreamClient(
     close: vi.fn().mockResolvedValue(undefined),
     ping: vi.fn().mockResolvedValue(undefined),
     reconnect: vi.fn().mockResolvedValue(undefined),
+    retryNow: vi.fn().mockResolvedValue(undefined),
     onStatusChange: vi.fn().mockReturnValue(() => {}),
     onToolsChanged: vi.fn().mockReturnValue(() => {}),
     ...overrides,
@@ -369,11 +370,10 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("throws immediately when upstream has permanently failed", async () => {
+  it("tells the caller to re-authorize when the upstream is still paused for authorization", async () => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
-
-    const mockClient = makeMockUpstreamClient("srv", { status: "error" });
+    const mockClient = makeMockUpstreamClient("srv", { status: "auth_required" });
 
     const { client, cleanup } = await createTestPair({
       registry,
@@ -382,9 +382,101 @@ describe("tools/call", () => {
 
     await expect(
       client.callTool({ name: "srv__my-tool", arguments: {} }),
-    ).rejects.toThrow(/failed permanently/);
+    ).rejects.toThrow(/needs re-authorization\. Run: crabeye-mcp-bridge auth srv/);
+    expect(mockClient.retryNow).toHaveBeenCalledOnce();
+    expect(mockClient.callTool).not.toHaveBeenCalled();
 
     await cleanup();
+  });
+
+  it("runs the tool once a paused upstream reconnects after re-authorization", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+    const mockClient: UpstreamClient = makeMockUpstreamClient("srv", {
+      status: "auth_required",
+      callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] }),
+      retryNow: vi.fn(async () => {
+        (mockClient as { status: string }).status = "connected";
+      }),
+    });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    const result = await client.callTool({ name: "srv__my-tool", arguments: {} });
+    expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+
+    await cleanup();
+  });
+
+  it("keeps waiting instead of blaming authorization when a paused upstream's retry fails for another reason", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+    const statusListeners = new Set<(event: { previous: string; current: string }) => void>();
+    const mockClient: UpstreamClient = makeMockUpstreamClient("srv", {
+      status: "auth_required",
+      callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] }),
+      retryNow: vi.fn(async () => {
+        (mockClient as { status: string }).status = "disconnected";
+      }),
+      onStatusChange: vi.fn((cb) => {
+        statusListeners.add(cb);
+        return () => { statusListeners.delete(cb); };
+      }),
+    });
+
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    const callPromise = client.callTool({ name: "srv__my-tool", arguments: {} });
+    await vi.waitFor(() => expect(statusListeners.size).toBe(1));
+    (mockClient as { status: string }).status = "connected";
+    for (const cb of statusListeners) cb({ previous: "disconnected", current: "connected" });
+
+    const result = await callPromise;
+    expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+
+    await cleanup();
+  });
+
+  it("returns the 'reconnecting' error after waiting 60s for an upstream that stays down", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+    let retryRequested: () => void = () => {};
+    const retried = new Promise<void>((r) => (retryRequested = r));
+    const mockClient = makeMockUpstreamClient("srv", {
+      status: "disconnected",
+      retryNow: vi.fn(async () => retryRequested()),
+    });
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    try {
+      let settled = false;
+      const callPromise = client
+        .callTool({ name: "srv__my-tool", arguments: {} }, { timeout: 120_000 })
+        .finally(() => (settled = true));
+      const assertion = expect(callPromise).rejects.toThrow(
+        /Upstream server "srv" is unavailable; reconnecting in the background/,
+      );
+      await retried;
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await assertion;
+      expect(mockClient.callTool).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      await cleanup();
+    }
   });
 
   it("waits for reconnection and succeeds when server comes back", async () => {
@@ -411,8 +503,7 @@ describe("tools/call", () => {
     // Start the tool call — it will wait for reconnection
     const callPromise = client.callTool({ name: "srv__my-tool", arguments: {} });
 
-    // Simulate reconnection after a short delay
-    await new Promise((r) => setTimeout(r, 50));
+    await vi.waitFor(() => expect(mockClient.retryNow).toHaveBeenCalledOnce());
     (mockClient as { status: string }).status = "connected";
     for (const cb of statusListeners) {
       cb({ previous: "disconnected", current: "connected" });
@@ -424,7 +515,7 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("waits for reconnection and fails when server goes to error", async () => {
+  it("stops waiting and asks for re-authorization when the reconnect needs it", async () => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
 
@@ -444,14 +535,34 @@ describe("tools/call", () => {
 
     const callPromise = client.callTool({ name: "srv__my-tool", arguments: {} });
 
-    // Simulate permanent failure after a short delay
-    await new Promise((r) => setTimeout(r, 50));
-    (mockClient as { status: string }).status = "error";
+    await vi.waitFor(() => expect(statusListeners.size).toBe(1));
+    (mockClient as { status: string }).status = "auth_required";
     for (const cb of statusListeners) {
-      cb({ previous: "disconnected", current: "error" });
+      cb({ previous: "disconnected", current: "auth_required" });
     }
 
-    await expect(callPromise).rejects.toThrow(/failed permanently/);
+    await expect(callPromise).rejects.toThrow(/needs re-authorization/);
+
+    await cleanup();
+  });
+
+  it("tells the caller to re-authorize when their tool call is what paused the upstream", async () => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
+    const mockClient: UpstreamClient = makeMockUpstreamClient("srv", {
+      callTool: vi.fn(async () => {
+        (mockClient as { status: string }).status = "auth_required";
+        throw new Error("Server returned 401 after re-authentication");
+      }),
+    });
+    const { client, cleanup } = await createTestPair({
+      registry,
+      getUpstreamClient: () => mockClient,
+    });
+
+    await expect(
+      client.callTool({ name: "srv__my-tool", arguments: {} }),
+    ).rejects.toThrow(/needs re-authorization\. Run: crabeye-mcp-bridge auth srv/);
 
     await cleanup();
   });

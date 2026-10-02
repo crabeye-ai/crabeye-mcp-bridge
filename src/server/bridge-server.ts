@@ -16,7 +16,7 @@ import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
 import { ApprovalFlow } from "./policy-approval.js";
 import { ClientMetadata } from "./client-metadata.js";
-import type { ConnectionStatus, UpstreamClient } from "../upstream/types.js";
+import type { UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
   SEARCH_TOOL_NAME,
@@ -101,6 +101,14 @@ function observeStart(transport: Transport): {
       transport.start = originalStart;
     },
   };
+}
+
+function reauthorizationError(source: string, serverName: string): ProtocolError {
+  return new ProtocolError(
+    ProtocolErrorCode.InternalError,
+    `Upstream server "${source}" needs re-authorization. Run: ${APP_NAME} auth ${serverName} ` +
+      "(or update its configured credentials if it does not use OAuth).",
+  );
 }
 
 function errorResult(text: string): CallToolResult {
@@ -303,43 +311,7 @@ export class BridgeServer {
     }
 
     if (client.status !== "connected") {
-      if (client.status === "error") {
-        throw new ProtocolError(
-          ProtocolErrorCode.InternalError,
-          `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
-        );
-      }
-
-      // Server is reconnecting — wait for it
-      this.options.logger?.info("waiting for server to reconnect", {
-        component: "bridge",
-        server: parsed.source,
-      });
-
-      const reconnected = await this.waitForReconnect(client);
-
-      if (!reconnected) {
-        // waitForReconnect resolves false for both "errored" and "timed out".
-        // Cast to widen back to the full ConnectionStatus union: the
-        // mutable status field can transition during the await, so the
-        // narrowing TS inferred before the await is no longer accurate.
-        const statusAfterWait = client.status as ConnectionStatus;
-        if (statusAfterWait === "error") {
-          throw new ProtocolError(
-            ProtocolErrorCode.InternalError,
-            `Upstream server "${parsed.source}" has failed permanently. Please retry later.`,
-          );
-        }
-        throw new ProtocolError(
-          ProtocolErrorCode.InternalError,
-          `Upstream server "${parsed.source}" did not reconnect within ${WAIT_FOR_RESPAWN_MS / 1000}s. Please retry in 30 seconds.`,
-        );
-      }
-
-      this.options.logger?.info("server reconnected, executing tool call", {
-        component: "bridge",
-        server: parsed.source,
-      });
+      await this.awaitUpstream(client, parsed.source);
     }
 
     const rateLimiter = this.options.getRateLimiter?.(parsed.source);
@@ -358,12 +330,36 @@ export class BridgeServer {
         arguments: args,
       });
     } catch (err) {
+      if (client.status === "auth_required") throw reauthorizationError(parsed.source, client.name);
       const message = err instanceof Error ? err.message : String(err);
       throw new ProtocolError(
         ProtocolErrorCode.InternalError,
         `Upstream server "${parsed.source}" error: ${message}`,
       );
     }
+  }
+
+  private async awaitUpstream(client: UpstreamClient, source: string): Promise<void> {
+    this.options.logger?.info("waiting for server to reconnect", {
+      component: "bridge",
+      server: source,
+    });
+    void client.retryNow();
+
+    if (await this.waitForReconnect(client)) {
+      this.options.logger?.info("server reconnected, executing tool call", {
+        component: "bridge",
+        server: source,
+      });
+      return;
+    }
+    if (client.status === "auth_required") {
+      throw reauthorizationError(source, client.name);
+    }
+    throw new ProtocolError(
+      ProtocolErrorCode.InternalError,
+      `Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`,
+    );
   }
 
   private waitForReconnect(client: UpstreamClient): Promise<boolean> {
@@ -373,7 +369,7 @@ export class BridgeServer {
         resolve(true);
         return;
       }
-      if (client.status === "error") {
+      if (client.status === "auth_required") {
         resolve(false);
         return;
       }
@@ -388,7 +384,7 @@ export class BridgeServer {
           clearTimeout(timeout);
           unsubscribe();
           resolve(true);
-        } else if (event.current === "error") {
+        } else if (event.current === "auth_required") {
           clearTimeout(timeout);
           unsubscribe();
           resolve(false);

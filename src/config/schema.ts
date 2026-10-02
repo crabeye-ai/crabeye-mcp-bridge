@@ -108,9 +108,9 @@ export const RateLimitConfigOrDisabledSchema = z.union([
 ]);
 
 export const ReconnectConfigSchema = z.object({
-  maxReconnectAttempts: z.number().int().min(0).optional(),
-  reconnectBaseDelay: z.number().int().positive().optional(),
-  reconnectMaxDelay: z.number().int().positive().optional(),
+  reconnectBaseDelay: z.number().int().min(100).optional(),
+  reconnectMaxDelay: z.number().int().min(1000).optional(),
+  maxReconnectAttempts: z.unknown().optional(),
 });
 
 /**
@@ -356,4 +356,12 @@ export function isStdioServer(
   config: ServerConfig,
 ): config is StdioServerConfig {
   return "command" in config;
+}
+
+export function findRemovedReconnectLimit(config: BridgeConfig): string[] {
+  const locations = Object.entries(resolveUpstreams(config))
+    .filter(([, server]) => server._bridge?.reconnect?.maxReconnectAttempts !== undefined)
+    .map(([name]) => `server "${name}"`);
+  if (config._bridge.reconnect?.maxReconnectAttempts !== undefined) locations.unshift("_bridge");
+  return locations;
 }

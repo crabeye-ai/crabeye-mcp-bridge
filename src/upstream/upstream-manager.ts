@@ -140,7 +140,6 @@ export class UpstreamManager {
     const globalReconnect = this._config._bridge.reconnect;
     const serverReconnect: ReconnectConfig | undefined = config._bridge?.reconnect;
     return {
-      maxReconnectAttempts: serverReconnect?.maxReconnectAttempts ?? globalReconnect?.maxReconnectAttempts,
       reconnectBaseDelay: serverReconnect?.reconnectBaseDelay ?? globalReconnect?.reconnectBaseDelay,
       reconnectMaxDelay: serverReconnect?.reconnectMaxDelay ?? globalReconnect?.reconnectMaxDelay,
     };
@@ -298,15 +297,15 @@ export class UpstreamManager {
       }
     });
 
+    let pauseLogged = false;
     const unsubStatus = group.client.onStatusChange((event) => {
-      if (event.current === "error") {
-        log.error(`error: ${event.error?.message ?? "unknown"}`);
-        for (const aliasName of group.aliasNames) {
-          this._toolRegistry.removeSource(aliasName);
-        }
-      } else {
-        log.debug(`${event.current}`);
+      if (event.current === "auth_required" && !pauseLogged) {
+        pauseLogged = true;
+        log.warn(`authorization required; paused until the next call or reload: ${event.error?.message ?? "unknown"}`);
+        return;
       }
+      if (event.current === "connected") pauseLogged = false;
+      log.debug(`${event.current}`);
     });
 
     group.unsubscribers.push(unsubTools, unsubStatus);
@@ -462,6 +461,12 @@ export class UpstreamManager {
     return out;
   }
 
+  retryAuthPaused(): void {
+    for (const group of new Set(this._nameToGroup.values())) {
+      if (group.client.status === "auth_required") void group.client.retryNow();
+    }
+  }
+
   startHealthChecks(): void {
     if (this._healthCheckInterval <= 0) return;
     if (this._healthTimer) return;
@@ -530,7 +535,7 @@ export class UpstreamManager {
             failures: t.consecutiveFailures,
           });
 
-          if (t.consecutiveFailures >= this._unhealthyThreshold) {
+          if (t.consecutiveFailures >= this._unhealthyThreshold && group.client.status === "connected") {
             this._logger.error(
               `${t.consecutiveFailures} consecutive ping failures, reconnecting`,
               { component: "health", server: logServer },

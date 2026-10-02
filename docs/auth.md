@@ -44,6 +44,8 @@ crabeye-mcp-bridge auth Linear
 
 A browser tab opens, you authorize, and the bridge stores the resulting tokens in the encrypted credential store. From that point on, the bridge uses those tokens automatically and refreshes them when the upstream returns 401. No config change is required — the bridge detects stored OAuth tokens by server name and attaches an OAuth client transparently.
 
+**When authorization expires.** If the authorization server rejects the stored tokens, or the upstream keeps refusing the bridge's credentials, the bridge pauses that upstream instead of retrying in the background. Its tools stay searchable, and a `run_tool` call tries the connection once more before returning an error that tells you to run `crabeye-mcp-bridge auth <server>` (or, for an upstream that doesn't use OAuth, to update its configured credentials). Once you re-authorize, the next call (or the next config reload) reconnects without restarting the bridge. If the authorization server is only unreachable, the bridge keeps retrying in the background as for any other outage.
+
 ### `auth` subcommands
 
 | Command | Description |
