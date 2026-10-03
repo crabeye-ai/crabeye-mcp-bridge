@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { APP_VERSION } from "../../src/constants.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
 import { DaemonStdioClient } from "../../src/upstream/daemon-stdio-client.js";
+import { until } from "../_helpers/daemon-fixtures.js";
 
 const isWindows = process.platform === "win32";
 
@@ -295,6 +296,50 @@ describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () 
 
     // Test passed if we got this far.
     expect(true).toBe(true);
+  }, 15000);
+
+  it("closes its daemon connection when its session is evicted", async () => {
+    let capturedSessionId: string | null = null;
+    let bridgeSocket: Socket | null = null;
+    let connectionClosed = false;
+
+    server = createServer((sock: Socket) => {
+      bridgeSocket = sock;
+      sock.on("close", () => {
+        connectionClosed = true;
+      });
+      const decoder = new FrameDecoder();
+      sock.on("data", (chunk: Buffer) => {
+        decoder.push(chunk);
+        for (let frame = decoder.next(); frame !== null; frame = decoder.next()) {
+          const f = frame as { id?: string; method?: string; params?: { sessionId?: string } };
+          if (f.method === "OPEN" && typeof f.id === "string") {
+            capturedSessionId = f.params?.sessionId ?? null;
+          }
+          if (typeof f.id === "string") sock.write(encodeFrame({ id: f.id, result: { ok: true } }));
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server!.listen(sockPath, resolve));
+
+    const client = new DaemonStdioClient({
+      name: "evict-close-test",
+      config: {
+        command: "node",
+        args: ["-e", "process.stdin.on('data', () => {})"],
+        _bridge: { sharing: "auto" },
+      } as never,
+      resolvedEnv: {},
+      _socketPath: sockPath,
+      _ensureDaemon: async () => {},
+    });
+    void client.connect().catch(() => {});
+    await until(() => capturedSessionId !== null);
+
+    bridgeSocket!.write(
+      encodeFrame({ method: "SESSION_EVICTED", params: { sessionId: capturedSessionId, reason: "child_exited" } }),
+    );
+    await until(() => connectionClosed);
   }, 15000);
 
   it("ignores SESSION_EVICTED for a different sessionId", async () => {

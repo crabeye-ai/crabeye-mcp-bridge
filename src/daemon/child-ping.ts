@@ -9,9 +9,8 @@
  * watches for any response (a JSON-RPC error is fine — an error response
  * still proves the child is reading + writing the stdio pipes).
  *
- * On `maxConsecutiveFailures` failures, `onWedged` fires. The caller is
- * expected to kill the child; the daemon's existing `handleChildExit` path
- * then runs and the bridge reconnects through its normal disconnect flow.
+ * On `maxConsecutiveFailures` failures, `onWedged` fires; the daemon tears
+ * the group down and evicts its sessions so their bridges reconnect.
  */
 
 import type { Logger } from "../logging/index.js";
@@ -80,11 +79,6 @@ export class ChildPing {
       this.cadenceTimer = null;
     }
     this.clearPending();
-  }
-
-  /** True once the supervisor has declared the child wedged. */
-  get isWedged(): boolean {
-    return this.wedged;
   }
 
   /** Test seam. */

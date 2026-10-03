@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const runDir = vi.hoisted(() => ({ path: "" }));
 
@@ -23,8 +23,16 @@ const { processExists } = await import("../../src/process/process-utils.js");
 
 describe.skipIf(process.platform === "win32")("daemon stop", () => {
   const children: ChildProcess[] = [];
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync("/tmp/cbe-stoph-");
+    vi.stubEnv("HOME", home);
+  });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
     vi.restoreAllMocks();
     for (const child of children.splice(0)) child.kill("SIGKILL");
     rmSync(runDir.path, { recursive: true, force: true });
@@ -105,4 +113,32 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
 
     expect(stderr()).toBe("daemon stopped\n");
   });
+
+  it("waits the daemon's kill grace plus a shutdown margin before force-stopping it", async () => {
+    runDir.path = mkdtempSync("/tmp/cbe-stopu-");
+    const slowToExit = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e6)"], { stdio: "ignore" });
+    children.push(slowToExit);
+    await new Promise((r) => setTimeout(r, 200));
+    writeFileSync(join(runDir.path, "manager.pid"), `${slowToExit.pid}\n`);
+    const daemon = createServer((sock: Socket) => {
+      const decoder = new FrameDecoder();
+      sock.on("data", (chunk: Buffer) => {
+        decoder.push(chunk);
+        for (let frame = decoder.next(); frame !== null; frame = decoder.next()) {
+          sock.write(encodeFrame({ id: (frame as { id?: string }).id, result: { ok: true } }));
+          setTimeout(() => slowToExit.kill("SIGKILL"), 2_500);
+        }
+      });
+    });
+    await new Promise<void>((r) => daemon.listen(join(runDir.path, "manager.sock"), () => r()));
+    const stderr = captureStderr();
+
+    try {
+      expect(await runDaemonCommand("stop")).toBe(0);
+    } finally {
+      await new Promise<void>((r) => daemon.close(() => r()));
+    }
+
+    expect(stderr()).toBe("daemon stopped\n");
+  }, 15_000);
 });

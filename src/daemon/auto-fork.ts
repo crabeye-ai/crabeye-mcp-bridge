@@ -1,5 +1,6 @@
 import type { Logger } from "../logging/index.js";
 import type { ChildGroup, SessionAttachment } from "./manager.js";
+import type { SessionEvictedParams } from "./protocol.js";
 
 export interface AutoForkDeps {
   logger: Logger;
@@ -41,10 +42,10 @@ export interface AutoForkDeps {
   unregisterInternal: (group: ChildGroup, id: number) => void;
   /** Force-kill a group (used when initialize replay fails). */
   killGroup: (group: ChildGroup) => void;
-  /** Evict a session: emit SESSION_EVICTED notification + force-detach. */
+  /** Evict a session: fail its in-flight requests, detach it, then emit SESSION_EVICTED. */
   evictSession: (
     sessionId: string,
-    reason: "auto_fork_initialize_failed" | "auto_fork_drain_timeout",
+    reason: Extract<SessionEvictedParams["reason"], `auto_fork_${string}`>,
   ) => void;
   /** URIs a session subscribed to within a specific group. */
   urisForSession: (group: ChildGroup, sessionId: string) => string[];

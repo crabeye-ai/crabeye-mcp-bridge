@@ -10,13 +10,22 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DaemonClient } from "../../src/daemon/client.js";
-import { ManagerDaemon } from "../../src/daemon/manager.js";
+import { ManagerDaemon, type ManagerOptions } from "../../src/daemon/manager.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 import type { DaemonNotification, OpenParams } from "../../src/daemon/protocol.js";
+
+export async function until(check: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() > deadline) throw new Error("condition not met");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
 
 export interface SpawnTestManagerOpts {
   /** Override idleMs (default 60_000). */
   idleMs?: number;
+  manager?: Partial<ManagerOptions>;
 }
 
 export interface DaemonFixture {
@@ -66,6 +75,7 @@ export async function spawnTestManager(opts: SpawnTestManagerOpts = {}): Promise
     idleMs: opts.idleMs ?? 60_000,
     transport: netTransport,
     processTrackerPath: join(paths.dir, "processes.json"),
+    ...opts.manager,
   });
   await manager.start();
 
@@ -108,17 +118,7 @@ export async function spawnTestManager(opts: SpawnTestManagerOpts = {}): Promise
         await manager.stop(0).catch(() => {});
         killed = true;
       }
-      // Manager.stop() resolves before tracker fsync may finish; retry a few
-      // times if the dir is briefly non-empty.
-      for (let i = 0; i < 5; i++) {
-        try {
-          await rm(paths.dir, { recursive: true, force: true });
-          return;
-        } catch {
-          await new Promise((r) => setTimeout(r, 50));
-        }
-      }
-      await rm(paths.dir, { recursive: true, force: true }).catch(() => {});
+      await rm(paths.dir, { recursive: true, force: true });
     },
   };
   return fx;
@@ -148,12 +148,15 @@ function nextSessionId(): string {
 
 export class OpenSessionFixture {
   readonly sessionId: string;
+  readonly spec: OpenParams["spec"];
   private inboundRpcHandlers: Array<(payload: unknown) => void> = [];
+  readonly evictions: Array<{ reason: string; framesBefore: number }> = [];
   private inboundFrames: unknown[] = [];
   private auxClient: DaemonClient;
 
-  private constructor(sessionId: string, auxClient: DaemonClient) {
+  private constructor(sessionId: string, spec: OpenParams["spec"], auxClient: DaemonClient) {
     this.sessionId = sessionId;
+    this.spec = spec;
     this.auxClient = auxClient;
     auxClient.setNotificationHandler((notif) => this._onNotification(notif));
   }
@@ -182,7 +185,7 @@ export class OpenSessionFixture {
     };
     await c.call("OPEN", { sessionId, spec });
 
-    const fixture = new OpenSessionFixture(sessionId, c);
+    const fixture = new OpenSessionFixture(sessionId, spec, c);
     return fixture;
   }
 
@@ -227,6 +230,14 @@ export class OpenSessionFixture {
     return this.auxClient.sendNotification(method, params);
   }
 
+  sendRpc(payload: unknown): boolean {
+    return this.auxClient.sendNotification("RPC", { sessionId: this.sessionId, payload });
+  }
+
+  framesMatching(predicate: (payload: unknown) => boolean): unknown[] {
+    return this.inboundFrames.filter(predicate);
+  }
+
   /** Issue an RPC call over the session's owning channel. */
   async call(method: string, params?: unknown): Promise<unknown> {
     return this.auxClient.call(method, params);
@@ -241,6 +252,13 @@ export class OpenSessionFixture {
   }
 
   private _onNotification(notif: DaemonNotification): void {
+    if (notif.method === "SESSION_EVICTED") {
+      const evicted = notif.params as { sessionId?: string; reason?: string } | undefined;
+      if (evicted?.sessionId === this.sessionId) {
+        this.evictions.push({ reason: evicted.reason ?? "", framesBefore: this.inboundFrames.length });
+      }
+      return;
+    }
     if (notif.method !== "RPC") return;
     const params = notif.params as { sessionId?: string; payload?: unknown } | undefined;
     if (params === undefined || params.sessionId !== this.sessionId) return;

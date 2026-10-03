@@ -343,6 +343,7 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
       if (params && params.sessionId === this._daemonSessionId) {
         const reasonErr = new Error(`daemon evicted session: ${params.reason ?? "unknown"}`);
         this.onerror?.(reasonErr);
+        void this.supervisor.close();
         this._onSocketClose();
       }
       return;

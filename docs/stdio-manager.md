@@ -68,7 +68,9 @@ crabeye-mcp-bridge daemon restart-upstream <upstreamHash>
 crabeye-mcp-bridge daemon restart-upstream --all
 ```
 
-Existing sessions on the killed child receive `ERR_UPSTREAM_RESTARTED { reason: "admin_restart" }`; the bridge re-OPENs on the next request, and a fresh child is spawned.
+Requests still in flight on the killed child fail with an "upstream restarted" error. Each bridge using that child reconnects on its own and gets a fresh child, so the next tool call goes through without restarting the client.
+
+The same happens when a child crashes, stops answering health pings, or floods its output: its bridges reconnect to a fresh child instead of waiting for requests to time out.
 
 ## Configuration knobs
 
@@ -152,7 +154,7 @@ The manager's `STATUS` RPC returns a `telemetry` object alongside the existing `
       "spawnedTotal": 12,                // counter: spawns since manager start
       "killedTotal": {
         "grace": 7, "restart": 2,
-        "fork": 0, "crash": 0
+        "fork": 0, "crash": 0, "wedged": 0
       }
     },
     "sessions": {
@@ -176,7 +178,8 @@ All counters are **process-lifetime** — they reset to zero on manager respawn.
 * **`grace`** — refcount dropped to zero and the `graceMs` timer fired.
 * **`restart`** — admin `RESTART` RPC (CLI `daemon restart-upstream`).
 * **`fork`** — child killed during auto-fork dedicated-spawn migration.
-* **`crash`** — child exited unexpectedly (non-zero exit, or signal the manager did not send).
+* **`crash`** — child exited on its own (any exit code, or a signal the manager did not send), or was killed for flooding its output without line breaks.
+* **`wedged`** — child stopped answering the manager's health pings and was killed.
 
 ### Force-respawn events (bridge-side)
 

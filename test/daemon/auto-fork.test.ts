@@ -7,6 +7,8 @@ import { DaemonClient } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 import { createNoopLogger } from "../../src/logging/index.js";
 import type { ChildGroup } from "../../src/daemon/manager.js";
+import { until } from "../_helpers/daemon-fixtures.js";
+import { INNER_ERROR_CODE_UPSTREAM_RESTARTED } from "../../src/daemon/protocol.js";
 
 const isWindows = process.platform === "win32";
 
@@ -176,7 +178,6 @@ describe("AutoForkOrchestrator — shared/dedicated dispatch", () => {
       serverName: "stub",
       startedAt: 0,
       graceTimer: null,
-      dying: false,
       initializedSeen: false,
       mode: opts.sharing === "dedicated" ? "dedicated" : "shared",
       sharing: opts.sharing,
@@ -184,6 +185,7 @@ describe("AutoForkOrchestrator — shared/dedicated dispatch", () => {
       internalRequests: new Map(),
       nextInternalId: -1,
       childPing: null,
+      teardown: null,
     };
   }
 
@@ -1249,9 +1251,8 @@ describe.skipIf(isWindows)("AutoForkOrchestrator — edge cases (Phase D)", () =
   it("old child dies mid-fork: draining sessions still complete migration", async () => {
     // Setup: two auto OPENs (sid1 + sid2), trigger fork, then kill old child
     // before its inflight responses arrive. The new child for sid2 still
-    // initializes successfully; migration should complete (no stuck inflight
-    // because the rewriter detach happens via handleChildExit's detach flow,
-    // and our draining branch in detachSession handles cleanup).
+    // initializes successfully; migration should complete because teardownGroup
+    // hands draining sessions back to the orchestrator instead of evicting them.
     let nextPid = 8000;
     let firstChild = true;
     let oldChildOnClose: (() => void) | null = null;
@@ -1328,7 +1329,7 @@ describe.skipIf(isWindows)("AutoForkOrchestrator — edge cases (Phase D)", () =
 
       // STATUS: sid2 should be on its new dedicated child.
       // sid1 (originating) was on the old child, which just died — so sid1's
-      // session should also be detached (handleChildExit cleanup).
+      // session should also be detached (teardownGroup eviction).
       const status = (await c2.call("STATUS")) as {
         children: Array<{ pid: number; sessions: string[]; mode: string }>;
         sessions: Array<{ sessionId: string }>;
@@ -1340,6 +1341,330 @@ describe.skipIf(isWindows)("AutoForkOrchestrator — edge cases (Phase D)", () =
       const sid2Child = status.children.find((c) => c.sessions.includes(sid2));
       expect(sid2Child).toBeDefined();
       expect(sid2Child!.mode).toBe("dedicated");
+    } finally {
+      c1.close();
+      c2.close();
+    }
+  });
+
+  it("new child dies mid-drain: the migrating session is evicted and its in-flight and queued requests fail once", async () => {
+    let nextPid = 8500;
+    const onCloseByPid = new Map<number, () => void>();
+
+    manager = new ManagerDaemon({
+      socketPath: paths.sock,
+      pidPath: paths.pid,
+      lockPath: paths.lock,
+      idleMs: 60_000,
+      transport: netTransport,
+      processTrackerPath: paths.proc,
+      autoForkDrainTimeoutMs: 5_000,
+      _spawnChild: (_spec, cb) => {
+        const pid = nextPid++;
+        const isFirst = pid === 8500;
+        onCloseByPid.set(pid, cb.onClose);
+        const handle = {
+          startedAt: Date.now(),
+          pid,
+          alive: true,
+          cachedInit: null as unknown,
+          setCachedInit(init: unknown): void { handle.cachedInit = init; },
+          send(payload: unknown): void {
+            const p = payload as { id?: number; method?: string };
+            if (isFirst || typeof p.id !== "number" || p.id >= 0) return;
+            setTimeout(() => {
+              const result =
+                p.method === "initialize"
+                  ? { protocolVersion: "2025-06-18", serverInfo: { name: "stub", version: "1" }, capabilities: {} }
+                  : {};
+              cb.onMessage({ jsonrpc: "2.0", id: p.id, result });
+            }, 5);
+          },
+          async kill(): Promise<void> {},
+        };
+        return handle as never;
+      },
+    });
+    await manager.start();
+
+    const c1 = freshClient(paths);
+    const c2 = freshClient(paths);
+    const evictions: unknown[] = [];
+    const frames: unknown[] = [];
+    c2.setNotificationHandler((n) => {
+      if (n.method === "SESSION_EVICTED") evictions.push(n.params);
+      if (n.method === "RPC") frames.push((n.params as { payload: unknown }).payload);
+    });
+    try {
+      await c1.connect();
+      await c2.connect();
+      const sid1 = "11111111-1111-1111-1111-111111111111";
+      const sid2 = "22222222-2222-2222-2222-222222222222";
+      await c1.call("OPEN", { sessionId: sid1, spec: defaultSpec("auto") });
+      await c2.call("OPEN", { sessionId: sid2, spec: defaultSpec("auto") });
+      c2.sendNotification("RPC", { sessionId: sid2, payload: { jsonrpc: "2.0", id: 42, method: "tools/call" } });
+      await until(async () => {
+        const s = (await c2.call("STATUS")) as { telemetry?: { rpc?: { inFlight?: number } } };
+        return (s.telemetry?.rpc?.inFlight ?? 0) > 0;
+      });
+
+      manager.spawnedChildEmitForTest({ jsonrpc: "2.0", id: 100, method: "sampling/createMessage", params: {} });
+      let newChildPid: number | undefined;
+      await until(async () => {
+        const s = (await c2.call("STATUS")) as { children: Array<{ pid: number; sessions: string[] }> };
+        newChildPid = s.children.find((c) => c.pid !== 8500 && c.sessions.includes(sid2))?.pid;
+        return newChildPid !== undefined;
+      });
+
+      c2.sendNotification("RPC", { sessionId: sid2, payload: { jsonrpc: "2.0", id: 43, method: "tools/call" } });
+      await c2.call("STATUS");
+      onCloseByPid.get(newChildPid!)!();
+      await until(() => evictions.length > 0 && frames.some((f) => (f as { id?: unknown }).id === 43));
+      const after = (await c1.call("STATUS")) as { sessions: Array<{ sessionId: string }> };
+      await manager.stop(0);
+
+      expect(evictions).toEqual([{ sessionId: sid2, reason: "child_exited" }]);
+      expect(frames.filter((f) => (f as { id?: unknown }).id === 42)).toHaveLength(1);
+      expect(frames.filter((f) => (f as { id?: unknown }).id === 43)).toHaveLength(1);
+      expect(after.sessions.map((s) => s.sessionId)).toEqual([sid1]);
+    } finally {
+      c1.close();
+      c2.close();
+    }
+  });
+
+  it("RESTART mid-drain: the migrating session is evicted and its in-flight and queued requests fail once as restarted", async () => {
+    let nextPid = 8800;
+    const onCloseByPid = new Map<number, () => void>();
+
+    manager = new ManagerDaemon({
+      socketPath: paths.sock,
+      pidPath: paths.pid,
+      lockPath: paths.lock,
+      idleMs: 60_000,
+      transport: netTransport,
+      processTrackerPath: paths.proc,
+      autoForkDrainTimeoutMs: 5_000,
+      _spawnChild: (_spec, cb) => {
+        const pid = nextPid++;
+        const isFirst = pid === 8800;
+        onCloseByPid.set(pid, cb.onClose);
+        const handle = {
+          startedAt: Date.now(),
+          pid,
+          alive: true,
+          cachedInit: null as unknown,
+          setCachedInit(init: unknown): void { handle.cachedInit = init; },
+          send(payload: unknown): void {
+            const p = payload as { id?: number; method?: string };
+            if (isFirst || typeof p.id !== "number" || p.id >= 0) return;
+            setTimeout(() => {
+              const result =
+                p.method === "initialize"
+                  ? { protocolVersion: "2025-06-18", serverInfo: { name: "stub", version: "1" }, capabilities: {} }
+                  : {};
+              cb.onMessage({ jsonrpc: "2.0", id: p.id, result });
+            }, 5);
+          },
+          async kill(): Promise<void> {},
+        };
+        return handle as never;
+      },
+    });
+    await manager.start();
+
+    const c1 = freshClient(paths);
+    const c2 = freshClient(paths);
+    const evictions: unknown[] = [];
+    const frames: unknown[] = [];
+    c2.setNotificationHandler((n) => {
+      if (n.method === "SESSION_EVICTED") evictions.push(n.params);
+      if (n.method === "RPC") frames.push((n.params as { payload: unknown }).payload);
+    });
+    try {
+      await c1.connect();
+      await c2.connect();
+      const sid1 = "11111111-1111-1111-1111-111111111111";
+      const sid2 = "22222222-2222-2222-2222-222222222222";
+      await c1.call("OPEN", { sessionId: sid1, spec: defaultSpec("auto") });
+      await c2.call("OPEN", { sessionId: sid2, spec: defaultSpec("auto") });
+      c2.sendNotification("RPC", { sessionId: sid2, payload: { jsonrpc: "2.0", id: 42, method: "tools/call" } });
+      await until(async () => {
+        const s = (await c2.call("STATUS")) as { telemetry?: { rpc?: { inFlight?: number } } };
+        return (s.telemetry?.rpc?.inFlight ?? 0) > 0;
+      });
+
+      manager.spawnedChildEmitForTest({ jsonrpc: "2.0", id: 100, method: "sampling/createMessage", params: {} });
+      let newChildPid: number | undefined;
+      await until(async () => {
+        const s = (await c2.call("STATUS")) as { children: Array<{ pid: number; sessions: string[] }> };
+        newChildPid = s.children.find((c) => c.pid !== 8800 && c.sessions.includes(sid2))?.pid;
+        return newChildPid !== undefined;
+      });
+
+      c2.sendNotification("RPC", { sessionId: sid2, payload: { jsonrpc: "2.0", id: 43, method: "tools/call" } });
+      await c2.call("STATUS");
+      const hash = ((await c2.call("STATUS")) as { children: Array<{ upstreamHash: string }> }).children[0]!.upstreamHash;
+      await c1.call("RESTART", { upstreamHash: hash });
+      await until(() => evictions.length > 0 && frames.some((f) => (f as { id?: unknown }).id === 43));
+      const after = (await c1.call("STATUS")) as { sessions: Array<{ sessionId: string }> };
+      await manager.stop(0);
+
+      expect(evictions).toEqual([{ sessionId: sid2, reason: "upstream_restarted" }]);
+      for (const id of [42, 43]) {
+        const replies = frames.filter((f) => (f as { id?: unknown }).id === id) as Array<{ error?: { code?: number } }>;
+        expect(replies).toHaveLength(1);
+        expect(replies[0]!.error?.code).toBe(INNER_ERROR_CODE_UPSTREAM_RESTARTED);
+      }
+      expect(after.sessions).toEqual([]);
+    } finally {
+      c1.close();
+      c2.close();
+    }
+  });
+
+  it("old child dies mid-drain: its in-flight request fails at once and the session finishes migrating", async () => {
+    let nextPid = 8600;
+    let oldChildOnClose: (() => void) | undefined;
+
+    manager = new ManagerDaemon({
+      socketPath: paths.sock,
+      pidPath: paths.pid,
+      lockPath: paths.lock,
+      idleMs: 60_000,
+      transport: netTransport,
+      processTrackerPath: paths.proc,
+      autoForkDrainTimeoutMs: 30_000,
+      _spawnChild: (_spec, cb) => {
+        const pid = nextPid++;
+        const isFirst = pid === 8600;
+        if (isFirst) oldChildOnClose = cb.onClose;
+        const handle = {
+          startedAt: Date.now(),
+          pid,
+          alive: true,
+          cachedInit: null as unknown,
+          setCachedInit(init: unknown): void { handle.cachedInit = init; },
+          send(payload: unknown): void {
+            const p = payload as { id?: number; method?: string };
+            if (isFirst || typeof p.id !== "number") return;
+            setTimeout(() => {
+              const result =
+                p.method === "initialize"
+                  ? { protocolVersion: "2025-06-18", serverInfo: { name: "stub", version: "1" }, capabilities: {} }
+                  : {};
+              cb.onMessage({ jsonrpc: "2.0", id: p.id, result });
+            }, 5);
+          },
+          async kill(): Promise<void> {},
+        };
+        return handle as never;
+      },
+    });
+    await manager.start();
+
+    const c1 = freshClient(paths);
+    const c2 = freshClient(paths);
+    const evictions: unknown[] = [];
+    const frames: unknown[] = [];
+    c2.setNotificationHandler((n) => {
+      if (n.method === "SESSION_EVICTED") evictions.push(n.params);
+      if (n.method === "RPC") frames.push((n.params as { payload: unknown }).payload);
+    });
+    try {
+      await c1.connect();
+      await c2.connect();
+      const sid1 = "11111111-1111-1111-1111-111111111111";
+      const sid2 = "22222222-2222-2222-2222-222222222222";
+      await c1.call("OPEN", { sessionId: sid1, spec: defaultSpec("auto") });
+      await c2.call("OPEN", { sessionId: sid2, spec: defaultSpec("auto") });
+      c2.sendNotification("RPC", { sessionId: sid2, payload: { jsonrpc: "2.0", id: 42, method: "tools/call" } });
+      await until(async () => {
+        const s = (await c2.call("STATUS")) as { telemetry?: { rpc?: { inFlight?: number } } };
+        return (s.telemetry?.rpc?.inFlight ?? 0) > 0;
+      });
+      manager.spawnedChildEmitForTest({ jsonrpc: "2.0", id: 100, method: "sampling/createMessage", params: {} });
+      await until(async () => {
+        const s = (await c2.call("STATUS")) as { children: Array<{ pid: number; sessions: string[] }> };
+        return s.children.some((c) => c.pid !== 8600 && c.sessions.includes(sid2));
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      oldChildOnClose!();
+      await until(() => frames.some((f) => (f as { id?: unknown }).id === 42), 2_000);
+      c2.sendNotification("RPC", { sessionId: sid2, payload: { jsonrpc: "2.0", id: 44, method: "tools/call" } });
+      await until(() => frames.some((f) => (f as { id?: unknown }).id === 44), 2_000);
+      await manager.stop(0);
+
+      expect(frames.filter((f) => (f as { id?: unknown }).id === 42)).toHaveLength(1);
+      expect((frames.find((f) => (f as { id?: unknown }).id === 42) as { error?: unknown }).error).toBeDefined();
+      expect((frames.find((f) => (f as { id?: unknown }).id === 44) as { result?: unknown }).result).toBeDefined();
+      expect(evictions).toEqual([]);
+    } finally {
+      c1.close();
+      c2.close();
+    }
+  });
+
+  it("arms the health ping on a forked child that has only answered the daemon's own requests", async () => {
+    let nextPid = 8700;
+
+    manager = new ManagerDaemon({
+      socketPath: paths.sock,
+      pidPath: paths.pid,
+      lockPath: paths.lock,
+      idleMs: 60_000,
+      transport: netTransport,
+      processTrackerPath: paths.proc,
+      autoForkDrainTimeoutMs: 5_000,
+      childPingMs: 50,
+      childPingTimeoutMs: 50,
+      childPingMaxConsecutiveFailures: 1,
+      _spawnChild: (_spec, cb) => {
+        const pid = nextPid++;
+        const isFirst = pid === 8700;
+        const handle = {
+          startedAt: Date.now(),
+          pid,
+          alive: true,
+          cachedInit: null as unknown,
+          setCachedInit(init: unknown): void { handle.cachedInit = init; },
+          send(payload: unknown): void {
+            const p = payload as { id?: number | string; method?: string };
+            if (p.method === "ping") {
+              if (isFirst) setTimeout(() => cb.onMessage({ jsonrpc: "2.0", id: p.id, result: {} }), 5);
+              return;
+            }
+            if (isFirst || typeof p.id !== "number" || p.id >= 0) return;
+            setTimeout(() => {
+              const result =
+                p.method === "initialize"
+                  ? { protocolVersion: "2025-06-18", serverInfo: { name: "stub", version: "1" }, capabilities: {} }
+                  : {};
+              cb.onMessage({ jsonrpc: "2.0", id: p.id, result });
+            }, 5);
+          },
+          async kill(): Promise<void> {},
+        };
+        return handle as never;
+      },
+    });
+    await manager.start();
+
+    const c1 = freshClient(paths);
+    const c2 = freshClient(paths);
+    try {
+      await c1.connect();
+      await c2.connect();
+      await c1.call("OPEN", { sessionId: "11111111-1111-1111-1111-111111111111", spec: defaultSpec("auto") });
+      await c2.call("OPEN", { sessionId: "22222222-2222-2222-2222-222222222222", spec: defaultSpec("auto") });
+
+      manager.spawnedChildEmitForTest({ jsonrpc: "2.0", id: 100, method: "sampling/createMessage", params: {} });
+
+      await until(async () => {
+        const s = (await c1.call("STATUS")) as { telemetry: { children: { killedTotal: { wedged: number } } } };
+        return s.telemetry.children.killedTotal.wedged > 0;
+      });
     } finally {
       c1.close();
       c2.close();

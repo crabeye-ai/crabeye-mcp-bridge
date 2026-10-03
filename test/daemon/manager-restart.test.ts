@@ -29,10 +29,6 @@ describe.skipIf(isWindows)("ManagerDaemon — RESTART handler", () => {
     const res = (await fx.client.call("RESTART", params)) as RestartResult;
     expect(res).toEqual({ ok: true, killed: 1 });
 
-    // STATUS should now show no children (the killed group is gone).
-    // unregisterGroup() is awaited synchronously with the response chain so
-    // give the kill a tick to propagate.
-    await new Promise((r) => setTimeout(r, 100));
     const after = (await fx.client.call("STATUS")) as import("../../src/daemon/protocol.js").StatusResult;
     expect(after.children).toEqual([]);
     // Telemetry: admin RESTART increments killedTotal.restart.

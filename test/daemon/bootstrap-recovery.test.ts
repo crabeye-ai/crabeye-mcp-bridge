@@ -1,13 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonUnreachableError, DaemonUnresponsiveError, ensureDaemonRunning } from "../../src/daemon/bootstrap.js";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
 import { waitForExit } from "../../src/daemon/daemon-process.js";
 import { processExists } from "../../src/process/process-utils.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
+import { BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR, DEFAULT_KILL_GRACE_MS } from "../../src/constants.js";
+import { until } from "../_helpers/daemon-fixtures.js";
 
 const WAIT_MS = 2_500;
 const DAEMON_ARGS = [...DAEMON_LAUNCH_ARGS];
@@ -40,9 +42,11 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
     lockPath = join(dir, "manager.lock");
     pidPath = join(dir, "manager.pid");
     sigtermLog = join(dir, "sigterm-at");
+    vi.stubEnv("HOME", dir);
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     for (const child of children.splice(0)) child.kill("SIGKILL");
     for (const server of servers.splice(0)) await new Promise<void>((r) => server.close(() => r()));
     await rm(dir, { recursive: true, force: true });
@@ -56,7 +60,7 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
 
   async function startWedgedDaemon(script = SILENT_SERVER, args = DAEMON_ARGS): Promise<ChildProcess> {
     const child = spawnTracked(["-e", script, socketPath, sigtermLog, ...args]);
-    await waitUntil(() => stat(socketPath).then(() => true, () => false));
+    await until(() => stat(socketPath).then(() => true, () => false));
     await new Promise((r) => setTimeout(r, 100));
     return child;
   }
@@ -109,6 +113,35 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
     expect(Number(await readFile(sigtermLog, "utf-8")) - startedAt).toBeGreaterThanOrEqual(WAIT_MS);
     expect(launches).toHaveLength(1);
     expect(launches[0]!.wedgedAlive).toBe(false);
+  });
+
+  async function writeBridgeConfig(content: string): Promise<void> {
+    await mkdir(join(dir, CREDENTIALS_DIR), { recursive: true });
+    await writeFile(join(dir, CREDENTIALS_DIR, BRIDGE_CONFIG_FILENAME), content);
+  }
+
+  async function sigkillDelayAfterSigterm(): Promise<number> {
+    const wedged = await startWedgedDaemon();
+    await lockHeldBy(wedged.pid!);
+    const launches: Launch[] = [];
+
+    await ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 400, launch: launchReplacement(launches, wedged) });
+
+    expect(launches).toHaveLength(1);
+    expect(launches[0]!.wedgedAlive).toBe(false);
+    return launches[0]!.at - Number(await readFile(sigtermLog, "utf-8"));
+  }
+
+  it("gives a wedged daemon that ignores SIGTERM the configured kill grace plus a shutdown margin before SIGKILL", async () => {
+    await writeBridgeConfig(JSON.stringify({ _bridge: { daemon: { killGraceMs: 2_600 } } }));
+
+    expect(await sigkillDelayAfterSigterm()).toBeGreaterThanOrEqual(3_600);
+  });
+
+  it("falls back to the default kill grace when the bridge config is unreadable", async () => {
+    await writeBridgeConfig("{ not json");
+
+    expect(await sigkillDelayAfterSigterm()).toBeGreaterThanOrEqual(DEFAULT_KILL_GRACE_MS + 1_000);
   });
 
   it("still recovers a daemon whose listen queue is full and refuses connections", async () => {
@@ -364,10 +397,3 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
   });
 });
 
-async function waitUntil(check: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await check())) {
-    if (Date.now() > deadline) throw new Error("condition not met");
-    await new Promise((r) => setTimeout(r, 20));
-  }
-}

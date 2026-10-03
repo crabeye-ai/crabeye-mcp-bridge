@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { ERROR_CODE_BACKPRESSURE } from "./protocol.js";
+import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
 
 /**
  * Per-child stdin queue cap. MCP stdio messages are small (<10 KiB typical);
@@ -46,7 +47,7 @@ export interface ChildHandleOptions {
   cwd?: string;
   /** Called once per parsed newline-delimited JSON message from child stdout. */
   onMessage: (payload: unknown) => void;
-  /** Called once when the child exits or stdout ends. */
+  /** Called once when the child dies by any means other than a `kill()` call from outside. */
   onClose: () => void;
   /** Called for unrecoverable errors (spawn failure, parse failure). */
   onError: (err: Error) => void;
@@ -73,6 +74,7 @@ export class ChildHandle {
   private child: ChildProcessWithoutNullStreams;
   private stdoutBuffer = "";
   private closed = false;
+  private killing: Promise<void> | null = null;
   private readonly queueMaxBytes: number;
   private readonly stdoutMaxBytes: number;
   private readonly opts: ChildHandleOptions;
@@ -131,9 +133,8 @@ export class ChildHandle {
     return this.child.pid ?? null;
   }
 
-  /** True until the child exits or `kill()` runs to completion. */
   get alive(): boolean {
-    return !this.closed && this.child.exitCode === null;
+    return !this.closed && !hasExited(this.child);
   }
 
   get cachedInit(): CachedInit | null {
@@ -171,14 +172,17 @@ export class ChildHandle {
 
   /**
    * Kill the child with SIGTERM, then SIGKILL after `killGraceMs`. Resolves once
-   * the child has exited or the kill window has elapsed.
+   * the child has exited or the kill window has elapsed. Later calls return the
+   * first kill, with its grace.
    */
-  async kill(killGraceMs = 2000): Promise<void> {
-    if (this.closed || this.child.exitCode !== null) {
-      this.closed = true;
-      return;
-    }
+  kill(killGraceMs = DEFAULT_KILL_GRACE_MS): Promise<void> {
+    this.killing ??= this.terminate(killGraceMs);
+    return this.killing;
+  }
+
+  private async terminate(killGraceMs: number): Promise<void> {
     this.closed = true;
+    if (hasExited(this.child)) return;
 
     try {
       this.child.kill("SIGTERM");
@@ -198,6 +202,7 @@ export class ChildHandle {
   }
 
   private _onStdout(chunk: string): void {
+    if (this.closed) return;
     this.stdoutBuffer += chunk;
     if (this.stdoutBuffer.length > this.stdoutMaxBytes) {
       // Misbehaving child: flooding stdout without newlines. Drop the buffer
@@ -210,6 +215,7 @@ export class ChildHandle {
         ),
       );
       void this.kill(0);
+      this.opts.onClose();
       return;
     }
     let nl = this.stdoutBuffer.indexOf("\n");
@@ -245,7 +251,7 @@ function waitForExit(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number,
 ): Promise<boolean> {
-  if (child.exitCode !== null) return Promise.resolve(true);
+  if (hasExited(child)) return Promise.resolve(true);
   return new Promise((resolve) => {
     const onExit = (): void => {
       clearTimeout(timer);
@@ -253,8 +259,12 @@ function waitForExit(
     };
     const timer = setTimeout(() => {
       child.off("exit", onExit);
-      resolve(child.exitCode !== null);
+      resolve(hasExited(child));
     }, timeoutMs);
     child.once("exit", onExit);
   });
+}
+
+function hasExited(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
 }

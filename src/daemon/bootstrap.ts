@@ -18,6 +18,7 @@ import {
 } from "./daemon-process.js";
 import { acquireLock, holdsLock, isLockLive, LockBusyError, type LockHandle } from "./lockfile.js";
 import { APP_NAME } from "../constants.js";
+import { loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
 import { processExists, READ_PROCESS_INFO_MAX_MS, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
 
 /**
@@ -30,20 +31,17 @@ const CONNECT_BACKOFF_MS = [50, 200, 500, 1000, 1000] as const;
 const STARTING_DAEMON_WAIT_MS = 60_000;
 const DAEMON_POLL_MS = 1_000;
 const PROBE_TIMEOUT_MS = 1_000;
-const WEDGED_DAEMON_KILL_GRACE_MS = 2_000;
 const WEDGED_DAEMON_EXIT_WAIT_MS = 5_000;
 const PROBE_MAX_MS = 2 * PROBE_TIMEOUT_MS;
 const LAUNCH_PROBE_MAX_MS =
   CONNECT_BACKOFF_MS.reduce((total, wait) => total + wait, 0) + CONNECT_BACKOFF_MS.length * PROBE_MAX_MS;
 const IDENTITY_CHECKS_PER_RECOVERY = 4;
-const RECOVERY_MAX_MS =
+const RECOVERY_MAX_MS_EXCLUDING_KILL_GRACE =
   PROBE_MAX_MS +
   IDENTITY_CHECKS_PER_RECOVERY * READ_PROCESS_INFO_MAX_MS +
-  WEDGED_DAEMON_KILL_GRACE_MS +
   TASKKILL_TIMEOUT_MS +
   WEDGED_DAEMON_EXIT_WAIT_MS +
   LAUNCH_PROBE_MAX_MS;
-const RECOVERY_GUARD_MAX_AGE_MS = 2 * RECOVERY_MAX_MS;
 
 export class DaemonUnreachableError extends Error {
   constructor() {
@@ -92,6 +90,7 @@ interface Bootstrap {
   files: DaemonFiles;
   waitMs: number;
   launch: () => void;
+  wedgedDaemonStopWaitMs: number;
 }
 
 interface PendingEnsure {
@@ -124,6 +123,7 @@ async function probeOrLaunch(socketPath: string, opts: EnsureDaemonOptions): Pro
     files: daemonFilesFor(socketPath),
     waitMs: opts._startingDaemonWaitMs ?? STARTING_DAEMON_WAIT_MS,
     launch: opts.launch ?? (await detachedDaemonLauncher()),
+    wedgedDaemonStopWaitMs: await loadDaemonShutdownWaitMs(),
   };
   let launched = false;
   let waitedOut: DaemonProcess | null = null;
@@ -210,14 +210,14 @@ async function recoverWedgedDaemon(
   boot: Bootstrap,
   daemon: DaemonProcess,
 ): Promise<"busy" | "resolved" | "launched"> {
-  const guard = await tryAcquire(recoveryGuardPath(boot));
+  const guard = await tryAcquire(boot);
   if (guard === null) return "busy";
   try {
     if (await isDaemonReachable(boot.socketPath)) return "resolved";
     const current = await recordedDaemon(boot.files);
     if (current === null || !isSameProcess(current, daemon)) return "resolved";
     const result = await terminateDaemon(daemon.pid, {
-      graceMs: WEDGED_DAEMON_KILL_GRACE_MS,
+      graceMs: boot.wedgedDaemonStopWaitMs,
       startTime: daemon.startTime,
     });
     if (result === "not_ours") {
@@ -240,18 +240,22 @@ function recoveryGuardPath(boot: Bootstrap): string {
 async function recoveryInProgress(boot: Bootstrap): Promise<boolean> {
   const guardPath = recoveryGuardPath(boot);
   if (await holdsLock(guardPath)) return false;
-  return isLockLive(guardPath, { maxAgeMs: RECOVERY_GUARD_MAX_AGE_MS, isProcessAlive: isOtherLiveProcess });
+  return isLockLive(guardPath, { maxAgeMs: recoveryGuardMaxAgeMs(boot), isProcessAlive: isOtherLiveProcess });
 }
 
 function isOtherLiveProcess(pid: number): boolean {
   return pid !== process.pid && processExists(pid);
 }
 
-async function tryAcquire(path: string): Promise<LockHandle | null> {
+function recoveryGuardMaxAgeMs(boot: Bootstrap): number {
+  return 2 * (RECOVERY_MAX_MS_EXCLUDING_KILL_GRACE + boot.wedgedDaemonStopWaitMs);
+}
+
+async function tryAcquire(boot: Bootstrap): Promise<LockHandle | null> {
   try {
-    return await acquireLock(path, {
+    return await acquireLock(recoveryGuardPath(boot), {
       stealStale: true,
-      maxAgeMs: RECOVERY_GUARD_MAX_AGE_MS,
+      maxAgeMs: recoveryGuardMaxAgeMs(boot),
       isProcessAlive: isOtherLiveProcess,
       track: true,
     });

@@ -19,9 +19,11 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning when the reco
 
   beforeEach(async () => {
     dir = await mkdtemp("/tmp/cbe-bootu-");
+    vi.stubEnv("HOME", dir);
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     for (const child of children.splice(0)) child.kill("SIGKILL");
     await rm(dir, { recursive: true, force: true });
   });

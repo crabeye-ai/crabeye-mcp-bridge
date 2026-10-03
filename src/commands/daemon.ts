@@ -17,8 +17,7 @@ import {
   type TerminateResult,
 } from "../daemon/index.js";
 import { processExists } from "../process/index.js";
-import { loadBridgeOwnedConfig } from "../config/bridge-config.js";
-import { DaemonConfigSchema } from "../config/schema.js";
+import { loadDaemonConfig, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
 import { APP_NAME } from "../constants.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
@@ -30,7 +29,7 @@ export interface RestartUpstreamOpts {
   _socketPath?: string;
 }
 
-const STOP_TIMEOUT_MS = 2_000;
+const SHUTDOWN_RPC_TIMEOUT_MS = 2_000;
 
 export async function runDaemonCommand(action: DaemonAction): Promise<number> {
   switch (action) {
@@ -50,9 +49,7 @@ export async function runDaemonCommand(action: DaemonAction): Promise<number> {
  * `--internal-launch`. Resolves when the manager exits.
  */
 export async function runDaemonInternal(): Promise<number> {
-  const cfg = DaemonConfigSchema.parse(
-    (await loadBridgeOwnedConfig().catch(() => null))?._bridge?.daemon ?? {},
-  );
+  const cfg = await loadDaemonConfig();
 
   const socketPath = getDaemonSocketPath();
   const manager = new ManagerDaemon({
@@ -115,17 +112,18 @@ async function runStart(): Promise<number> {
 async function runStop(): Promise<number> {
   const reachable = await isDaemonReachable(getDaemonSocketPath());
   const recorded = await recordedDaemonPids();
+  const shutdownWaitMs = await loadDaemonShutdownWaitMs();
 
   if (!reachable) {
     if (recorded.length === 0) process.stderr.write("daemon not running\n");
     for (const pid of recorded) {
-      const result = await terminateDaemon(pid, { graceMs: STOP_TIMEOUT_MS, allowUnidentified: true });
+      const result = await terminateDaemon(pid, { graceMs: shutdownWaitMs, allowUnidentified: true });
       reportStop(pid, result, `unresponsive daemon ${pid} stopped`);
     }
     return 0;
   }
 
-  const client = makeClient({ rpcTimeoutMs: STOP_TIMEOUT_MS });
+  const client = makeClient({ rpcTimeoutMs: SHUTDOWN_RPC_TIMEOUT_MS });
   try {
     await client.connect();
     try {
@@ -144,7 +142,7 @@ async function runStop(): Promise<number> {
 
   const lingering: number[] = [];
   for (const pid of recorded) {
-    if (!(await waitForExit(pid, STOP_TIMEOUT_MS))) lingering.push(pid);
+    if (!(await waitForExit(pid, shutdownWaitMs))) lingering.push(pid);
   }
   if (lingering.length === 0) process.stderr.write("daemon stopped\n");
   for (const pid of lingering) {

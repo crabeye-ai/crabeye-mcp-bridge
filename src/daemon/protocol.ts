@@ -92,7 +92,7 @@ export interface RpcNotificationParams {
 
 export interface SessionEvictedParams {
   sessionId: string;
-  reason: "auto_fork_initialize_failed" | "auto_fork_drain_timeout";
+  reason: "auto_fork_initialize_failed" | "auto_fork_drain_timeout" | "child_exited" | "upstream_restarted";
 }
 
 export interface StatusChild {
@@ -141,6 +141,7 @@ export const ERROR_CODE_SESSION_IN_USE = "session_in_use";
 export const ERROR_CODE_SPAWN_FAILED = "spawn_failed";
 export const ERROR_CODE_INVALID_PARAMS = "invalid_params";
 export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
+export const ERROR_CODE_DAEMON_STOPPING = "daemon_stopping";
 /** Synthetic JSON-RPC error code emitted to inner requests when the session closes. */
 export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
 /** Synthetic JSON-RPC error code emitted when the per-child stdin queue overflows. */

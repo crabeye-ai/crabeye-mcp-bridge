@@ -1,6 +1,7 @@
 import { open, lstat, mkdir, chmod, unlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
+import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
 import { createNoopLogger, type Logger } from "../logging/index.js";
 import { upstreamHash } from "../upstream/upstream-hash.js";
 import {
@@ -21,6 +22,7 @@ import {
   ERROR_CODE_SESSION_NOT_FOUND,
   ERROR_CODE_SPAWN_FAILED,
   ERROR_CODE_TOO_MANY_CONNECTIONS,
+  ERROR_CODE_DAEMON_STOPPING,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
@@ -143,8 +145,6 @@ export interface ChildGroup {
   startedAt: number;
   /** Idle-child grace timer; non-null only when refcount==0. */
   graceTimer: NodeJS.Timeout | null;
-  /** True once SIGTERM has been dispatched; new attaches must spawn fresh. */
-  dying: boolean;
   /** True once the daemon has seen `notifications/initialized` from any session for this group. */
   initializedSeen: boolean;
   /** Phase D: runtime state — "shared" or "dedicated". */
@@ -169,12 +169,17 @@ export interface ChildGroup {
   nextInternalId: number;
   /**
    * Daemon-side MCP ping supervisor. Lifecycled with the child: instantiated
-   * at `spawnGroup`, armed once we see the initialize response, stopped in
-   * `handleChildExit` / `unregisterGroup`. `null` when the supervisor is
-   * disabled via `childPingMs <= 0`.
+   * at `spawnGroup`, armed once the child answers its first request, stopped
+   * in `teardownGroup`. `null` when the supervisor is disabled via
+   * `childPingMs <= 0`.
    */
   childPing: ChildPing | null;
+  teardown: Promise<void> | null;
 }
+
+type TeardownReason = KilledReason | "shutdown";
+
+type InflightFailure = { kind: "closed"; message: string } | { kind: "restarted"; reason: UpstreamRestartedReason };
 
 /**
  * Phase D: per-session migration state machine for auto-fork.
@@ -301,6 +306,7 @@ export class ManagerDaemon {
   });
   private connections = new Set<FrameChannel>();
   private groups = new Map<string, ChildGroup>();
+  private readonly pendingTeardowns = new Set<Promise<void>>();
   /** Phase D: index of currently-shareable groups, keyed by `${hash}:${sharing}`. dedicated entries never appear here. */
   private shareableIndex = new Map<string, ChildGroup>();
   /** Phase D: hashes where `auto` mode has triggered a fork. Future auto OPENs for these hashes spawn fresh dedicated. */
@@ -335,7 +341,7 @@ export class ManagerDaemon {
     this.maxSessionsPerChannel = opts.maxSessionsPerChannel ?? DEFAULT_MAX_SESSIONS_PER_CHANNEL;
     this.maxSessionsTotal = opts.maxSessionsTotal ?? DEFAULT_MAX_SESSIONS_TOTAL;
     this.graceMs = opts.graceMs ?? 60_000;
-    this.killGraceMsValue = opts.killGraceMs ?? 2_000;
+    this.killGraceMsValue = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.autoForkDrainTimeoutMs = opts.autoForkDrainTimeoutMs ?? 60_000;
     this.autoForkInitializeTimeoutMs = opts.autoForkInitializeTimeoutMs ?? 10_000;
     this.childPingMs = opts.childPingMs ?? 15_000;
@@ -408,20 +414,10 @@ export class ManagerDaemon {
         group.internalRequests.delete(id);
       },
       killGroup: (group) => {
-        void this.unregisterGroup(group, "fork").catch(() => {});
+        void this.teardownGroup(group, "fork");
       },
       evictSession: (sessionId, reason) => {
-        const att = this.sessions.get(sessionId);
-        if (att === undefined) return;
-        // Send SESSION_EVICTED notification to bridge first; if we detached
-        // first the channel cleanup could race the bridge's read of the frame.
-        att.channel.send({
-          method: "SESSION_EVICTED",
-          params: { sessionId, reason } satisfies SessionEvictedParams,
-        });
-        // Force-detach via the standard path so rewriter / subscription /
-        // grace-timer cleanup all run.
-        void this.detachSession(sessionId, `auto-fork eviction: ${reason}`).catch(() => {});
+        this.evictSession(sessionId, reason, { kind: "closed", message: `auto-fork eviction: ${reason}` });
       },
       urisForSession: (group, sessionId) => group.subscriptions.urisForSession(sessionId),
       registerSubscription: (group, sessionId, uri) => {
@@ -604,11 +600,11 @@ export class ManagerDaemon {
     // a clean kill and the tracker is up-to-date.
     const sessionIds = Array.from(this.sessions.keys());
     for (const sid of sessionIds) {
-      await this.detachSession(sid, "daemon shutdown").catch(() => {});
+      await this.detachSession(sid, { kind: "closed", message: "daemon shutdown" }).catch(() => {});
     }
-    const groups = Array.from(this.groups.values());
-    for (const g of groups) {
-      await this.unregisterGroup(g, "shutdown").catch(() => {});
+    await Promise.allSettled(Array.from(this.groups.values(), (g) => this.teardownGroup(g, "shutdown")));
+    while (this.pendingTeardowns.size > 0) {
+      await Promise.allSettled(Array.from(this.pendingTeardowns));
     }
 
     for (const ch of this.connections) {
@@ -790,7 +786,7 @@ export class ManagerDaemon {
       if (ownedSessions) {
         for (const sid of ownedSessions) {
           // Channel died: emit synthetic errors and detach.
-          void this.detachSession(sid, "session closed").catch(() => {
+          void this.detachSession(sid, { kind: "closed", message: "session closed" }).catch(() => {
             /* logged inside */
           });
         }
@@ -1039,6 +1035,9 @@ export class ManagerDaemon {
     rawParams: unknown,
     channel: FrameChannel,
   ): Promise<DaemonResponse> {
+    if (this.stopping) {
+      return errorResponse(requestId, ERROR_CODE_DAEMON_STOPPING, "manager is shutting down");
+    }
     const params = parseOpenParams(rawParams);
     if (params === null) {
       return errorResponse(requestId, ERROR_CODE_INVALID_PARAMS, "OPEN params malformed");
@@ -1132,7 +1131,7 @@ export class ManagerDaemon {
     if (sharing === "auto" && this.autoTainted.has(hash)) return undefined;
     const key = `${hash}:${sharing}`;
     const group = this.shareableIndex.get(key);
-    if (group === undefined || group.dying) return undefined;
+    if (group === undefined || group.teardown !== null) return undefined;
     return group;
   }
 
@@ -1153,7 +1152,7 @@ export class ManagerDaemon {
       },
       onClose: (): void => {
         const g = groupRef.value;
-        if (g !== null) this.handleChildExit(g);
+        if (g !== null) void this.teardownGroup(g, "crash");
       },
       onError: (err: Error): void => {
         this.logger.warn(`child error: ${err.message}`, { component: "daemon", upstreamHash: hash });
@@ -1189,7 +1188,7 @@ export class ManagerDaemon {
       serverName: spec.serverName,
       startedAt: child.startedAt,
       graceTimer: null,
-      dying: false,
+      teardown: null,
       initializedSeen: false,
       mode,
       sharing: spec.sharing,
@@ -1200,10 +1199,6 @@ export class ManagerDaemon {
     };
     groupRef.value = group;
 
-    // Daemon-side liveness ping. Armed only once the child has answered
-    // initialize (see `routeChildMessage`): MCP servers commonly reject
-    // arbitrary requests before init, and treating those error responses
-    // as "alive" would technically work but pollutes the child's logs.
     if (this.childPingMs > 0) {
       group.childPing = new ChildPing({
         pingMs: this.childPingMs,
@@ -1242,7 +1237,7 @@ export class ManagerDaemon {
                 pid: group.child.pid,
               },
             );
-            this.handleChildExit(group);
+            void this.teardownGroup(group, "wedged");
           },
         },
       });
@@ -1282,19 +1277,11 @@ export class ManagerDaemon {
     if (!this.sessions.has(params.sessionId)) {
       return errorResponse(requestId, ERROR_CODE_SESSION_NOT_FOUND, "no such session");
     }
-    await this.detachSession(params.sessionId, "session closed");
+    await this.detachSession(params.sessionId, { kind: "closed", message: "session closed" });
     return { id: requestId, result: { ok: true } };
   }
 
-  /**
-   * Admin RESTART: kill the child group(s) matching `params.upstreamHash`.
-   *
-   * Before tearing each group down we surface a typed JSON-RPC error
-   * (`upstream_restarted`, `data.reason: "admin_restart"`) to every
-   * attached session for any in-flight request, so the bridge sees the
-   * intended cause instead of the generic `session_closed` that
-   * detachSession() would otherwise emit when the child exits underneath.
-   */
+  /** Admin RESTART: kill the child group(s) matching `params.upstreamHash`. */
   private handleRestart(reqId: string, rawParams: unknown): DaemonResponse {
     const params = parseRestartParams(rawParams);
     if (params === null) {
@@ -1305,36 +1292,14 @@ export class ManagerDaemon {
       );
     }
     const hash = params.upstreamHash;
-    // Snapshot before iterating: unregisterGroup() mutates this.groups.
     const matched = Array.from(this.groups.values()).filter(
       (g) => g.upstreamHash === hash,
     );
     for (const group of matched) {
-      for (const sid of Array.from(group.sessions)) {
-        const att = this.sessions.get(sid);
-        if (att === undefined) continue;
-        this.sendRestartedError(att, "admin_restart");
-      }
-      void this.unregisterGroup(group, "restart").catch(() => {
-        /* logged elsewhere */
-      });
+      void this.teardownGroup(group, "restart");
     }
     const result: RestartResult = { ok: true, killed: matched.length };
     return { id: reqId, result };
-  }
-
-  /**
-   * Synthesize an `upstream_restarted` JSON-RPC error for every in-flight
-   * request on the given session, framed inside an `RPC` notification so the
-   * bridge sees it as a regular response.
-   */
-  private sendRestartedError(att: SessionAttachment, reason: UpstreamRestartedReason): void {
-    const inflight = att.group.rewriter.inflightForSession(att.sessionId);
-    for (const outerId of inflight) {
-      const origin = att.group.rewriter.peekOrigin(outerId);
-      if (origin === undefined) continue;
-      this.sendUpstreamRestartedError(att.channel, att.sessionId, origin.originalId, reason);
-    }
   }
 
   /**
@@ -1345,6 +1310,7 @@ export class ManagerDaemon {
    */
   private routeChildMessage(group: ChildGroup, payload: unknown): void {
     const routing = group.rewriter.inboundFromChild(payload);
+    if (routing.kind === "response" || routing.kind === "internal") group.childPing?.start();
     if (routing.kind === "drop") return;
     if (routing.kind === "response") {
       // Capture cachedInit from the first initialize response.
@@ -1384,9 +1350,6 @@ export class ManagerDaemon {
             capabilities: result.capabilities as Record<string, unknown>,
             ...(instrToCache !== undefined && { instructions: instrToCache }),
           });
-          // Initialize completed — child has demonstrated it can read +
-          // write the stdio pipes, so the ping supervisor can safely arm.
-          group.childPing?.start();
         }
       }
       this.deliver(group, routing.sessionIds, routing.payload);
@@ -1517,55 +1480,100 @@ export class ManagerDaemon {
     }
   }
 
-  private handleChildExit(group: ChildGroup): void {
-    // Phase D (Task 16): sessions whose old group is dying may be mid-migration.
-    // For each draining session, give the orchestrator a chance to finalize
-    // against the new child (treating old-child inflight as terminated).
-    // Sessions still in idle on this group take the standard detach path.
-    const sessionIds = Array.from(group.sessions);
+  private teardownGroup(group: ChildGroup, reason: TeardownReason): Promise<void> {
+    if (group.teardown !== null) return group.teardown;
+    const teardown: Promise<void> = Promise.resolve()
+      .then(() => this.runTeardown(group, reason))
+      .catch((err: unknown) => {
+        this.logger.error(`child teardown failed: ${err instanceof Error ? err.message : String(err)}`, {
+          groupId: group.groupId,
+        });
+      })
+      .finally(() => {
+        this.pendingTeardowns.delete(teardown);
+      });
+    group.teardown = teardown;
+    this.pendingTeardowns.add(teardown);
+    return teardown;
+  }
 
-    // Snapshot draining sessions whose OLD group is the one that just died.
-    // Note: at fork time (Task 11) we moved migrating sessions OUT of
-    // `oldGroup.sessions` and INTO `newGroup.sessions`, so iterating
-    // `group.sessions` won't surface them. We instead scan `this.sessions` for
-    // any draining attachment whose `att.group` (still pointing at old group
-    // during draining) equals the dying group.
-    const drainingSessions: Array<{ sessionId: string; newGroup: ChildGroup }> = [];
-    for (const att of this.sessions.values()) {
-      if (att.migration.kind !== "draining") continue;
-      if (att.group !== group) continue;
-      drainingSessions.push({ sessionId: att.sessionId, newGroup: att.migration.newGroup });
+  private async runTeardown(group: ChildGroup, reason: TeardownReason): Promise<void> {
+    try {
+      if (this.groups.get(group.groupId) === group) {
+        this.groups.delete(group.groupId);
+        if (reason !== "shutdown") this.telemetry.recordKill(reason);
+      }
+      const indexKey = `${group.upstreamHash}:${group.sharing}`;
+      if (this.shareableIndex.get(indexKey) === group) this.shareableIndex.delete(indexKey);
+      this.cancelGraceTimer(group);
+      group.childPing?.stop();
+      if (reason !== "shutdown" && reason !== "fork") this.evictSessionsOf(group, reason);
+    } finally {
+      const pid = group.child.pid;
+      await group.child.kill(this.killGraceMs()).catch(() => {});
+      if (pid !== null) await this.tracker.unregister(pid).catch(() => {});
     }
-
-    // For each draining session, attempt completion. If replay is done and
-    // old-child inflight is now treated as zero (rewriter detach hasn't run
-    // yet, but we attempt anyway — the manager-side hook checks inflight on
-    // the old rewriter), it'll finalize. If not, the session stays draining;
-    // it'll either complete when replay finishes or hit the drain timeout.
-    for (const { sessionId, newGroup } of drainingSessions) {
-      this.autoFork.onSessionInflightChanged(group, newGroup, sessionId);
+    if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
+      this.armIdleTimer();
     }
+  }
 
-    // Detach all sessions still attached to this old group (originating session
-    // and any non-draining sessions). Draining sessions that already migrated
-    // away (att.group === newGroup after completeMigration) are skipped.
-    for (const sid of sessionIds) {
-      const att = this.sessions.get(sid);
-      if (att === undefined) continue;
-      if (att.group !== group) continue; // already migrated away
-      void this.detachSession(sid, "child process exited").catch(() => {});
+  private evictSessionsOf(group: ChildGroup, reason: KilledReason): void {
+    const [evictionReason, inflightFailure]: [SessionEvictedParams["reason"], InflightFailure] =
+      reason === "restart"
+        ? ["upstream_restarted", { kind: "restarted", reason: "admin_restart" }]
+        : ["child_exited", { kind: "closed", message: "child process exited" }];
+    for (const att of Array.from(this.sessions.values())) {
+      const migration = att.migration;
+      const migratingAway = migration.kind === "draining" && att.group === group;
+      const migratingHere = migration.kind === "draining" && migration.newGroup === group;
+      if (migratingAway) {
+        this.failInflightOn(group, att, inflightFailure);
+        this.autoFork.onSessionInflightChanged(group, migration.newGroup, att.sessionId);
+      } else if (att.group === group || migratingHere) {
+        this.evictSession(att.sessionId, evictionReason, inflightFailure);
+      }
     }
+  }
 
-    const reason: KilledReason = group.childPing?.isWedged === true ? "wedged" : "crash";
-    void this.unregisterGroup(group, reason).catch(() => {});
+  private failInflightOn(group: ChildGroup, att: SessionAttachment, inflightFailure: InflightFailure): void {
+    for (const outerId of group.rewriter.inflightForSession(att.sessionId)) {
+      const origin = group.rewriter.peekOrigin(outerId);
+      if (origin !== undefined) this.sendInflightFailure(att.channel, att.sessionId, origin.originalId, inflightFailure);
+    }
+    group.rewriter.detachSession(att.sessionId);
+  }
+
+  private sendInflightFailure(
+    channel: FrameChannel,
+    sessionId: string,
+    innerId: InnerId,
+    inflightFailure: InflightFailure,
+  ): void {
+    if (inflightFailure.kind === "restarted") {
+      this.sendUpstreamRestartedError(channel, sessionId, innerId, inflightFailure.reason);
+    } else {
+      this.sendInnerError(channel, sessionId, innerId, INNER_ERROR_CODE_SESSION_CLOSED, inflightFailure.message);
+    }
+  }
+
+  private evictSession(
+    sessionId: string,
+    reason: SessionEvictedParams["reason"],
+    inflightFailure: InflightFailure,
+  ): void {
+    const att = this.sessions.get(sessionId);
+    if (att === undefined) return;
+    void this.detachSession(sessionId, inflightFailure).catch(() => {});
+    att.channel.send({ method: "SESSION_EVICTED", params: { sessionId, reason } satisfies SessionEvictedParams });
   }
 
   /**
-   * Detach a session from its group. Emits synthetic session_closed errors
-   * for in-flight requests, decrements refcount, arms the grace timer at 0.
-   * Does NOT kill the child unless the grace timer expires.
+   * Detach a session from its group. Fails its in-flight requests with
+   * `inflightFailure`, decrements refcount, arms the grace timer at 0. Does NOT kill
+   * the child unless the grace timer expires.
    */
-  private async detachSession(sessionId: string, reason: string): Promise<void> {
+  private async detachSession(sessionId: string, inflightFailure: InflightFailure): Promise<void> {
     const att = this.sessions.get(sessionId);
     if (att === undefined) return;
 
@@ -1579,7 +1587,12 @@ export class ManagerDaemon {
         clearTimeout(att.migration.drainTimer);
         att.migration.drainTimer = null;
       }
-      // Drop any unflushed payloads — bridge will reconnect.
+      for (const payload of att.migration.queuedOutbound) {
+        const innerId = (payload as { id?: unknown }).id;
+        if (typeof innerId === "string" || typeof innerId === "number") {
+          this.sendInflightFailure(att.channel, sessionId, innerId, inflightFailure);
+        }
+      }
       att.migration.queuedOutbound.length = 0;
       // Kill the not-yet-attached new child if it has no other sessions
       // (or only this one).
@@ -1588,7 +1601,7 @@ export class ManagerDaemon {
         newGroup.sessions.size === 0 ||
         (newGroup.sessions.size === 1 && newGroup.sessions.has(sessionId))
       ) {
-        void this.unregisterGroup(newGroup, "fork").catch(() => {});
+        void this.teardownGroup(newGroup, "fork");
       }
     }
 
@@ -1618,7 +1631,7 @@ export class ManagerDaemon {
 
     // Send synthetic errors AFTER detach so rewriter state is clean.
     for (const innerId of originals) {
-      this.sendInnerError(att.channel, sessionId, innerId, INNER_ERROR_CODE_SESSION_CLOSED, reason);
+      this.sendInflightFailure(att.channel, sessionId, innerId, inflightFailure);
     }
 
     // Forward `notifications/cancelled` to the child for each outstanding outer id.
@@ -1658,6 +1671,7 @@ export class ManagerDaemon {
 
   private armGraceTimer(group: ChildGroup): void {
     this.cancelGraceTimer(group);
+    if (group.teardown !== null || this.stopping) return;
     if (this.graceMs === 0) {
       void this.expireGroup(group);
       return;
@@ -1670,50 +1684,14 @@ export class ManagerDaemon {
 
   private async expireGroup(group: ChildGroup): Promise<void> {
     if (group.sessions.size > 0) return; // re-attached during the window
-    group.dying = true;
     group.graceTimer = null;
-    await this.unregisterGroup(group, "grace").catch(() => {});
-    if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
-      this.armIdleTimer();
-    }
+    await this.teardownGroup(group, "grace");
   }
 
   private cancelGraceTimer(group: ChildGroup): void {
     if (group.graceTimer !== null) {
       clearTimeout(group.graceTimer);
       group.graceTimer = null;
-    }
-  }
-
-  private async unregisterGroup(
-    group: ChildGroup,
-    reason: KilledReason | "shutdown",
-  ): Promise<void> {
-    if (this.groups.get(group.groupId) === group) {
-      this.groups.delete(group.groupId);
-      // Counters reflect lifecycle events while the daemon is alive; don't
-      // count children torn down during stop().
-      if (reason !== "shutdown") this.telemetry.recordKill(reason);
-    }
-    // Remove from shareable index if this group is the indexed one.
-    const indexKey = `${group.upstreamHash}:${group.sharing}`;
-    if (this.shareableIndex.get(indexKey) === group) {
-      this.shareableIndex.delete(indexKey);
-    }
-    this.cancelGraceTimer(group);
-    group.childPing?.stop();
-    const pid = group.child.pid;
-    try {
-      await group.child.kill(this.killGraceMs());
-    } catch {
-      /* best-effort */
-    }
-    if (pid !== null) {
-      try {
-        await this.tracker.unregister(pid);
-      } catch {
-        /* best-effort */
-      }
     }
   }
 

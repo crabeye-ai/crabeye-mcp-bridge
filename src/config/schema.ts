@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { APP_NAME } from "../constants.js";
+import { APP_NAME, DEFAULT_KILL_GRACE_MS } from "../constants.js";
 
 // --- Tool policy ---
 
@@ -208,7 +208,7 @@ export const DaemonConfigSchema = z
     /** Idle-child grace before SIGTERM. Starts when a child's refcount drops to 0. Cancelled on new attach. */
     graceMs: z.number().int().nonnegative().default(60_000),
     /** SIGTERM→SIGKILL window once kill is dispatched. */
-    killGraceMs: z.number().int().nonnegative().default(2_000),
+    killGraceMs: z.number().int().nonnegative().default(DEFAULT_KILL_GRACE_MS),
     autoForkDrainTimeoutMs: z.number().int().nonnegative().default(60_000),
     autoForkInitializeTimeoutMs: z.number().int().nonnegative().default(10_000),
     /** Per-RPC timeout the bridge applies to outbound daemon calls. Was hardcoded 10000 in DaemonStdioTransport. */

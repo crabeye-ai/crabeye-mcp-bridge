@@ -2,10 +2,12 @@ import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
-import { CREDENTIALS_DIR, BRIDGE_CONFIG_FILENAME } from "../constants.js";
+import { BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR, DAEMON_SHUTDOWN_MARGIN_MS, DEFAULT_KILL_GRACE_MS } from "../constants.js";
 import {
   ServerConfigSchema,
   GlobalBridgeConfigSchema,
+  DaemonConfigSchema,
+  type DaemonConfig,
 } from "./schema.js";
 import { parseJsoncString } from "./jsonc.js";
 
@@ -37,6 +39,19 @@ export async function loadBridgeOwnedConfig(): Promise<BridgeOwnedConfig | null>
 
   const json = parseJsoncString(raw);
   return BridgeOwnedConfigSchema.parse(json);
+}
+
+export async function loadDaemonConfig(): Promise<DaemonConfig> {
+  const config = await loadBridgeOwnedConfig().catch(() => null);
+  return DaemonConfigSchema.parse(config?._bridge?.daemon ?? {});
+}
+
+export async function loadDaemonShutdownWaitMs(): Promise<number> {
+  const killGraceMs = await loadDaemonConfig().then(
+    (config) => config.killGraceMs,
+    () => DEFAULT_KILL_GRACE_MS,
+  );
+  return killGraceMs + DAEMON_SHUTDOWN_MARGIN_MS;
 }
 
 export async function saveBridgeOwnedConfig(config: BridgeOwnedConfig): Promise<void> {

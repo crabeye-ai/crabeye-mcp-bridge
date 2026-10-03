@@ -122,7 +122,7 @@ describe("ChildPing", () => {
 
     expect(r.wedged).toHaveLength(1);
     expect(r.wedged[0]).toMatch(/3 consecutive ping failures/);
-    expect(p.isWedged).toBe(true);
+    expect(p._statsForTest().wedged).toBe(true);
 
     // After wedge: cadence is stopped, no more sends.
     const sendsBefore = r.sends.length;

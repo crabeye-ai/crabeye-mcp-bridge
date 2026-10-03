@@ -27,9 +27,11 @@ describe.skipIf(process.platform === "win32")("a bridge waiting on another bridg
 
   beforeEach(async () => {
     dir = await mkdtemp("/tmp/cbe-bootw-");
+    vi.stubEnv("HOME", dir);
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     for (const child of children.splice(0)) child.kill("SIGKILL");
     await rm(dir, { recursive: true, force: true });
   });

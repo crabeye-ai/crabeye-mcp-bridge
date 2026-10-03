@@ -16,3 +16,5 @@ export const DAEMON_RUN_SUBDIR = "run";
 export const DAEMON_SOCKET_FILENAME = "manager.sock";
 export const DAEMON_PID_FILENAME = "manager.pid";
 export const DAEMON_LOCK_FILENAME = "manager.lock";
+export const DEFAULT_KILL_GRACE_MS = 2_000;
+export const DAEMON_SHUTDOWN_MARGIN_MS = 1_000;
