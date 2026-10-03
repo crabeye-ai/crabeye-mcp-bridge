@@ -1,6 +1,6 @@
 export { ManagerDaemon, DaemonAlreadyRunningError } from "./manager.js";
 export type { ManagerOptions, ChildGroup, SessionAttachment } from "./manager.js";
-export { DaemonClient, DaemonRpcError } from "./client.js";
+export { DaemonClient, DaemonRpcError, DAEMON_CONNECTION_CLOSED, DAEMON_REJECTED } from "./client.js";
 export type { DaemonClientOpts } from "./client.js";
 export {
   encodeFrame,

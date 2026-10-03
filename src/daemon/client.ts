@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import {
-  ERROR_CODE_BACKPRESSURE,
   ERROR_CODE_RPC_TIMEOUT,
   isNotification,
   isResponse,
@@ -9,6 +8,9 @@ import {
   type DaemonResponse,
 } from "./protocol.js";
 import type { FrameChannel, Transport } from "./transport.js";
+
+export const DAEMON_REJECTED = "daemon rejected the message";
+export const DAEMON_CONNECTION_CLOSED = "daemon connection closed";
 
 export class DaemonRpcError extends Error {
   constructor(
@@ -68,7 +70,7 @@ export class DaemonClient {
     channel.on("message", (msg: unknown) => this._dispatch(msg));
     channel.on("close", () => {
       this.channel = null;
-      const closeErr = new Error("daemon connection closed");
+      const closeErr = new Error(DAEMON_CONNECTION_CLOSED);
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
         reject(closeErr);
@@ -113,25 +115,22 @@ export class DaemonClient {
 
       this.pending.set(id, { resolve, reject, timer });
       const ok = channel.send(req);
-      if (!ok) {
-        // Backpressure: kernel buffer full. Fail fast rather than letting
-        // the request linger until rpc_timeout — caller can retry.
-        if (this.pending.delete(id)) {
-          clearTimeout(timer);
-          reject(
-            new DaemonRpcError(
-              ERROR_CODE_BACKPRESSURE,
-              `socket write would block on ${method}`,
-            ),
-          );
-        }
+      if (!ok && this.pending.delete(id)) {
+        clearTimeout(timer);
+        reject(new Error(this.connected ? DAEMON_REJECTED : DAEMON_CONNECTION_CLOSED));
       }
     });
   }
 
+  get connected(): boolean {
+    return !this.closed && this.channel !== null;
+  }
+
   /**
-   * Send a notification frame (no `id`). Returns false on socket backpressure.
-   * Notifications carry no reply; use `call()` if a response is needed.
+   * Send a notification frame (no `id`). Returns false when the frame was not
+   * queued: the connection is closed or the frame could not be encoded. A full
+   * socket buffer still queues the frame. Notifications carry no reply; use
+   * `call()` if a response is needed.
    */
   sendNotification(method: string, params?: unknown): boolean {
     if (this.closed || this.channel === null) return false;

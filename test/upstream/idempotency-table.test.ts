@@ -29,6 +29,13 @@ describe("IdempotencyTable", () => {
     expect(t.snapshotForRetry().retryable).toHaveLength(0);
   });
 
+  it("forgets a request once its cancellation is sent", () => {
+    const t = new IdempotencyTable();
+    t.track(req(4, "tools/list"));
+    t.track({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 4 } } as JSONRPCMessage);
+    expect(t.snapshotForRetry()).toEqual({ retryable: [], evicted: [] });
+  });
+
   it("returns the snapshot for retry, partitioning retryable vs evicted", () => {
     const t = new IdempotencyTable();
     t.track(req(1, "tools/list"));

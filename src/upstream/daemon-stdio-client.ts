@@ -10,6 +10,8 @@ import {
   getDaemonSocketPath,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   DaemonRpcError,
+  DAEMON_CONNECTION_CLOSED,
+  DAEMON_REJECTED,
   ERROR_CODE_SESSION_IN_USE,
   type DaemonNotification,
   type EnsureAttemptOptions,
@@ -19,9 +21,12 @@ import { createNoopLogger, type Logger } from "../logging/index.js";
 import { BaseUpstreamClient, upstreamClientInfo } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 import { IdempotencyTable } from "./idempotency-table.js";
+import { HeldOutbound } from "./held-outbound.js";
+import { cancelledRequestId, requestIdOf, type RequestId } from "./jsonrpc-ids.js";
 
 const OPEN_ATTEMPTS = 5;
 const OPEN_RETRY_MS = 100;
+const INTERNAL_ERROR = -32603;
 
 export interface DaemonStdioClientOptions extends BaseUpstreamClientOptions {
   config: StdioServerConfig;
@@ -164,6 +169,8 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
   private readonly _logger: Logger;
   private supervisor: DaemonLivenessSupervisor;
   private idempotency = new IdempotencyTable();
+  private held: HeldOutbound | null = null;
+  private connectionGeneration = 0;
   private opened = false;
   private closing = false;
 
@@ -181,6 +188,10 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
       onNotification: (notif) => this._onNotification(notif),
       _ensureDaemonRunning: opts.ensureDaemon,
     });
+    this.supervisor.on("livenessFailure", () => {
+      this._nextConnection();
+      if (!this.closing) this.held ??= new HeldOutbound();
+    });
     this.supervisor.on("respawned", (reason: LivenessFailureKind) => {
       this._logger.info("force_respawn", {
         component: "daemon-stdio",
@@ -189,7 +200,7 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
         reason,
         sessionsReopened: this.closing ? 0 : 1,
       });
-      void this._reopenAfterRespawn();
+      void this._reopenAfterRespawn(this._nextConnection());
     });
     this.supervisor.on("respawnFailed", (err) => this._onRespawnFailed(err));
   }
@@ -211,19 +222,32 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (this.closing) throw new Error("daemon transport is closed");
-    this.idempotency.track(message);
-    const ok = this.supervisor.sendNotification("RPC", {
+    if (this.held !== null) {
+      this._hold(this.held, message);
+      return;
+    }
+    if (!this._write(message)) throw new Error(this._writeFailure());
+  }
+
+  private _hold(held: HeldOutbound, message: JSONRPCMessage): void {
+    const cancelled = cancelledRequestId(message);
+    if (cancelled === undefined) held.hold(message);
+    else if (!held.cancel(cancelled)) this.idempotency.forget(cancelled);
+  }
+
+  private _write(message: JSONRPCMessage): boolean {
+    const written = this.supervisor.sendNotification("RPC", {
       sessionId: this._daemonSessionId,
       payload: message,
     });
-    if (!ok) {
-      throw new Error("daemon socket backpressure (RPC notification dropped)");
-    }
+    if (written) this.idempotency.track(message);
+    return written;
   }
 
   async close(): Promise<void> {
     if (this.closing) return;
     this.closing = true;
+    this.held = null;
     if (this.opened) {
       try {
         await this.supervisor.call("CLOSE", { sessionId: this._daemonSessionId });
@@ -238,7 +262,7 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
   }
 
   /** Issue a fresh OPEN against the (possibly newly-respawned) supervisor. */
-  private async _issueOpen(): Promise<void> {
+  private async _issueOpen(generation = this.connectionGeneration): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       try {
         await this._sendOpen();
@@ -248,8 +272,19 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
           err instanceof DaemonRpcError && err.code === ERROR_CODE_SESSION_IN_USE;
         if (!previousConnectionStillAttached || attempt >= OPEN_ATTEMPTS) throw err;
         await delay(OPEN_RETRY_MS);
+        if (generation !== this.connectionGeneration) throw err;
       }
     }
+  }
+
+  private _nextConnection(): number {
+    return ++this.connectionGeneration;
+  }
+
+  private _takeHeld(): JSONRPCMessage[] {
+    const held = this.held?.drain() ?? [];
+    this.held = null;
+    return held;
   }
 
   private async _sendOpen(): Promise<void> {
@@ -271,71 +306,59 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
     });
   }
 
-  /**
-   * Triggered by `supervisor.on("respawned")` after a successful force-respawn.
-   * Re-OPENs the session against the new daemon, then drains the idempotency
-   * table (Task 13): retryable in-flight requests are re-sent verbatim;
-   * non-retryable ones get synthetic `daemon_respawn` errors so the MCP
-   * client rejects the pending Promise.
-   */
-  private async _reopenAfterRespawn(): Promise<void> {
+  private async _reopenAfterRespawn(generation: number): Promise<void> {
     if (this.closing) return;
     try {
-      await this._issueOpen();
+      await this._issueOpen(generation);
     } catch (err) {
-      this._onRespawnFailed(err);
+      if (generation === this.connectionGeneration) this._onRespawnFailed(err);
       return;
     }
-    const snap = this.idempotency.snapshotForRetry();
-    for (const m of snap.evicted) {
-      const id = (m as { id?: string | number }).id;
-      if (id === undefined) continue;
-      this.onmessage?.(this._synthRespawnError(id, "upstream restarted"));
-    }
-    for (const m of snap.retryable) {
-      const ok = this.supervisor.sendNotification("RPC", {
-        sessionId: this._daemonSessionId,
-        payload: m,
-      });
-      if (!ok) {
-        const id = (m as { id?: string | number }).id;
-        if (id !== undefined) {
-          this.onmessage?.(
-            this._synthRespawnError(id, "upstream restarted (resend backpressure)"),
-          );
-        }
-      }
-    }
-    // Clear the table; new responses will repopulate via track/onResponse.
-    // Resent retryable requests retain their pending entry on the MCP Client
-    // and resolve when the response comes back.
+    if (this.closing || generation !== this.connectionGeneration) return;
+    const held = this._takeHeld();
+    const { retryable, evicted } = this.idempotency.snapshotForRetry();
     this.idempotency.clear();
+    this._failRespawned(evicted, "upstream restarted");
+    this._resend([...retryable, ...held]);
+  }
+
+  private _resend(messages: JSONRPCMessage[]): void {
+    for (const message of messages) {
+      if (this._write(message)) continue;
+      if (this.supervisor.connected) this._failRejected(message);
+      else (this.held ??= new HeldOutbound()).hold(message);
+    }
+  }
+
+  private _writeFailure(): string {
+    return this.supervisor.connected ? DAEMON_REJECTED : DAEMON_CONNECTION_CLOSED;
   }
 
   private _onRespawnFailed(err: unknown): void {
-    const snap = this.idempotency.snapshotForRetry();
     const msg = err instanceof Error ? err.message : String(err);
-    for (const m of [...snap.retryable, ...snap.evicted]) {
-      const id = (m as { id?: string | number }).id;
-      if (id === undefined) continue;
-      this.onmessage?.(this._synthRespawnError(id, `upstream restarted: ${msg}`));
-    }
+    const { retryable, evicted } = this.idempotency.snapshotForRetry();
+    const pending = [...retryable, ...evicted, ...this._takeHeld()];
     this.idempotency.clear();
+    this._failRespawned(pending, `upstream restarted: ${msg}`);
     void this.supervisor.close();
     this._onSocketClose();
   }
 
-  private _synthRespawnError(id: string | number, message: string): JSONRPCMessage {
-    return {
-      jsonrpc: "2.0",
-      id,
-      error: {
-        code: INNER_ERROR_CODE_UPSTREAM_RESTARTED,
-        message,
-        data: { reason: "daemon_respawn" },
-      },
-    } as JSONRPCMessage;
+  private _failRespawned(messages: JSONRPCMessage[], message: string): void {
+    for (const m of messages) {
+      const id = requestIdOf(m);
+      if (id !== undefined) {
+        this.onmessage?.(synthError(id, INNER_ERROR_CODE_UPSTREAM_RESTARTED, message, "daemon_respawn"));
+      }
+    }
   }
+
+  private _failRejected(message: JSONRPCMessage): void {
+    const id = requestIdOf(message);
+    if (id !== undefined) this.onmessage?.(synthError(id, INTERNAL_ERROR, DAEMON_REJECTED, "daemon_rejected"));
+  }
+
+
 
   private _onNotification(notif: DaemonNotification): void {
     if (notif.method === "SESSION_EVICTED") {
@@ -364,8 +387,13 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
   private _onSocketClose(): void {
     if (this.closing) return;
     this.closing = true;
-    const err = new Error("daemon connection closed");
+    this.held = null;
+    const err = new Error(DAEMON_CONNECTION_CLOSED);
     this.onerror?.(err);
     this.onclose?.();
   }
+}
+
+function synthError(id: RequestId, code: number, message: string, reason: string): JSONRPCMessage {
+  return { jsonrpc: "2.0", id, error: { code, message, data: { reason } } } as JSONRPCMessage;
 }

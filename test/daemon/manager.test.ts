@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { ManagerDaemon, LockBusyError } from "../../src/daemon/manager.js";
-import { DaemonClient, DaemonRpcError } from "../../src/daemon/client.js";
+import { DAEMON_REJECTED, DaemonClient, DaemonRpcError } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 
 // macOS UDS sun_path is 104 bytes. Tests under $TMPDIR overflow that, so we
@@ -426,5 +426,30 @@ describe.skipIf(isWindows)("DaemonClient lifecycle", () => {
     client.close();
 
     await expect(client.call("STATUS")).rejects.toThrow(/closed/);
+  });
+
+  it("call() with a frame too large to send rejects at once as rejected, leaving the connection usable", async () => {
+    manager = new ManagerDaemon({
+      socketPath: paths.sock,
+      pidPath: paths.pid,
+      lockPath: paths.lock,
+      idleMs: 60_000,
+      transport: netTransport,
+    });
+    await manager.start();
+    const client = new DaemonClient({
+      socketPath: paths.sock,
+      transport: netTransport,
+      rpcTimeoutMs: 5_000,
+      connectTimeoutMs: 1_000,
+    });
+    await client.connect();
+    const startedAt = Date.now();
+
+    await expect(client.call("STATUS", { blob: "x".repeat(17 * 1024 * 1024) })).rejects.toThrow(DAEMON_REJECTED);
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    await expect(client.call("STATUS")).resolves.toBeDefined();
+    client.close();
   });
 });

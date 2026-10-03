@@ -79,7 +79,8 @@ export function wrapSocket(socket: Socket, remote: string): FrameChannel {
   emitter.send = (payload: unknown): boolean => {
     if (closed) return false;
     try {
-      return socket.write(encodeFrame(payload));
+      socket.write(encodeFrame(payload));
+      return true;
     } catch (err) {
       emitter.emit("error", err as Error);
       return false;

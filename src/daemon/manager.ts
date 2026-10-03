@@ -1471,7 +1471,7 @@ export class ManagerDaemon {
       if (att === undefined) continue;
       const ok = att.channel.send({ method: "RPC", params: { sessionId: sid, payload } });
       if (!ok) {
-        this.logger.debug("RPC notification dropped (backpressure)", {
+        this.logger.debug("RPC notification not sent", {
           component: "daemon",
           sessionId: sid,
           upstreamHash: group.upstreamHash,

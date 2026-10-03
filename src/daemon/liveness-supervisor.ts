@@ -93,6 +93,10 @@ export class DaemonLivenessSupervisor extends EventEmitter {
     return this.client.call(method, params);
   }
 
+  get connected(): boolean {
+    return this.client?.connected ?? false;
+  }
+
   sendNotification(method: string, params?: unknown): boolean {
     if (this.client === null) return false;
     return this.client.sendNotification(method, params);
