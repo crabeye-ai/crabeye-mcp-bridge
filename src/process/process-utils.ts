@@ -105,6 +105,27 @@ export async function readProcessInfo(pid: number): Promise<ProcessInfo | null> 
   return readPosixProcessInfo(pid);
 }
 
+export async function readParentPid(pid: number): Promise<number | null> {
+  try {
+    if (process.platform === "linux" || process.platform === "android") {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf-8");
+      return parsePid(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1] ?? "");
+    }
+    if (process.platform === "win32") {
+      const { stdout } = await execFileAsync(
+        `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+        ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`],
+        { timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true },
+      );
+      return parsePid(stdout);
+    }
+    const { stdout } = await execFileAsync("/bin/ps", ["-p", String(pid), "-o", "ppid="], { timeout: PS_TIMEOUT_MS });
+    return parsePid(stdout);
+  } catch {
+    return null;
+  }
+}
+
 // --- POSIX helpers ---
 
 function sendPosixSignal(pid: number, signal: NodeJS.Signals): boolean {

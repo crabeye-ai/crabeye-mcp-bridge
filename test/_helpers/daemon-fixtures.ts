@@ -135,6 +135,7 @@ export interface OpenSessionOpts {
   sharing?: "auto" | "shared" | "dedicated";
   /** serverName override (changes upstreamHash). */
   serverName?: string;
+  resolvedEnv?: Record<string, string>;
 }
 
 let nextSessionCounter = 0;
@@ -176,7 +177,7 @@ export class OpenSessionFixture {
       serverName: opts.serverName ?? "test-server",
       command: opts.command ?? "node",
       args: opts.args ?? ["-e", "process.stdin.on('data', () => {})"],
-      resolvedEnv: {},
+      resolvedEnv: opts.resolvedEnv ?? {},
       cwd: "",
       sharing: opts.sharing ?? "dedicated",
       clientInfo: { name: "test-bridge", version: "0.0.0" },

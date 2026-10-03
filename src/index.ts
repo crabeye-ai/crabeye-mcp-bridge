@@ -7,7 +7,8 @@ import {
   ConfigWatcher,
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
-import { findRemovedReconnectLimit, resolveUpstreams, isStdioServer } from "./config/schema.js";
+import { findRemovedReconnectLimit, findSelfReferences, resolveUpstreams, isStdioServer } from "./config/schema.js";
+import { launchedByAnotherBridge } from "./upstream/launch-guard.js";
 import type {
   BridgeConfig,
   ServerBridgeConfig,
@@ -46,6 +47,14 @@ function warnRemovedReconnectLimit(config: BridgeConfig, logger: Logger): void {
       "upstreams now retry indefinitely with capped backoff",
     { component: "config" },
   );
+}
+
+const SELF_REFERENCE_REASON = `it launches ${APP_NAME} itself`;
+
+function logSelfReferences(config: BridgeConfig, logger: Logger): void {
+  for (const name of findSelfReferences(config)) {
+    logger.info(`skipping server "${name}": ${SELF_REFERENCE_REASON}`, { component: "config" });
+  }
 }
 
 function buildServerBridgeConfigs(
@@ -122,10 +131,23 @@ program
           const suffix = category ? ` [${category}]` : "";
           process.stderr.write(`  ${name} (${transport})${suffix}\n`);
         }
+        for (const name of findSelfReferences(config)) {
+          process.stderr.write(`  ${name} skipped: ${SELF_REFERENCE_REASON}\n`);
+        }
+        return;
+      }
+
+      if (await launchedByAnotherBridge()) {
+        process.stderr.write(
+          `${APP_NAME} was started as an upstream of another ${APP_NAME}; refusing to run so it cannot launch itself in a loop. ` +
+            "Remove it from that bridge's server list.\n",
+        );
+        process.exitCode = 1;
         return;
       }
 
       warnRemovedReconnectLimit(config, logger);
+      logSelfReferences(config, logger);
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
@@ -202,13 +224,15 @@ program
       // Config hot-reload handler
       const onConfigReload = async (newConfig: typeof config) => {
         const diff = diffConfigs(config, newConfig);
-        warnRemovedReconnectLimit(newConfig, logger);
 
         // Bridge-level hot-reloadable settings
         if (diff.bridge.logLevel) {
           logger.setLevel(diff.bridge.logLevel);
           logger.info(`log level changed to ${diff.bridge.logLevel}`, { component: "reload" });
         }
+
+        warnRemovedReconnectLimit(newConfig, logger);
+        logSelfReferences(newConfig, logger);
 
         if (diff.bridge.healthCheckInterval !== undefined) {
           upstreamManager!.restartHealthChecks(diff.bridge.healthCheckInterval);

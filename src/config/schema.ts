@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { APP_NAME, DEFAULT_KILL_GRACE_MS } from "../constants.js";
+import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
+import { isSelfReference } from "./self-reference.js";
 
 // --- Tool policy ---
 
@@ -292,35 +293,29 @@ export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
  * earlier sources win:
  * `upstreamMcpServers` > `upstreamServers` > `servers` > `context_servers` > `mcpServers`.
  *
- * Self-exclusion: entries from `mcpServers` and `context_servers` whose
- * `command` or `args` contain the app name are filtered out.
+ * Self-exclusion: entries from `mcpServers` and `context_servers` that launch
+ * the bridge itself are filtered out (see `isSelfReference`).
  */
 export function resolveUpstreams(
   config: BridgeConfig,
 ): Record<string, ServerConfig> {
+  return partitionUpstreams(config).upstreams;
+}
+
+/** Names of imported entries skipped because they launch the bridge itself and no kept server took their place. */
+export function findSelfReferences(config: BridgeConfig): string[] {
+  return partitionUpstreams(config).selfReferences;
+}
+
+function partitionUpstreams(config: BridgeConfig): { upstreams: Record<string, ServerConfig>; selfReferences: string[] } {
   const result: Record<string, ServerConfig> = {};
+  const skipped = new Set<string>();
 
-  // mcpServers (lowest priority, with self-exclusion)
-  for (const [name, server] of Object.entries(config.mcpServers)) {
-    if (isStdioServer(server)) {
-      const tokens = [server.command, ...(server.args ?? [])];
-      if (tokens.some((t) => t.includes(APP_NAME))) {
-        continue;
-      }
-    }
-    result[name] = server;
-  }
-
-  // context_servers (with self-exclusion, above mcpServers)
-  if (config.context_servers) {
-    for (const [name, server] of Object.entries(config.context_servers)) {
-      if (isStdioServer(server)) {
-        const tokens = [server.command, ...(server.args ?? [])];
-        if (tokens.some((t) => t.includes(APP_NAME))) {
-          continue;
-        }
-      }
-      result[name] = server;
+  // mcpServers (lowest priority), then context_servers, both with self-exclusion
+  for (const imported of [config.mcpServers, config.context_servers ?? {}]) {
+    for (const [name, server] of Object.entries(imported)) {
+      if (isSelfReference(server)) skipped.add(name);
+      else result[name] = server;
     }
   }
 
@@ -339,7 +334,7 @@ export function resolveUpstreams(
     Object.assign(result, config.upstreamMcpServers);
   }
 
-  return result;
+  return { upstreams: result, selfReferences: [...skipped].filter((name) => !Object.hasOwn(result, name)) };
 }
 
 // --- Type guards ---

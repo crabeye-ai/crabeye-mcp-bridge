@@ -1,8 +1,10 @@
 import { createRequire } from "node:module";
 
-const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+const pkg = createRequire(import.meta.url)("../package.json") as { name: string; version: string };
 
 export const APP_NAME = "crabeye-mcp-bridge";
+export const PACKAGE_NAME = pkg.name;
+export const UPSTREAM_MARKER_ENV = "CRABEYE_MCP_BRIDGE_UPSTREAM";
 export const APP_VERSION = pkg.version;
 
 export const CREDENTIALS_DIR = `.${APP_NAME}`;

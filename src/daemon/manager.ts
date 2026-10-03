@@ -1,7 +1,7 @@
 import { open, lstat, mkdir, chmod, unlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
-import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
+import { DEFAULT_KILL_GRACE_MS, UPSTREAM_MARKER_ENV } from "../constants.js";
 import { createNoopLogger, type Logger } from "../logging/index.js";
 import { upstreamHash } from "../upstream/upstream-hash.js";
 import {
@@ -1876,7 +1876,8 @@ function parseOpenParams(raw: unknown): OpenParams | null {
  * filtering produces literal `"undefined"` env var values), and strips the
  * dynamic-linker / runtime-loader env vars from BOTH the daemon's inherited
  * env and the bridge-supplied `resolvedEnv`. Bridge-supplied `resolvedEnv`
- * still wins on key collision for non-denied keys.
+ * still wins on key collision for non-denied keys, except the upstream marker,
+ * which is always this daemon's pid.
  */
 function buildSpawnEnv(resolvedEnv: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -1889,6 +1890,7 @@ function buildSpawnEnv(resolvedEnv: Record<string, string>): Record<string, stri
     if (ENV_VAR_DENYLIST.has(k)) continue;
     out[k] = v;
   }
+  out[UPSTREAM_MARKER_ENV] = String(process.pid);
   return out;
 }
 

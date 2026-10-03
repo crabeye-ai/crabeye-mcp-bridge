@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { modify, applyEdits, type ModificationOptions } from "jsonc-parser";
-import { APP_NAME } from "../constants.js";
+import { APP_NAME, PACKAGE_NAME } from "../constants.js";
 import { discoverMcpConfigs } from "../config/discovery.js";
 import {
   loadBridgeOwnedConfig,
@@ -27,7 +27,7 @@ const JSONC_FORMAT: ModificationOptions = {
 
 const BRIDGE_ENTRY = {
   command: "npx",
-  args: ["-y", `@crabeye-ai/${APP_NAME}`],
+  args: ["-y", PACKAGE_NAME],
 };
 
 export async function runInit(): Promise<void> {
@@ -124,7 +124,7 @@ const OPENCODE_SNIPPET = `{
   "mcp": {
     "${APP_NAME}": {
       "type": "local",
-      "command": ["npx", "-y", "@crabeye-ai/${APP_NAME}"],
+      "command": ["npx", "-y", "${PACKAGE_NAME}"],
       "enabled": true
     }
   }
@@ -134,7 +134,7 @@ const CONTINUE_DEV_HINT =
   "Continue.dev's MCP support is still evolving (legacy JSON array shape, " +
   "newer per-file YAML). See https://docs.continue.dev/customize/mcp-tools " +
   "for the current schema and add an entry pointing at " +
-  `\`npx -y @crabeye-ai/${APP_NAME}\`.`;
+  `\`npx -y ${PACKAGE_NAME}\`.`;
 
 /**
  * Print a manual-setup snippet for a harness whose config schema doesn't fit
@@ -158,7 +158,7 @@ function printDetectOnlySnippet(clientName: string, configPath: string): void {
 
   // Fallback for any future detect-only harness without a tailored snippet.
   process.stderr.write(
-    `    Add an entry pointing at \`npx -y @crabeye-ai/${APP_NAME}\`.\n\n`,
+    `    Add an entry pointing at \`npx -y ${PACKAGE_NAME}\`.\n\n`,
   );
 }
 

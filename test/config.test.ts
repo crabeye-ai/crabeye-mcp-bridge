@@ -537,7 +537,7 @@ describe("resolveUpstreams", () => {
     expect(Object.keys(upstreams)).toEqual(["s"]);
   });
 
-  it("excludes entries with crabeye-mcp-bridge in command from mcpServers", () => {
+  it("excludes a single-string npx launch of the bridge from mcpServers", () => {
     const config = parsed({
       mcpServers: {
         bridge: { command: "npx crabeye-mcp-bridge", args: ["--config", "c.json"] },
@@ -549,7 +549,7 @@ describe("resolveUpstreams", () => {
     expect(Object.keys(upstreams).sort()).toEqual(["httpServer", "real"]);
   });
 
-  it("excludes entries with crabeye-mcp-bridge in args from mcpServers", () => {
+  it("excludes npx -y crabeye-mcp-bridge from mcpServers", () => {
     const config = parsed({
       mcpServers: {
         bridge: { command: "npx", args: ["-y", "crabeye-mcp-bridge", "--config", "c.json"] },
@@ -571,13 +571,28 @@ describe("resolveUpstreams", () => {
     expect(Object.keys(upstreams)).toEqual(["real"]);
   });
 
-  it("does not apply self-exclusion to upstreamMcpServers or servers", () => {
+  it("keeps servers whose arguments merely contain crabeye-mcp-bridge, in both imported keys", () => {
+    const config = parsed({
+      mcpServers: {
+        tool: { command: "node", args: ["/work/crabeye-mcp-bridge/tools/server.js"] },
+        rooted: { command: "node", args: ["s.js", "--root", "/x/crabeye-mcp-bridge"] },
+      },
+      context_servers: {
+        zed: { command: "node", args: ["/work/crabeye-mcp-bridge/tools/server.js"] },
+      },
+    });
+    const upstreams = resolveUpstreams(config);
+    expect(Object.keys(upstreams).sort()).toEqual(["rooted", "tool", "zed"]);
+  });
+
+  it("does not apply self-exclusion to upstreamMcpServers, servers or upstreamServers", () => {
     const config = parsed({
       upstreamMcpServers: { bridge1: { command: "npx crabeye-mcp-bridge" } },
       servers: { bridge2: { command: "npx", args: ["crabeye-mcp-bridge"] } },
+      upstreamServers: { bridge3: { command: "crabeye-mcp-bridge" } },
     });
     const upstreams = resolveUpstreams(config);
-    expect(Object.keys(upstreams).sort()).toEqual(["bridge1", "bridge2"]);
+    expect(Object.keys(upstreams).sort()).toEqual(["bridge1", "bridge2", "bridge3"]);
   });
 
   it("returns empty object when no server keys are provided", () => {

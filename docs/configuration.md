@@ -148,7 +148,9 @@ The bridge reads upstream definitions from these top-level keys (in priority ord
 4. `context_servers` (Zed)
 5. `mcpServers`
 
-Self-exclusion applies to `mcpServers` and `context_servers` — the bridge will skip its own entry to avoid recursion.
+Self-exclusion applies to `mcpServers` and `context_servers`: the bridge skips any entry that launches the bridge itself, so it doesn't start a copy of itself. An entry counts as the bridge when its command line runs the `crabeye-mcp-bridge` command, the `@crabeye-ai/crabeye-mcp-bridge` package (through `npx`, `pnpm dlx`, `bunx` and similar, including inside `cmd /c` or `sh -c`), or one of the bridge's own entry files. A server is not skipped just because a path, an option value (such as `--repo crabeye-ai/crabeye-mcp-bridge`) or a sentence in one of its arguments mentions `crabeye-mcp-bridge`. Each skipped entry is logged at info level when the config loads or reloads, and `--validate` lists it.
+
+The bridge can't run as an upstream of another bridge: a bridge started that way exits with an error explaining why. Entries under the other keys are never skipped, so a bridge listed there fails to start.
 
 ## Supported clients in `init`
 
