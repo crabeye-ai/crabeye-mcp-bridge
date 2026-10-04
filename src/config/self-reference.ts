@@ -3,20 +3,12 @@ import { dirname, isAbsolute, join, relative } from "node:path";
 import { APP_NAME, PACKAGE_NAME } from "../constants.js";
 import type { ServerConfig } from "./schema.js";
 
-const ENTRY_FILES = [`bin/${APP_NAME}`, "dist/index.js", "src/index.ts"];
-const BIN_DIRS = new Set(["bin", ".bin"]);
-const WINDOWS_SHIM = /\.(cmd|exe|ps1)$/i;
-const ENTRY_NAMES = new Set(ENTRY_FILES.map((entry) => entry.split("/").at(-1)!));
-const VERSION_SUFFIX = /(?<=.)@[^/@]*$/;
+const QUOTES = "\"'";
 const PACKAGE_FLAG_PREFIX = /^(?:--package|-p)=/;
-const CALL_FLAG_PREFIX = /^(?:--call|--command|-c)=/;
+const COMMAND_LINE_FLAG_PREFIX = /^(?:--call|--command|-c)=/;
+
+const COMMAND_LINE_FLAG = /^(?:-[eilnuvx]{0,4}c[eilnuvx]{0,4}|\/[ck]|--?command|--call)$/i;
 const LONG_OPTION = /^--[\w-]+$/;
-const SHELL_COMMAND_FLAG = /^(?:-[eilnuvx]{0,4}c[eilnuvx]{0,4}|\/[ck]|--?command|--call)$/i;
-const SLASH_SWITCH = /^\/[a-z?]+(?::\S*)?$/i;
-const ENV_VALUE_OPTION = /^(?:-[uCaP]|--(?:unset|chdir|argv0))$/;
-const POWERSHELL_VALUE_SWITCH =
-  /^[-/](?:executionpolicy|ep|ex|windowstyle|w|version|v|outputformat|of|o|inputformat|if|configurationname|psconsolefile|workingdirectory|wd|settingsfile|custompipename)$/i;
-const PACKAGE_OPTIONS = new Set(["--package"]);
 const BOOLEAN_LAUNCHER_FLAGS = new Set([
   "--yes",
   "--no",
@@ -31,15 +23,30 @@ const BOOLEAN_LAUNCHER_FLAGS = new Set([
   "--legacy-peer-deps",
 ]);
 const NO_VALUE_FLAG = /^--(?:no|prefer)-/;
+
 const POSIX_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
 const WINDOWS_SHELLS = new Set(["cmd", "powershell", "pwsh"]);
-const WHITESPACE = /\s+/;
+const SHELLS_AND_ENV = new Set([...POSIX_SHELLS, ...WINDOWS_SHELLS, "env"]);
+const SLASH_SWITCH = /^\/[a-z?]+(?::\S*)?$/i;
+const POWERSHELL_VALUE_SWITCH =
+  /^[-/](?:executionpolicy|ep|ex|windowstyle|w|version|v|outputformat|of|o|inputformat|if|configurationname|psconsolefile|workingdirectory|wd|settingsfile|custompipename)$/i;
+const ENV_VALUE_OPTION = /^(?:-[uCaP]|--(?:unset|chdir|argv0))$/;
+
+const BIN_DIRS = new Set(["bin", ".bin"]);
+const WINDOWS_SHIM = /\.(cmd|exe|ps1)$/i;
+const VERSION_SUFFIX = /(?<=.)@[^/@]*$/;
 const NPM_ALIAS = /^(?:(?:@[^/@\s]+\/)?[^/@\s]+@)?npm:/i;
-const PREFIXED_SPEC = /^(?:(?:github|gitlab|bitbucket|file|ssh|git|git\+[a-z]+):|[^@\s/]+@[^:.\s/]+\.[^:\s]+:)/i;
+const GIT_OR_FILE_SPEC_PREFIX = /^(?:(?:github|gitlab|bitbucket|file|ssh|git|git\+[a-z]+):|[^@\s/]+@[^:.\s/]+\.[^:\s]+:)/i;
 const OWN_REPO = PACKAGE_NAME.replace(/^@/, "");
 const TARBALL = new RegExp(`^(?:${OWN_REPO.replace("/", "-")}|${APP_NAME})-\\d[\\w.+-]*\\.tgz$`, "i");
-const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
+const ENTRY_FILES = [`bin/${APP_NAME}`, "dist/index.js", "src/index.ts"];
+const ENTRY_NAMES = new Set(ENTRY_FILES.map((entry) => entry.split("/").at(-1)!));
 
+const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
+const WHITESPACE = /\s+/;
+const PATH_SEPARATOR = /[\\/]/;
+
+type Role = "commandLine" | "optionValue" | "argument";
 type PackageLookup = { found: false } | { found: true; name: string | undefined };
 
 const verdicts = new WeakMap<ServerConfig, boolean>();
@@ -55,114 +62,137 @@ export function isSelfReference(server: ServerConfig): boolean {
 }
 
 function classify(command: string, args: string[], cwd: string | undefined): boolean {
-  const program = clean(command.trim());
-  const programFile = fileName(programPath(program, cwd));
-  if (programFile === APP_NAME) return true;
-  if (commandLineNamesBridge(program, cwd)) return true;
-  const commandLines = commandLineIndexes(programFile, args);
-  return args.some((raw, index) => {
-    const previous = args[index - 1];
-    const token = clean(raw.replace(CALL_FLAG_PREFIX, ""));
-    if (token.length === 0) return false;
-    if (commandLines.has(index) || CALL_FLAG_PREFIX.test(raw) || (previous !== undefined && SHELL_COMMAND_FLAG.test(previous))) {
-      return commandLineNamesBridge(token, cwd);
-    }
-    return tokenNamesBridge(token, cwd, isOptionValue(previous));
+  const commandLine = unwrapCommand(command.trim());
+  const programName = fileName(commandProgram(commandLine, cwd));
+  if (programName === APP_NAME || namesBridgeAs("commandLine", commandLine, cwd)) return true;
+  const roles = argumentRoles(programName, args);
+  return args.some((raw, index) => namesBridgeAs(roles[index]!, unwrapArgument(raw), cwd));
+}
+
+function unwrapCommand(text: string): string {
+  return stripQuotes(text).replace(PACKAGE_FLAG_PREFIX, "");
+}
+
+function unwrapArgument(raw: string): string {
+  return unwrapCommand(raw.replace(COMMAND_LINE_FLAG_PREFIX, ""));
+}
+
+function commandProgram(line: string, cwd: string | undefined): string {
+  if (!WHITESPACE.test(line) || existingFile(resolveToken(line, cwd) ?? line) !== undefined) return line;
+  return line.split(WHITESPACE)[0]!;
+}
+
+function argumentRoles(programName: string, args: string[]): Role[] {
+  const operands = shellOperands(programName, args);
+  return args.map((raw, index) => {
+    const previous = args[index - 1] ?? "";
+    if (operands.has(index) || COMMAND_LINE_FLAG_PREFIX.test(raw) || COMMAND_LINE_FLAG.test(previous)) return "commandLine";
+    if (takesValue(previous) && previous !== "--package") return "optionValue";
+    return "argument";
   });
 }
 
-function commandLineIndexes(programFile: string, args: string[]): Set<number> {
-  const indexes = new Set<number>();
-  for (let program = programFile, start = 0; ; ) {
-    const operand = operandIndex(program, args, start);
-    if (operand === -1 || POSIX_SHELLS.has(program)) {
-      if (operand !== -1) indexes.add(operand);
-      return indexes;
-    }
-    indexes.add(operand);
-    program = fileName(clean(args[operand]!));
-    start = operand + 1;
+function takesValue(option: string): boolean {
+  return LONG_OPTION.test(option) && !BOOLEAN_LAUNCHER_FLAGS.has(option) && !NO_VALUE_FLAG.test(option);
+}
+
+function shellOperands(programName: string, args: string[]): Set<number> {
+  const operands = new Set<number>();
+  let program = programName;
+  for (let index = 0; index < args.length && SHELLS_AND_ENV.has(program); index++) {
+    const arg = args[index]!;
+    if (!isShellOperand(program, arg, args[index - 1] ?? "")) continue;
+    operands.add(index);
+    if (POSIX_SHELLS.has(program)) break;
+    program = fileName(unwrapCommand(arg));
+  }
+  return operands;
+}
+
+function isShellOperand(program: string, arg: string, previous: string): boolean {
+  if (arg.startsWith("-")) return false;
+  if (WINDOWS_SHELLS.has(program)) return !SLASH_SWITCH.test(arg) && !POWERSHELL_VALUE_SWITCH.test(previous);
+  if (program === "env") return !arg.includes("=") && !ENV_VALUE_OPTION.test(previous);
+  return true;
+}
+
+function namesBridgeAs(role: Role, token: string, cwd: string | undefined): boolean {
+  if (token.length === 0) return false;
+  switch (role) {
+    case "commandLine":
+      return namesBridgeAsCommandLine(token, cwd);
+    case "optionValue":
+      return namesBridgeUnambiguously(token, cwd);
+    case "argument":
+      return namesBridgeAsArgument(token, cwd);
   }
 }
 
-function operandIndex(programFile: string, args: string[], start: number): number {
-  const isOperand = operandTest(programFile);
-  if (isOperand === undefined) return -1;
-  for (let index = start; index < args.length; index++) {
-    if (isOperand(args[index]!, index > start ? args[index - 1]! : "")) return index;
-  }
-  return -1;
+function namesBridgeAsCommandLine(line: string, cwd: string | undefined): boolean {
+  return namesBridgeAsArgument(line, cwd) || namesBridgeWhenSplit(line, cwd);
 }
 
-function operandTest(programFile: string): ((arg: string, previous: string) => boolean) | undefined {
-  if (POSIX_SHELLS.has(programFile)) return (arg) => !arg.startsWith("-");
-  if (WINDOWS_SHELLS.has(programFile)) {
-    return (arg, previous) => !arg.startsWith("-") && !SLASH_SWITCH.test(arg) && !POWERSHELL_VALUE_SWITCH.test(previous);
-  }
-  if (programFile === "env") {
-    return (arg, previous) => !arg.startsWith("-") && !arg.includes("=") && !ENV_VALUE_OPTION.test(previous);
-  }
-  return undefined;
-}
-
-function isOptionValue(previous: string | undefined): boolean {
-  if (previous === undefined || !LONG_OPTION.test(previous)) return false;
-  return !PACKAGE_OPTIONS.has(previous) && !BOOLEAN_LAUNCHER_FLAGS.has(previous) && !NO_VALUE_FLAG.test(previous);
-}
-
-function commandLineNamesBridge(line: string, cwd: string | undefined): boolean {
-  return line.length > 0 && (tokenNamesBridge(line, cwd, false) || piecesNameBridge(line, cwd));
-}
-
-function programPath(program: string, cwd: string | undefined): string {
-  if (!WHITESPACE.test(program) || existingFile(resolveToken(program, cwd) ?? program) !== undefined) return program;
-  return program.split(WHITESPACE)[0]!;
-}
-
-function piecesNameBridge(line: string, cwd: string | undefined): boolean {
-  const pieces = line
+function namesBridgeWhenSplit(line: string, cwd: string | undefined): boolean {
+  const words = line
     .split(WHITESPACE)
-    .map((piece) => clean(piece.replace(CALL_FLAG_PREFIX, "")))
-    .filter((piece) => piece.length > 0);
-  if (pieces.length < 2 || !pieces.some((piece) => tokenNamesBridge(piece, cwd, false))) return false;
+    .map(unwrapArgument)
+    .filter((word) => word.length > 0);
+  if (words.length < 2 || !words.some((word) => namesBridgeAsArgument(word, cwd))) return false;
   return existingFile(resolveToken(line, cwd)) === undefined;
 }
 
-function tokenNamesBridge(token: string, cwd: string | undefined, optionValue: boolean): boolean {
-  if (namesBin(token, optionValue) || isBridgePackage(token, cwd, optionValue)) return true;
+function namesBridgeAsArgument(token: string, cwd: string | undefined): boolean {
+  return (
+    isBareBin(token) ||
+    isBinPath(token) ||
+    isUnambiguousBridgeSpec(token) ||
+    isAmbiguousBridgeSpec(token, cwd) ||
+    namesEntryFile(token, cwd)
+  );
+}
+
+function namesBridgeUnambiguously(token: string, cwd: string | undefined): boolean {
+  return isBinPath(token) || isUnambiguousBridgeSpec(token) || namesEntryFile(token, cwd);
+}
+
+function isBareBin(token: string): boolean {
+  return fileName(token) === APP_NAME && !PATH_SEPARATOR.test(token);
+}
+
+function isBinPath(token: string): boolean {
+  if (fileName(token) !== APP_NAME) return false;
+  return WINDOWS_SHIM.test(token) || BIN_DIRS.has(token.split(PATH_SEPARATOR).at(-2) ?? "");
+}
+
+function isUnambiguousBridgeSpec(spec: string): boolean {
+  if (spec.startsWith("-")) return false;
+  if (NPM_ALIAS.test(spec)) {
+    const name = stripVersion(spec.replace(NPM_ALIAS, ""));
+    return name === PACKAGE_NAME || name === APP_NAME;
+  }
+  return TARBALL.test(fileName(spec)) || stripVersion(spec) === PACKAGE_NAME;
+}
+
+function isAmbiguousBridgeSpec(spec: string, cwd: string | undefined): boolean {
+  if (spec.startsWith("-") || NPM_ALIAS.test(spec)) return false;
+  if (GIT_OR_FILE_SPEC_PREFIX.test(spec)) {
+    const name = stripVersion(stripTrailingSlashes(beforeHash(spec.replace(GIT_OR_FILE_SPEC_PREFIX, ""))));
+    return name === PACKAGE_NAME || stripGitSuffix(name.split("/").at(-1)!) === APP_NAME;
+  }
+  if (stripGitSuffix(beforeHash(spec)) === OWN_REPO) {
+    const local = resolveToken(OWN_REPO, cwd);
+    return local === undefined || safeStat(local) === undefined;
+  }
+  return stripVersion(spec) === APP_NAME;
+}
+
+function namesEntryFile(token: string, cwd: string | undefined): boolean {
   const resolved = resolveToken(token, cwd);
   if (ENTRY_NAMES.has(fileName(token))) {
     const real = existingFile(resolved);
     if (real !== undefined) return bridgeEntryOnDisk(real) ?? endsWithEntry(toPosix(real));
   }
   return [token, resolved].some((path) => path !== undefined && endsWithEntry(toPosix(path)));
-}
-
-function namesBin(token: string, optionValue: boolean): boolean {
-  if (fileName(token) !== APP_NAME) return false;
-  const segments = toPosix(token).split("/");
-  return WINDOWS_SHIM.test(token) || (segments.length === 1 && !optionValue) || BIN_DIRS.has(segments.at(-2)!);
-}
-
-function isBridgePackage(spec: string, cwd: string | undefined, optionValue: boolean): boolean {
-  if (spec.startsWith("-")) return false;
-  if (NPM_ALIAS.test(spec)) {
-    const name = spec.replace(NPM_ALIAS, "").replace(VERSION_SUFFIX, "");
-    return name === PACKAGE_NAME || name === APP_NAME;
-  }
-  if (TARBALL.test(fileName(spec))) return true;
-  const withoutVersion = spec.replace(VERSION_SUFFIX, "");
-  if (withoutVersion === PACKAGE_NAME) return true;
-  if (optionValue) return false;
-  if (PREFIXED_SPEC.test(spec)) {
-    const name = trimTrailing(beforeHash(spec.replace(PREFIXED_SPEC, "")), "/").replace(VERSION_SUFFIX, "");
-    return name === PACKAGE_NAME || stripGitSuffix(name.split("/").at(-1)!) === APP_NAME;
-  }
-  if (stripGitSuffix(beforeHash(spec)) === OWN_REPO) {
-    const local = resolveToken(OWN_REPO, cwd);
-    return local === undefined || !pathExists(local);
-  }
-  return withoutVersion === APP_NAME;
 }
 
 function endsWithEntry(path: string): boolean {
@@ -228,10 +258,6 @@ function existingFile(path: string | undefined): string | undefined {
   }
 }
 
-function pathExists(path: string): boolean {
-  return safeStat(path) !== undefined;
-}
-
 function safeStat(path: string): Stats | undefined {
   try {
     return statSync(path, { throwIfNoEntry: false });
@@ -240,20 +266,26 @@ function safeStat(path: string): Stats | undefined {
   }
 }
 
-function clean(token: string): string {
-  return trimTrailing(trimLeading(token, "\"'"), "\"'").replace(PACKAGE_FLAG_PREFIX, "");
-}
-
-function trimLeading(text: string, chars: string): string {
+function stripQuotes(text: string): string {
   let start = 0;
-  while (start < text.length && chars.includes(text[start]!)) start++;
-  return text.slice(start);
+  let end = text.length;
+  while (start < end && QUOTES.includes(text[start]!)) start++;
+  while (end > start && QUOTES.includes(text[end - 1]!)) end--;
+  return text.slice(start, end);
 }
 
-function trimTrailing(text: string, chars: string): string {
+function stripVersion(spec: string): string {
+  return spec.replace(VERSION_SUFFIX, "");
+}
+
+function stripTrailingSlashes(text: string): string {
   let end = text.length;
-  while (end > 0 && chars.includes(text[end - 1]!)) end--;
+  while (end > 0 && text[end - 1] === "/") end--;
   return text.slice(0, end);
+}
+
+function stripGitSuffix(name: string): string {
+  return name.endsWith(".git") ? name.slice(0, -4) : name;
 }
 
 function beforeHash(text: string): string {
@@ -261,14 +293,10 @@ function beforeHash(text: string): string {
   return hash === -1 ? text : text.slice(0, hash);
 }
 
-function stripGitSuffix(name: string): string {
-  return name.endsWith(".git") ? name.slice(0, -4) : name;
-}
-
 function fileName(token: string): string {
-  return toPosix(token).split("/").at(-1)!.replace(WINDOWS_SHIM, "").toLowerCase();
+  return token.split(PATH_SEPARATOR).at(-1)!.replace(WINDOWS_SHIM, "").toLowerCase();
 }
 
 function toPosix(path: string): string {
-  return path.split(/[\\/]/).join("/");
+  return path.split(PATH_SEPARATOR).join("/");
 }
