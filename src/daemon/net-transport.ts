@@ -1,7 +1,7 @@
 import { createServer as createNetServer, createConnection, type Server } from "node:net";
 import { chmod, link, lstat, mkdir, readdir, unlink } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   SocketInUseError,
   wrapSocket,
@@ -11,6 +11,7 @@ import {
   type FrameChannel,
   type Transport,
 } from "./transport.js";
+import { socketAddress } from "./socket-address.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const SERVING_PROBE_TIMEOUT_MS = 1_000;
@@ -28,10 +29,12 @@ class NetDaemonServer implements DaemonServer {
   }
 
   async start(): Promise<void> {
+    const address = await socketAddress(this.opts.path);
     if (!isWindows) {
       await prepUnixSocketPath(this.opts.path);
     }
     const bindPath = isWindows ? this.opts.path : stagingSocketPath(this.opts.path);
+    const bindAddress = isWindows ? bindPath : join(dirname(address), basename(bindPath));
 
     this.server = createNetServer((socket) => {
       this.opts.onConnection(wrapSocket(socket, this.opts.path));
@@ -52,7 +55,7 @@ class NetDaemonServer implements DaemonServer {
       };
       this.server!.once("error", onError);
       this.server!.once("listening", onListening);
-      this.server!.listen(bindPath);
+      this.server!.listen(bindAddress);
     });
 
     if (!isWindows) {
@@ -161,9 +164,10 @@ async function sweepOrphanedStagingSockets(dir: string): Promise<void> {
   }
 }
 
-export function isServing(path: string): Promise<boolean> {
+export async function isServing(path: string): Promise<boolean> {
+  const address = await socketAddress(path);
   return new Promise((resolve) => {
-    const probe = createConnection(path);
+    const probe = createConnection(address);
     const settle = (serving: boolean): void => {
       clearTimeout(timer);
       probe.destroy();
@@ -181,10 +185,11 @@ export const netTransport: Transport = {
   createServer(opts: DaemonServerOptions): DaemonServer {
     return new NetDaemonServer(opts);
   },
-  connect(opts: DaemonClientOptions): Promise<FrameChannel> {
+  async connect(opts: DaemonClientOptions): Promise<FrameChannel> {
     const timeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    const address = await socketAddress(opts.path);
     return new Promise((resolve, reject) => {
-      const socket = createConnection(opts.path);
+      const socket = createConnection(address);
       const timer = setTimeout(() => {
         socket.destroy(new Error(`connect timed out after ${timeoutMs}ms`));
       }, timeoutMs);
@@ -192,6 +197,7 @@ export const netTransport: Transport = {
       const onError = (err: Error): void => {
         clearTimeout(timer);
         socket.removeListener("connect", onConnect);
+        if (address !== opts.path) err.message = err.message.split(address).join(opts.path);
         reject(err);
       };
       const onConnect = (): void => {

@@ -13,6 +13,7 @@ import {
   recordedPids,
   terminateDaemon,
   waitForExit,
+  isSocketAddressError,
   type StatusResult,
   type TerminateResult,
 } from "../daemon/index.js";
@@ -32,6 +33,20 @@ export interface RestartUpstreamOpts {
 const SHUTDOWN_RPC_TIMEOUT_MS = 2_000;
 
 export async function runDaemonCommand(action: DaemonAction): Promise<number> {
+  try {
+    return await dispatch(action);
+  } catch (err) {
+    reportSocketAddressError(err);
+    return 1;
+  }
+}
+
+function reportSocketAddressError(err: unknown): void {
+  if (!isSocketAddressError(err)) throw err;
+  process.stderr.write(`${err.message}\n`);
+}
+
+function dispatch(action: DaemonAction): Promise<number> {
   switch (action) {
     case "start":
       return runStart();
@@ -110,7 +125,10 @@ async function runStart(): Promise<number> {
 }
 
 async function runStop(): Promise<number> {
-  const reachable = await isDaemonReachable(getDaemonSocketPath());
+  const reachable = await isDaemonReachable(getDaemonSocketPath()).catch((err: unknown) => {
+    reportSocketAddressError(err);
+    return false;
+  });
   const recorded = await recordedDaemonPids();
   const shutdownWaitMs = await loadDaemonShutdownWaitMs();
 
@@ -182,8 +200,8 @@ async function runStatus(): Promise<number> {
       ) + "\n",
     );
     return 0;
-  } catch {
-    /* fall through to pidfile probe */
+  } catch (err) {
+    if (isSocketAddressError(err)) throw err;
   } finally {
     client.close();
   }
@@ -211,7 +229,7 @@ async function runRestart(): Promise<number> {
  *
  * Exit codes:
  *  - 0: success (or daemon not running — idempotent no-op).
- *  - 1: RPC error from a reachable daemon.
+ *  - 1: RPC error from a reachable daemon, or the daemon socket path can't be used.
  *  - 2: usage error (neither hash nor --all).
  */
 export async function runRestartUpstream(opts: RestartUpstreamOpts): Promise<number> {
@@ -231,7 +249,8 @@ export async function runRestartUpstream(opts: RestartUpstreamOpts): Promise<num
   try {
     try {
       await client.connect();
-    } catch {
+    } catch (err) {
+      if (isSocketAddressError(err)) throw err;
       // Daemon not reachable: nothing to restart. Idempotent no-op, matching
       // `daemon stop`'s behaviour.
       process.stderr.write("daemon not running; nothing to restart\n");

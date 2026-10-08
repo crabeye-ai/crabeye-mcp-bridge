@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DaemonClient } from "./client.js";
 import { daemonFilesFor, getDaemonSocketPath, type DaemonFiles } from "./paths.js";
 import { isServing, netTransport } from "./net-transport.js";
+import { isSocketAddressError } from "./socket-address.js";
 import { DAEMON_LAUNCH_ARGS } from "./daemon-identity.js";
 import {
   describeProcess,
@@ -289,7 +290,8 @@ export async function isDaemonReachable(socketPath: string): Promise<boolean> {
     await client.connect();
     await client.call("STATUS");
     return true;
-  } catch {
+  } catch (err) {
+    if (isSocketAddressError(err)) throw err;
     return false;
   } finally {
     client.close();
