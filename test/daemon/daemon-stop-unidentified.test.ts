@@ -17,6 +17,7 @@ vi.mock("../../src/process/process-utils.js", async (importOriginal) => ({
 }));
 
 const { runDaemonCommand } = await import("../../src/commands/daemon.js");
+const { getDaemonSocketPath } = await import("../../src/daemon/index.js");
 const { encodeFrame, FrameDecoder } = await import("../../src/daemon/protocol.js");
 const { waitForExit } = await import("../../src/daemon/daemon-process.js");
 const { processExists } = await import("../../src/process/process-utils.js");
@@ -47,6 +48,13 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
     return () => out;
   }
 
+  async function stopDaemon(): Promise<number> {
+    if (!getDaemonSocketPath().startsWith(`${runDir.path}/`)) {
+      throw new Error(`refusing to run daemon stop: the daemon paths are outside the test run dir (${getDaemonSocketPath()})`);
+    }
+    return runDaemonCommand("stop");
+  }
+
   it("stops a recorded process whose identity cannot be read, since only a confirmed foreign one is left alone", async () => {
     runDir.path = mkdtempSync("/tmp/cbe-stopu-");
     const unidentified = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e6)"], { stdio: "ignore" });
@@ -55,7 +63,7 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
     writeFileSync(join(runDir.path, "manager.pid"), `${unidentified.pid}\n`);
     const stderr = captureStderr();
 
-    expect(await runDaemonCommand("stop")).toBe(0);
+    expect(await stopDaemon()).toBe(0);
 
     expect(stderr()).toBe(`unresponsive daemon ${unidentified.pid} stopped\n`);
     expect(await waitForExit(unidentified.pid!, 3_000)).toBe(true);
@@ -66,7 +74,7 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
     runDir.path = mkdtempSync("/tmp/cbe-stopu-");
     const stderr = captureStderr();
 
-    expect(await runDaemonCommand("stop")).toBe(0);
+    expect(await stopDaemon()).toBe(0);
 
     expect(stderr()).toBe("daemon not running\n");
   });
@@ -86,7 +94,7 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
     });
     const stderr = captureStderr();
 
-    expect(await runDaemonCommand("stop")).toBe(0);
+    expect(await stopDaemon()).toBe(0);
 
     expect(stderr()).toMatch(new RegExp(`^could not stop pid ${stubborn.pid} recorded for the daemon$`, "m"));
   });
@@ -106,7 +114,7 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
     const stderr = captureStderr();
 
     try {
-      expect(await runDaemonCommand("stop")).toBe(0);
+      expect(await stopDaemon()).toBe(0);
     } finally {
       await new Promise<void>((r) => daemon.close(() => r()));
     }
@@ -134,7 +142,7 @@ describe.skipIf(process.platform === "win32")("daemon stop", () => {
     const stderr = captureStderr();
 
     try {
-      expect(await runDaemonCommand("stop")).toBe(0);
+      expect(await stopDaemon()).toBe(0);
     } finally {
       await new Promise<void>((r) => daemon.close(() => r()));
     }
