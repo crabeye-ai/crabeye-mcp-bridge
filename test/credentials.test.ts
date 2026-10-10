@@ -443,14 +443,17 @@ describe("CredentialStore CRUD", () => {
   // keys" above). The read-path `Object.hasOwn` check is now belt-and-
   // suspenders defense-in-depth for any future code that bypasses validate.
 
-  it("throws when keychain is wiped but store file exists", async () => {
+  it("a new store throws when the keychain is wiped; a running one keeps its key", async () => {
     await store.set("key", { type: "bearer", access_token: "tok" });
 
     // Simulate keychain wipe
     await keychain.deleteKey();
 
-    // Read-only op should fail with clear message, not auto-generate a new key
-    await expect(store.get("key")).rejects.toThrow(/No master key found/);
+    // A running process keeps its cached key; a new one fails with a clear
+    // message instead of auto-generating a new key
+    expect(await store.get("key")).toEqual({ type: "bearer", access_token: "tok" });
+    const restarted = new CredentialStore({ keychain, filePath: join(dir, "creds.enc") });
+    await expect(restarted.get("key")).rejects.toThrow(/No master key found/);
 
     // Keychain should still be empty (no auto-generation on read path)
     expect(await keychain.getKey()).toBeUndefined();
@@ -675,7 +678,7 @@ describe("key auto-generation", () => {
     const filePath = join(dir, "creds.enc");
     const store = new CredentialStore({ keychain: failingKeychain, filePath });
 
-    // Write a dummy file so _readStore doesn't short-circuit on ENOENT
+    // Write a dummy file so get() doesn't short-circuit on a missing file
     await writeFile(filePath, Buffer.from("dummy-data"));
 
     await expect(store.get("key")).rejects.toThrow(CredentialError);
@@ -867,27 +870,16 @@ describe("concurrency", () => {
   });
 
   it("a rejected RMW does not poison the chain", async () => {
-    let getKeyCalls = 0;
-    let stored: Buffer | undefined;
-    const flaky: KeychainAdapter = {
-      async getKey() {
-        getKeyCalls++;
-        if (getKeyCalls === 3) {
-          throw new CredentialError("transient keychain error");
-        }
-        return stored;
-      },
-      async setKey(k) {
-        stored = k;
-      },
-      async deleteKey() {
-        stored = undefined;
-      },
-    };
-    const store = new CredentialStore({
-      keychain: flaky,
-      filePath: join(dir, "creds.enc"),
-    });
+    const store = new CredentialStore({ keychain: new MockKeychain(), filePath: join(dir, "creds.enc") });
+    const internals = store as unknown as { _writeStore: (...args: unknown[]) => Promise<void> };
+    const realWrite = internals._writeStore.bind(store);
+    let writes = 0;
+    vi.spyOn(internals, "_writeStore")
+      .mockImplementation(async (...args) => {
+        writes++;
+        if (writes === 3) throw new CredentialError("transient write error");
+        return realWrite(...args);
+      });
 
     const results = await Promise.allSettled([
       store.set("k1", { type: "bearer", access_token: "t1" }),

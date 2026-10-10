@@ -8,13 +8,16 @@ import type { KeychainAdapter } from "../../src/credentials/keychain.js";
 /** In-memory keychain — same shape as the real adapters, no OS calls. */
 export class MockKeychain implements KeychainAdapter {
   private key: Buffer | undefined;
-  async getKey() { return this.key; }
+  reads = 0;
+  async getKey() { this.reads++; return this.key; }
   async setKey(k: Buffer) { this.key = k; }
   async deleteKey() { this.key = undefined; }
 }
 
 export interface TestStoreHandle {
   store: CredentialStore;
+  keychain: MockKeychain;
+  filePath: string;
   /** Removes the tmpdir. Safe to call multiple times. */
   cleanup: () => void;
 }
@@ -31,12 +34,12 @@ export function makeTestStore(prefix = "crabeye-test-"): TestStoreHandle {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   const keychain = new MockKeychain();
   void keychain.setKey(randomBytes(32));
-  const store = new CredentialStore({
-    keychain,
-    filePath: join(dir, "creds.enc"),
-  });
+  const filePath = join(dir, "creds.enc");
+  const store = new CredentialStore({ keychain, filePath });
   return {
     store,
+    keychain,
+    filePath,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }

@@ -124,6 +124,8 @@ class AsyncMutex {
 // lock — in this codebase that's enforced by computing the path once from
 // constants in the constructor.
 
+class DecryptError extends CredentialError {}
+
 const CASE_INSENSITIVE_FS =
   process.platform === "darwin" || process.platform === "win32";
 
@@ -134,6 +136,7 @@ export class CredentialStore {
   private readonly filePath: string;
   private readonly logger: Logger | undefined;
   private readonly lockTimeoutMs: number | undefined;
+  private masterKey: Promise<Buffer | undefined> | undefined;
 
   constructor(options: CredentialStoreOptions) {
     this.keychain = options.keychain;
@@ -161,8 +164,7 @@ export class CredentialStore {
   async get(key: string): Promise<Credential | undefined> {
     this._validateKey(key);
     if (!await this._storeFileExists()) return undefined;
-    const masterKey = await this._getExistingMasterKey();
-    const store = await this._readStore(masterKey);
+    const { store } = await this._openStore(await this._getExistingMasterKey());
     return Object.hasOwn(store.credentials, key)
       ? store.credentials[key]
       : undefined;
@@ -171,8 +173,8 @@ export class CredentialStore {
   async set(key: string, credential: Credential): Promise<void> {
     this._validateKey(key);
     await this.getMutex().run(async () => {
-      const masterKey = await this._getOrCreateMasterKey();
-      const store = await this._readStore(masterKey);
+      await this._forgetMasterKeyIfStoreMissing();
+      const { store, masterKey } = await this._openStore(await this._getOrCreateMasterKey());
       store.credentials[key] = credential;
       await this._writeStore(store, masterKey);
     }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "set" });
@@ -182,8 +184,7 @@ export class CredentialStore {
     this._validateKey(key);
     return this.getMutex().run(async () => {
       if (!await this._storeFileExists()) return false;
-      const masterKey = await this._getExistingMasterKey();
-      const store = await this._readStore(masterKey);
+      const { store, masterKey } = await this._openStore(await this._getExistingMasterKey());
       if (!Object.hasOwn(store.credentials, key)) {
         return false;
       }
@@ -203,8 +204,7 @@ export class CredentialStore {
     for (const key of keys) this._validateKey(key);
     return this.getMutex().run(async () => {
       if (!await this._storeFileExists()) return [];
-      const masterKey = await this._getExistingMasterKey();
-      const store = await this._readStore(masterKey);
+      const { store, masterKey } = await this._openStore(await this._getExistingMasterKey());
       const removed: string[] = [];
       for (const key of keys) {
         if (Object.hasOwn(store.credentials, key)) {
@@ -220,8 +220,7 @@ export class CredentialStore {
 
   async list(): Promise<string[]> {
     if (!await this._storeFileExists()) return [];
-    const masterKey = await this._getExistingMasterKey();
-    const store = await this._readStore(masterKey);
+    const { store } = await this._openStore(await this._getExistingMasterKey());
     return Object.keys(store.credentials);
   }
 
@@ -256,23 +255,53 @@ export class CredentialStore {
     }
   }
 
+  private _loadMasterKey(): Promise<Buffer | undefined> {
+    if (this.masterKey) return this.masterKey;
+    const pending = this.keychain.getKey();
+    this.masterKey = pending;
+    pending.then(
+      (key) => { if (!key) this._forgetMasterKey(pending); },
+      () => this._forgetMasterKey(pending),
+    );
+    return pending;
+  }
+
+  private _forgetMasterKey(pending: Promise<Buffer | undefined>): void {
+    if (this.masterKey === pending) this.masterKey = undefined;
+  }
+
+  private async _forgetMasterKeyIfStoreMissing(): Promise<void> {
+    if (!await this._storeFileExists()) this.masterKey = undefined;
+  }
+
+  private async _refetchMasterKey(stale: Buffer): Promise<Buffer | undefined> {
+    const cached = this.masterKey;
+    if (cached) {
+      const current = await cached.catch(() => undefined);
+      if (current && !current.equals(stale)) return current;
+      this._forgetMasterKey(cached);
+    }
+    return this._loadMasterKey();
+  }
+
   private async _getOrCreateMasterKey(): Promise<Buffer> {
-    const existing = await this.keychain.getKey();
+    const existing = await this._loadMasterKey();
     if (existing) return existing;
     const key = randomBytes(32);
     await this.keychain.setKey(key);
+    this.masterKey = Promise.resolve(key);
     return key;
   }
 
   private async _getExistingMasterKey(): Promise<Buffer> {
-    const existing = await this.keychain.getKey();
-    if (!existing) {
-      throw new CredentialError(
-        "No master key found in keychain — cannot decrypt credential store. " +
-        "If the keychain was reset, the credential store must be recreated.",
-      );
-    }
-    return existing;
+    return (await this._loadMasterKey()) ?? this._noMasterKey();
+  }
+
+  private _noMasterKey(): never {
+    throw new CredentialError(
+      "No master key found in keychain — cannot decrypt credential store. " +
+      "If the keychain was reset, the credential store must be recreated.",
+    );
   }
 
   private _encrypt(data: Buffer, key: Buffer): Buffer {
@@ -300,29 +329,39 @@ export class CredentialStore {
       decipher.setAuthTag(authTag);
       return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     } catch (err) {
-      throw new CredentialError(
+      throw new DecryptError(
         "Failed to decrypt credential store: wrong key or corrupted data",
         { cause: err },
       );
     }
   }
 
-  private async _readStore(masterKey: Buffer): Promise<CredentialStoreFile> {
-    let raw: Buffer;
+  private async _openStore(masterKey: Buffer): Promise<{ store: CredentialStoreFile; masterKey: Buffer }> {
+    const raw = await this._readStoreFile();
+    if (!raw) return { store: { version: 1, credentials: {} }, masterKey };
     try {
-      raw = await readFile(this.filePath);
+      return { store: this._parseStore(this._decrypt(raw, masterKey)), masterKey };
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        return { version: 1, credentials: {} };
-      }
+      if (!(err instanceof DecryptError)) throw err;
+      const current = (await this._refetchMasterKey(masterKey)) ?? this._noMasterKey();
+      if (current.equals(masterKey)) throw err;
+      return { store: this._parseStore(this._decrypt(raw, current)), masterKey: current };
+    }
+  }
+
+  private async _readStoreFile(): Promise<Buffer | undefined> {
+    try {
+      return await readFile(this.filePath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw new CredentialError(
         `Failed to read credential store: ${(err as Error).message}`,
         { cause: err },
       );
     }
+  }
 
-    const decrypted = this._decrypt(raw, masterKey);
-
+  private _parseStore(decrypted: Buffer): CredentialStoreFile {
     let json: unknown;
     try {
       json = JSON.parse(decrypted.toString("utf-8"));
