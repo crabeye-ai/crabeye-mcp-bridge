@@ -202,10 +202,10 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     }
   }
 
-  async callTool(params: {
-    name: string;
-    arguments?: Record<string, unknown>;
-  }): Promise<CallToolResult> {
+  async callTool(
+    params: { name: string; arguments?: Record<string, unknown> },
+    options?: { signal?: AbortSignal },
+  ): Promise<CallToolResult> {
     if (!this._client || this._status !== "connected") {
       throw new Error(
         `Cannot call tool "${params.name}": client "${this.name}" is not connected`,
@@ -213,7 +213,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     }
     const client = this._client;
     try {
-      return (await client.callTool(params)) as CallToolResult;
+      return (await client.callTool(params, options)) as CallToolResult;
     } catch (err) {
       this._pauseIfAuthFailure(client, err);
       throw err;

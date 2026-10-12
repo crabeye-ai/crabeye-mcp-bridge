@@ -154,7 +154,7 @@ describe.each(["legacy", "modern"] as const)(
       expect(upstream.callTool).toHaveBeenCalledWith({
         name: "create_issue",
         arguments: { title: "Bug" },
-      });
+      }, { signal: expect.any(AbortSignal) });
 
       await cleanup();
     });

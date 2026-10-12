@@ -96,6 +96,7 @@ export class UpstreamManager {
   private _healthTracking = new WeakMap<ClientGroup, HealthTracking>();
   private _pingsInFlight = new WeakSet<ClientGroup>();
   private _pingTimeoutMs = 5000;
+  private _clientsChangedListeners = new Set<() => void>();
   private _unhealthyThreshold = 3;
 
   constructor(options: UpstreamManagerOptions) {
@@ -206,6 +207,7 @@ export class UpstreamManager {
         if (existing !== undefined) {
           existing.aliasNames.add(name);
           this._nameToGroup.set(name, existing);
+          this._notifyClientsChanged();
           this._applyCategory(name, serverConfig);
           const aliasOf = [...existing.aliasNames].filter((n) => n !== name).join(", ");
           this._logger.warn(
@@ -243,6 +245,7 @@ export class UpstreamManager {
         this._stdioHashIndex.set(hash, group);
         this._applyCategory(name, serverConfig);
         this._wireSubscriptions(group, log);
+        this._notifyClientsChanged();
       } finally {
         release();
         if (this._hashLocks.get(hash) === lock) {
@@ -273,6 +276,7 @@ export class UpstreamManager {
     this._nameToGroup.set(name, group);
     this._applyCategory(name, serverConfig);
     this._wireSubscriptions(group, log);
+    this._notifyClientsChanged();
     return this._connectGroup(group, name, log);
   }
 
@@ -397,6 +401,7 @@ export class UpstreamManager {
     for (const name of diff.servers.removed) {
       this._logger.info(`removing server`, { component: "reload", server: name });
       await this._removeClient(name);
+      this._notifyClientsChanged();
     }
 
     // 2. Reconnect servers with changed connection fields
@@ -404,6 +409,7 @@ export class UpstreamManager {
       this._logger.info(`reconnecting server`, { component: "reload", server: name });
       await this._removeClient(name);
       const result = await this._addClient(name, config);
+      if (!this._nameToGroup.has(name)) this._notifyClientsChanged();
       if (result.error) {
         this._logger.warn(`server failed to connect after reload`, {
           component: "reload", server: name, error: result.error,
@@ -440,6 +446,16 @@ export class UpstreamManager {
     this.stopHealthChecks();
     this._healthCheckInterval = interval;
     this.startHealthChecks();
+  }
+
+  /** Fires when a reload removes a server or a client is registered under a name; returns an unsubscribe. */
+  onClientsChanged(listener: () => void): () => void {
+    this._clientsChangedListeners.add(listener);
+    return () => this._clientsChangedListeners.delete(listener);
+  }
+
+  private _notifyClientsChanged(): void {
+    for (const listener of [...this._clientsChangedListeners]) listener();
   }
 
   getClient(name: string): UpstreamClient | undefined {

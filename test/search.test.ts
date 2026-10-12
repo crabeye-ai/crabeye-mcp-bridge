@@ -848,7 +848,7 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Bug" },
-    });
+    }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
   });
@@ -1000,7 +1000,7 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Bug" },
-    });
+    }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
   });
@@ -1024,7 +1024,7 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Test" },
-    });
+    }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
   });
@@ -1097,7 +1097,7 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Bug" },
-    });
+    }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
   });
@@ -1116,7 +1116,7 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "list_issues",
       arguments: undefined,
-    });
+    }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
   });

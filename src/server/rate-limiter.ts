@@ -31,6 +31,17 @@ export interface RateLimiterOptions {
 
 const DEFAULT_QUEUE_MULTIPLIER = 10;
 
+function waitCancelledError(): Error {
+  return new Error("Rate limit wait cancelled");
+}
+
+export class RateLimiterDisposedError extends Error {
+  constructor() {
+    super("Rate limiter disposed");
+    this.name = "RateLimiterDisposedError";
+  }
+}
+
 export class RateLimiter {
   private maxCalls: number;
   private windowMs: number;
@@ -50,7 +61,8 @@ export class RateLimiter {
     this.onFirstBlock = opts.onFirstBlock;
   }
 
-  async acquire(): Promise<void> {
+  async acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw waitCancelledError();
     this.prune();
 
     if (this.timestamps.length < this.maxCalls) {
@@ -75,15 +87,35 @@ export class RateLimiter {
     }
 
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const idx = this.queue.findIndex((w) => w.resolve === resolve);
-        if (idx !== -1) this.queue.splice(idx, 1);
-        reject(new Error("Rate limit timeout: too many calls queued"));
-      }, this.timeoutMs);
-
-      this.queue.push({ resolve, reject, timer });
+      const onAbort = () => {
+        this.dequeue(waiter);
+        waiter.reject(waitCancelledError());
+      };
+      const waiter: Waiter = {
+        resolve: () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        reject: (err) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+        timer: setTimeout(() => {
+          this.dequeue(waiter);
+          waiter.reject(new Error("Rate limit timeout: too many calls queued"));
+        }, this.timeoutMs),
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.queue.push(waiter);
       this.scheduleDrain();
     });
+  }
+
+  private dequeue(waiter: Waiter): void {
+    clearTimeout(waiter.timer);
+    const idx = this.queue.indexOf(waiter);
+    if (idx !== -1) this.queue.splice(idx, 1);
+    this.scheduleDrain();
   }
 
   reconfigure(config: RateLimitConfig): void {
@@ -125,7 +157,7 @@ export class RateLimiter {
     for (const waiter of this.queue) {
       clearTimeout(waiter.timer);
       if (resolveQueued) waiter.resolve();
-      else waiter.reject(new Error("Rate limiter disposed"));
+      else waiter.reject(new RateLimiterDisposedError());
     }
     this.queue = [];
     this.timestamps = [];

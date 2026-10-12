@@ -16,6 +16,7 @@ import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
 import { ApprovalFlow } from "./policy-approval.js";
 import { ClientMetadata } from "./client-metadata.js";
+import { awaitConnectedClient, cancelledError, reauthorizationError, removedError } from "./upstream-wait.js";
 import type { UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
@@ -25,14 +26,12 @@ import {
   runToolDefinition,
 } from "../search/index.js";
 import type { SearchToolsParams } from "../search/index.js";
-import type { PolicyEngine } from "../policy/index.js";
+import type { PolicyDecision, PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
 import type { SessionStatsSnapshot } from "./session-stats.js";
-import type { RateLimiter } from "./rate-limiter.js";
+import { RateLimiterDisposedError, type RateLimiter } from "./rate-limiter.js";
 import type { Logger } from "../logging/index.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
-
-const WAIT_FOR_RESPAWN_MS = 60_000;
 
 const BASE_INSTRUCTIONS = [
   "This MCP bridge connects you to many external tools and services.",
@@ -64,6 +63,7 @@ export interface BridgeServerOptions {
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
   getRateLimiter?: (name: string) => RateLimiter | undefined;
+  onClientsChanged?: (listener: () => void) => () => void;
   logger?: Logger;
   showStats?: boolean;
   onSearchStats?: (stats: SessionStatsSnapshot) => void;
@@ -103,16 +103,12 @@ function observeStart(transport: Transport): {
   };
 }
 
-function reauthorizationError(source: string, serverName: string): ProtocolError {
-  return new ProtocolError(
-    ProtocolErrorCode.InternalError,
-    `Upstream server "${source}" needs re-authorization. Run: ${APP_NAME} auth ${serverName} ` +
-      "(or update its configured credentials if it does not use OAuth).",
-  );
-}
-
 function errorResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }], isError: true };
+}
+
+function throwIfDenied(decision: PolicyDecision | undefined): void {
+  if (decision?.kind === "deny") throw new ProtocolError(ProtocolErrorCode.InvalidRequest, decision.reason);
 }
 
 export class BridgeServer {
@@ -276,22 +272,18 @@ export class BridgeServer {
       );
     }
 
-    if (this.policyEngine) {
-      const toolKey = `${parsed.source}__${parsed.toolName}`;
-      const decision = this.policyEngine.evaluate(parsed.source, parsed.toolName, args);
-      if (decision.kind === "deny") {
-        throw new ProtocolError(ProtocolErrorCode.InvalidRequest, decision.reason);
+    const toolKey = `${parsed.source}__${parsed.toolName}`;
+    const decision = this.policyEngine?.evaluate(parsed.source, parsed.toolName, args);
+    throwIfDenied(decision);
+    if (decision?.kind === "prompt") {
+      if (!connection.client.supportsFormElicitation(ctx)) {
+        throw new ProtocolError(
+          ProtocolErrorCode.InvalidRequest,
+          `Tool ${toolKey} requires confirmation but the client does not support elicitation`,
+        );
       }
-      if (decision.kind === "prompt") {
-        if (!connection.client.supportsFormElicitation(ctx)) {
-          throw new ProtocolError(
-            ProtocolErrorCode.InvalidRequest,
-            `Tool ${toolKey} requires confirmation but the client does not support elicitation`,
-          );
-        }
-        const outcome = await this.approval.resolve(toolKey, args, decision.request, ctx);
-        if (outcome !== "approved") return outcome;
-      }
+      const outcome = await this.approval.resolve(toolKey, args, decision.request, ctx);
+      if (outcome !== "approved") return outcome;
     }
 
     const getClient = this.options.getUpstreamClient;
@@ -302,34 +294,40 @@ export class BridgeServer {
       );
     }
 
-    const client = getClient(parsed.source);
-    if (!client) {
+    if (!getClient(parsed.source)) {
       throw new ProtocolError(
         ProtocolErrorCode.InternalError,
         `Upstream server not found: ${parsed.source}`,
       );
     }
 
-    if (client.status !== "connected") {
-      await this.awaitUpstream(client, parsed.source);
-    }
+    const signal = ctx.mcpReq.signal;
+    const waitOptions = {
+      getClient,
+      onClientsChanged: this.options.onClientsChanged,
+      signal,
+      logger: this.options.logger,
+    };
+    await awaitConnectedClient(parsed.source, waitOptions);
 
     const rateLimiter = this.options.getRateLimiter?.(parsed.source);
     if (rateLimiter) {
       try {
-        await rateLimiter.acquire();
+        await rateLimiter.acquire(signal);
       } catch (err) {
+        if (signal.aborted) throw cancelledError();
+        if (err instanceof RateLimiterDisposedError) throw removedError(parsed.source);
         const message = err instanceof Error ? err.message : String(err);
         throw new ProtocolError(ProtocolErrorCode.InternalError, message);
       }
     }
 
+    const client = await awaitConnectedClient(parsed.source, waitOptions);
+    this.refuseIfPolicyTightened(parsed.source, parsed.toolName, args, decision);
     try {
-      return await client.callTool({
-        name: parsed.toolName,
-        arguments: args,
-      });
+      return await client.callTool({ name: parsed.toolName, arguments: args }, { signal });
     } catch (err) {
+      if (signal.aborted) throw cancelledError();
       if (client.status === "auth_required") throw reauthorizationError(parsed.source, client.name);
       const message = err instanceof Error ? err.message : String(err);
       throw new ProtocolError(
@@ -339,58 +337,20 @@ export class BridgeServer {
     }
   }
 
-  private async awaitUpstream(client: UpstreamClient, source: string): Promise<void> {
-    this.options.logger?.info("waiting for server to reconnect", {
-      component: "bridge",
-      server: source,
-    });
-    void client.retryNow();
-
-    if (await this.waitForReconnect(client)) {
-      this.options.logger?.info("server reconnected, executing tool call", {
-        component: "bridge",
-        server: source,
-      });
-      return;
+  private refuseIfPolicyTightened(
+    source: string,
+    toolName: string,
+    args: Record<string, unknown> | undefined,
+    decisionBeforeWait: PolicyDecision | undefined,
+  ): void {
+    const decision = this.policyEngine?.evaluate(source, toolName, args);
+    throwIfDenied(decision);
+    if (decision?.kind === "prompt" && decisionBeforeWait?.kind !== "prompt") {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidRequest,
+        `Tool ${source}__${toolName} now requires confirmation after a configuration change; please retry`,
+      );
     }
-    if (client.status === "auth_required") {
-      throw reauthorizationError(source, client.name);
-    }
-    throw new ProtocolError(
-      ProtocolErrorCode.InternalError,
-      `Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`,
-    );
-  }
-
-  private waitForReconnect(client: UpstreamClient): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
-      // Edge case: status changed between the check and subscribing
-      if (client.status === "connected") {
-        resolve(true);
-        return;
-      }
-      if (client.status === "auth_required") {
-        resolve(false);
-        return;
-      }
-
-      const timeout = setTimeout(() => {
-        unsubscribe();
-        resolve(false);
-      }, WAIT_FOR_RESPAWN_MS);
-
-      const unsubscribe = client.onStatusChange((event) => {
-        if (event.current === "connected") {
-          clearTimeout(timeout);
-          unsubscribe();
-          resolve(true);
-        } else if (event.current === "auth_required") {
-          clearTimeout(timeout);
-          unsubscribe();
-          resolve(false);
-        }
-      });
-    });
   }
 
   async connect(transport: Transport): Promise<void> {

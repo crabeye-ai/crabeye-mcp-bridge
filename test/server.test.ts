@@ -5,70 +5,13 @@ import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 import { APP_VERSION } from "../src/constants.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
-import type { BridgeServerOptions } from "../src/server/bridge-server.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
+import { createTestPair, makeMockUpstreamClient, makeTool } from "./_helpers/bridge-test-pair.js";
 import {
   NAMESPACE_SEPARATOR,
   namespaceTool,
   parseNamespacedName,
 } from "../src/server/tool-namespacing.js";
-
-function makeTool(name: string, description?: string): Tool {
-  return {
-    name,
-    description: description ?? `Tool ${name}`,
-    inputSchema: { type: "object" as const },
-  };
-}
-
-async function createTestPair(options?: {
-  registry?: ToolRegistry;
-  getUpstreamClient?: BridgeServerOptions["getUpstreamClient"];
-}) {
-  const toolRegistry = options?.registry ?? new ToolRegistry();
-  const server = new BridgeServer({
-    toolRegistry,
-    getUpstreamClient: options?.getUpstreamClient,
-  });
-
-  const client = new Client({ name: "test-client", version: "1.0.0" });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-  await server.connect(serverTransport);
-  await client.connect(clientTransport);
-
-  return {
-    server,
-    client,
-    toolRegistry,
-    async cleanup() {
-      await client.close();
-      await server.close();
-    },
-  };
-}
-
-function makeMockUpstreamClient(
-  name: string,
-  overrides?: Partial<UpstreamClient>,
-): UpstreamClient {
-  return {
-    name,
-    status: "connected",
-    tools: [],
-    connect: vi.fn().mockResolvedValue(undefined),
-    callTool: vi.fn().mockResolvedValue({
-      content: [{ type: "text", text: `called on ${name}` }],
-    }),
-    close: vi.fn().mockResolvedValue(undefined),
-    ping: vi.fn().mockResolvedValue(undefined),
-    reconnect: vi.fn().mockResolvedValue(undefined),
-    retryNow: vi.fn().mockResolvedValue(undefined),
-    onStatusChange: vi.fn().mockReturnValue(() => {}),
-    onToolsChanged: vi.fn().mockReturnValue(() => {}),
-    ...overrides,
-  };
-}
 
 // --- ToolRegistry ---
 
@@ -315,7 +258,7 @@ describe("tools/call", () => {
     expect(mockClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Bug" },
-    });
+    }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
   });
@@ -348,7 +291,7 @@ describe("tools/call", () => {
     });
 
     expect(result.content).toEqual([{ type: "text", text: "github issue" }]);
-    expect(githubClient.callTool).toHaveBeenCalledWith({ name: "create_issue", arguments: {} });
+    expect(githubClient.callTool).toHaveBeenCalledWith({ name: "create_issue", arguments: {} }, { signal: expect.any(AbortSignal) });
     expect(linearClient.callTool).not.toHaveBeenCalled();
 
     await cleanup();
@@ -443,7 +386,7 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("returns the 'reconnecting' error after waiting 60s for an upstream that stays down", async () => {
+  it("returns the 'reconnecting' error after waiting 30s for an upstream that stays down", async () => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
     let retryRequested: () => void = () => {};
@@ -468,9 +411,9 @@ describe("tools/call", () => {
       );
       await retried;
 
-      await vi.advanceTimersByTimeAsync(59_999);
+      await vi.advanceTimersByTimeAsync(29_990);
       expect(settled).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(10);
       await assertion;
       expect(mockClient.callTool).not.toHaveBeenCalled();
     } finally {

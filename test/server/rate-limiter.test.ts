@@ -188,6 +188,62 @@ describe("RateLimiter", () => {
     });
   });
 
+  describe("cancellation", () => {
+    it("rejects at once when the signal is already aborted", async () => {
+      const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
+
+      await expect(rl.acquire(AbortSignal.abort())).rejects.toThrow("Rate limit wait cancelled");
+      await rl.acquire();
+
+      rl.dispose();
+    });
+
+    it("drops a queued waiter on abort, leaving no timers and serving the next waiter", async () => {
+      const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 1 });
+      await rl.acquire();
+      const controller = new AbortController();
+      const cancelled = rl.acquire(controller.signal);
+      const next = rl.acquire();
+
+      controller.abort();
+      await expect(cancelled).rejects.toThrow("Rate limit wait cancelled");
+      await vi.advanceTimersByTimeAsync(1_000);
+      await next;
+
+      expect(vi.getTimerCount()).toBe(0);
+      rl.dispose();
+    });
+
+    it("clears its timers when the only queued waiter is cancelled", async () => {
+      const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
+      await rl.acquire();
+      const controller = new AbortController();
+      const cancelled = rl.acquire(controller.signal);
+
+      controller.abort();
+
+      await expect(cancelled).rejects.toThrow("Rate limit wait cancelled");
+      expect(vi.getTimerCount()).toBe(0);
+      rl.dispose();
+    });
+
+    it("ignores an abort after the waiter was served", async () => {
+      const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 1 });
+      await rl.acquire();
+      const controller = new AbortController();
+      const served = rl.acquire(controller.signal);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await served;
+      const queued = rl.acquire();
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(queued).resolves.toBeUndefined();
+      rl.dispose();
+    });
+  });
+
   describe("drainAndDispose", () => {
     it("resolves queued waiters in FIFO order, never rejects them", async () => {
       const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });

@@ -29,10 +29,10 @@ export interface UpstreamClient {
   readonly instructions?: string;
 
   connect(): Promise<void>;
-  callTool(params: {
-    name: string;
-    arguments?: Record<string, unknown>;
-  }): Promise<CallToolResult>;
+  callTool(
+    params: { name: string; arguments?: Record<string, unknown> },
+    options?: { signal?: AbortSignal },
+  ): Promise<CallToolResult>;
   close(): Promise<void>;
 
   ping(timeoutMs?: number): Promise<void>;

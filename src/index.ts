@@ -195,6 +195,7 @@ program
         logger,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
         getRateLimiter: (name) => rateLimiters.get(name),
+        onClientsChanged: (listener) => upstreamManager!.onClientsChanged(listener),
         showStats: options.stats === true,
         onSearchStats: (stats) => {
           logger.info(
