@@ -30,14 +30,32 @@ function formatTime(): string {
   return `${pad(d.getHours(), 2)}:${pad(d.getMinutes(), 2)}:${pad(d.getSeconds(), 2)}.${pad(d.getMilliseconds(), 3)}`;
 }
 
+const CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+const NAMED_ESCAPES: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
+
+function hexEscape(code: number): string {
+  return code > 0xff
+    ? `\\u${code.toString(16).padStart(4, "0")}`
+    : `\\x${code.toString(16).padStart(2, "0")}`;
+}
+
+function escapeControlCharacters(text: string): string {
+  return text.replace(CONTROL_CHARACTERS, (char) => NAMED_ESCAPES[char] ?? hexEscape(char.charCodeAt(0)));
+}
+
+function renderValue(value: unknown): string {
+  const text = typeof value === "object" && value !== null ? String(JSON.stringify(value)) : String(value);
+  return escapeControlCharacters(text);
+}
+
 function formatText(
   level: LogLevel,
   message: string,
   context: Record<string, unknown>,
 ): string {
   const tag = level.toUpperCase().padEnd(5);
-  const component = context.component as string | undefined;
-  const server = context.server as string | undefined;
+  const component = context.component ? escapeControlCharacters(String(context.component)) : undefined;
+  const server = context.server ? escapeControlCharacters(String(context.server)) : undefined;
   let prefix = "";
   if (component && server) {
     prefix = `[${component}:${server}] `;
@@ -55,11 +73,10 @@ function formatText(
     }
   }
   const suffix = Object.keys(extra).length > 0
-    ? " " + Object.entries(extra).map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}`).join(" ")
+    ? " " + Object.entries(extra).map(([k, v]) => `${k}=${renderValue(v)}`).join(" ")
     : "";
 
-  const safeMessage = message.replace(/\n/g, "\\n");
-  return `${formatTime()} ${tag} ${prefix}${safeMessage}${suffix}\n`;
+  return `${formatTime()} ${tag} ${prefix}${escapeControlCharacters(message)}${suffix}\n`;
 }
 
 function formatJson(

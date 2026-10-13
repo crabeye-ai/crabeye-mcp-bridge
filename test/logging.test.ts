@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createLogger, createNoopLogger } from "../src/logging/index.js";
 
+const HOSTILE = "a\r\n\t\x00\x1b[31m\x7f\x80\x9b\x9f\u2028\u2029z";
+
 describe("Logger", () => {
   let stderrSpy: ReturnType<typeof vi.spyOn>;
   let stdoutSpy: ReturnType<typeof vi.spyOn>;
@@ -138,7 +140,123 @@ describe("Logger", () => {
     });
   });
 
+  describe("text format control characters", () => {
+    const RAW_CONTROL_CHARACTER = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+    const CASES: Array<[string, string]> = [
+      ["\\r", "\r"],
+      ["\\n", "\n"],
+      ["\\t", "\t"],
+      ["\\x00", "\x00"],
+      ["\\x1b", "\x1b"],
+      ["\\x1f", "\x1f"],
+      ["\\x7f", "\x7f"],
+      ["\\x80", "\x80"],
+      ["\\x9b", "\x9b"],
+      ["\\x9f", "\x9f"],
+      ["\\u2028", "\u2028"],
+      ["\\u2029", "\u2029"],
+    ];
+
+    function textLine(message: string, context?: Record<string, unknown>): string {
+      createLogger({ level: "info", format: "text" }).info(message, context);
+      return stderrSpy.mock.calls.at(-1)![0] as string;
+    }
+
+    function withoutTrailingNewline(line: string): string {
+      expect(line.endsWith("\n")).toBe(true);
+      return line.slice(0, -1);
+    }
+
+    it.each(CASES)("escapes %s the same way in the message, the server prefix and a context value", (escaped, raw) => {
+      const line = withoutTrailingNewline(textLine(`m${raw}m`, { component: "c", server: `s${raw}s`, detail: `v${raw}v` }));
+
+      expect(line).toContain(`[c:s${escaped}s] m${escaped}m detail=v${escaped}v`);
+      expect(line).not.toMatch(RAW_CONTROL_CHARACTER);
+    });
+
+    it("keeps a value with a newline and a fake log prefix on one line", () => {
+      const line = withoutTrailingNewline(textLine("client connected", { clientName: "x\n12:00:00.000 ERROR [bridge] forged" }));
+
+      expect(line).toContain("clientName=x\\n12:00:00.000 ERROR [bridge] forged");
+      expect(line).not.toContain("\n");
+    });
+
+    it("shows a terminal colour sequence as text instead of sending it", () => {
+      const line = withoutTrailingNewline(textLine("event", { clientName: "\x1b[31mred" }));
+
+      expect(line).toContain("clientName=\\x1b[31mred");
+      expect(line).not.toContain("\x1b");
+    });
+
+    it("escapes the component prefix", () => {
+      const line = withoutTrailingNewline(textLine("event", { component: "c\x1b" }));
+
+      expect(line).toContain("[c\\x1b] event");
+    });
+
+    it("escapes DEL, C1 and line separators inside object values without escaping twice", () => {
+      const line = withoutTrailingNewline(textLine("event", { data: { text: "a\x1b\x7f\x9b\u2028b" } }));
+
+      expect(line).toContain('data={"text":"a\\u001b\\x7f\\x9b\\u2028b"}');
+      expect(line).not.toMatch(RAW_CONTROL_CHARACTER);
+    });
+
+    it("never writes a control character other than the final newline, whatever the input", () => {
+      const line = withoutTrailingNewline(textLine(HOSTILE, { component: HOSTILE, server: HOSTILE, text: HOSTILE, data: { nested: HOSTILE }, list: [HOSTILE] }));
+
+      expect(line).not.toMatch(RAW_CONTROL_CHARACTER);
+    });
+
+    it.each([
+      ["space", " "],
+      ["tilde", "~"],
+      ["no-break space", "\xa0"],
+      ["accented letters", "José Müller"],
+      ["emoji", "🦀"],
+      ["CJK", "日本語"],
+      ["bidi overrides", "\u202a\u202e\u2066\u2069"],
+      ["the characters next to the line separators", "\u2027\u202a"],
+      ["a Windows path", "C:\\Users\\x\\new"],
+    ])("leaves %s unchanged", (_label, text) => {
+      const line = withoutTrailingNewline(textLine(`m${text}m`, { component: "c", server: `s${text}s`, detail: `v${text}v` }));
+
+      expect(line).toContain(`[c:s${text}s] m${text}m detail=v${text}v`);
+    });
+
+    it("renders an object whose JSON form is undefined as undefined, without throwing", () => {
+      const line = withoutTrailingNewline(textLine("event", { data: { toJSON: () => undefined } }));
+
+      expect(line).toMatch(/ event data=undefined$/);
+    });
+
+    it("leaves numbers, booleans and null unchanged", () => {
+      const line = withoutTrailingNewline(textLine("event", { retries: 3, ok: true, value: null }));
+
+      expect(line).toMatch(/ event retries=3 ok=true value=null$/);
+    });
+
+    it("renders an empty message and an empty value", () => {
+      const line = withoutTrailingNewline(textLine("", { component: "c", empty: "" }));
+
+      expect(line).toMatch(/\[c\]  empty=$/);
+    });
+  });
+
   describe("JSON format", () => {
+    it("writes hostile input exactly as JSON.stringify does", () => {
+      vi.useFakeTimers({ now: new Date("2026-01-02T03:04:05.006Z") });
+      try {
+        const context = { component: HOSTILE, server: HOSTILE, text: HOSTILE, data: { nested: HOSTILE } };
+        createLogger({ level: "info", format: "json" }).info(HOSTILE, context);
+
+        expect(stderrSpy.mock.calls[0][0]).toBe(
+          JSON.stringify({ ...context, time: "2026-01-02T03:04:05.006Z", level: "info", msg: HOSTILE }) + "\n",
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("outputs parseable JSON with correct fields", () => {
       const logger = createLogger({ level: "info", format: "json" });
       logger.info("connected", { component: "upstream", server: "linear" });
