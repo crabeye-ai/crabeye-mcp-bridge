@@ -29,7 +29,9 @@ import {
   OAuthError,
 } from "../oauth/index.js";
 import { BridgeOAuthClientProvider } from "../oauth/sdk-provider.js";
+import { assertCallbackIssuerWithoutMetadata } from "../oauth/issuer-binding.js";
 import { APP_NAME } from "../constants.js";
+import { escapeControlCharacters } from "../logging/index.js";
 
 const USAGE = `Usage:
   ${APP_NAME} auth <server>            run OAuth flow for a server
@@ -499,6 +501,8 @@ export async function runAuthLogin(
       return 1;
     }
 
+    assertCallbackIssuerWithoutMetadata(provider.discoveryState(), callback.iss);
+
     const result = await authFn(provider, {
       serverUrl: upstream.server.url,
       authorizationCode: callback.code,
@@ -553,10 +557,11 @@ function formatErr(err: unknown): string {
   }
   if (err instanceof CredentialError || err instanceof OAuthError) return err.message;
   if (err instanceof IssuerMismatchError) {
-    const expected = err.expected ?? "(none recorded)";
-    return err.kind === "authorization_response"
-      ? `Authorization response came from a different issuer than expected (${expected}) — possible authorization-server mix-up; aborting.`
-      : `Authorization server metadata issuer does not match ${expected} — aborting.`;
+    const expected = escapeControlCharacters(err.expected ?? "(none recorded)");
+    if (err.kind === "metadata") return `Authorization server metadata issuer does not match ${expected} — aborting.`;
+    return err.received === undefined
+      ? `Authorization response did not include the issuer identifier that ${expected} requires — possible authorization-server mix-up; aborting.`
+      : `Authorization response came from a different issuer than expected (${expected}) — possible authorization-server mix-up; aborting.`;
   }
   if (err instanceof Error) {
     const code = (err as { code?: unknown }).code;

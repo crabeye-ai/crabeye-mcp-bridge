@@ -50,6 +50,11 @@ describe("BridgeOAuthClientProvider", () => {
     expect(provider.clientMetadata.token_endpoint_auth_method).toBe("none");
   });
 
+  it("clientMetadata declares application_type=native", () => {
+    const provider = new BridgeOAuthClientProvider({ serverName: "srv", store, redirectUrl: REDIRECT });
+    expect(provider.clientMetadata.application_type).toBe("native");
+  });
+
   it("clientInformation returns config-supplied client when set", async () => {
     const provider = new BridgeOAuthClientProvider({
       serverName: "srv",

@@ -5,7 +5,7 @@ import { clientInfoKey, oauthCredentialKey } from "../../src/oauth/client-secret
 import type { HttpServerConfig } from "../../src/config/schema.js";
 import type { ConnectionStatus } from "../../src/upstream/types.js";
 import { makeTestStore, type TestStoreHandle } from "../_helpers/credential-store.js";
-import { startProtectedUpstream, type ProtectedUpstream, type TokenEndpoint } from "../_helpers/protected-upstream.js";
+import { startProtectedUpstream, type ProtectedUpstream, type RefreshOutcome, type TokenEndpoint } from "../_helpers/protected-upstream.js";
 
 describe("HTTP upstream authorization pause (real OAuth provider)", () => {
   let storeHandle: TestStoreHandle;
@@ -124,7 +124,7 @@ describe("HTTP upstream authorization pause (real OAuth provider)", () => {
   });
 
   it("pauses when the upstream demands a wider scope than the stored token has", async () => {
-    upstream = await startProtectedUpstream("invalid_grant", "insufficient_scope");
+    upstream = await startProtectedUpstream("invalid_grant", { guard: "insufficient_scope" });
     await storeHandle.store.set(oauthCredentialKey("protected"), {
       type: "oauth2",
       access_token: "valid",
@@ -140,7 +140,7 @@ describe("HTTP upstream authorization pause (real OAuth provider)", () => {
     expect(upstream.mcpRequests()).toBe(requests);
   });
 
-  it.each<[string, TokenEndpoint, ConnectionStatus]>([
+  it.each<[string, RefreshOutcome, ConnectionStatus]>([
     ["is rate-limited", "rate_limited_json", "connected"],
     ["is rejected with invalid_grant", "invalid_grant", "auth_required"],
   ])("a connected upstream whose token expires and whose refresh %s ends up %s", async (_label, refreshOutcome, expected) => {

@@ -1,4 +1,4 @@
-import type { StoredOAuthClientInformation } from "@modelcontextprotocol/client";
+import { IssuerMismatchError, type OAuthDiscoveryState, type StoredOAuthClientInformation } from "@modelcontextprotocol/client";
 import type { Credential } from "../credentials/types.js";
 
 export function parseStoredClientInfo(
@@ -28,4 +28,14 @@ export function issuersMatch(a: string, b: string): boolean {
   if (a.endsWith("/") && a.slice(0, -1) === b) return true;
   if (b.endsWith("/") && b.slice(0, -1) === a) return true;
   return false;
+}
+
+export function assertCallbackIssuerWithoutMetadata(
+  discovery: OAuthDiscoveryState | undefined,
+  iss: string | undefined,
+): void {
+  if (iss === undefined || !discovery || discovery.authorizationServerMetadata) return;
+  if (!issuersMatch(discovery.authorizationServerUrl, iss)) {
+    throw new IssuerMismatchError("authorization_response", discovery.authorizationServerUrl, iss);
+  }
 }

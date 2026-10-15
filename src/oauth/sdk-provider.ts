@@ -150,6 +150,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   get clientMetadata(): OAuthClientMetadata {
     const meta: OAuthClientMetadata = {
       redirect_uris: [String(this._opts.redirectUrl)],
+      application_type: "native",
       client_name: APP_NAME,
       client_uri: "https://github.com/crabeye-ai/crabeye-mcp-bridge",
       software_id: APP_NAME,

@@ -39,7 +39,7 @@ function hexEscape(code: number): string {
     : `\\x${code.toString(16).padStart(2, "0")}`;
 }
 
-function escapeControlCharacters(text: string): string {
+export function escapeControlCharacters(text: string): string {
   return text.replace(CONTROL_CHARACTERS, (char) => NAMED_ESCAPES[char] ?? hexEscape(char.charCodeAt(0)));
 }
 
