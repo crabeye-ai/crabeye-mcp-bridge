@@ -3,6 +3,7 @@ import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:c
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
+import { daemonPidsRunning, exited, waitUntil } from "../_helpers/processes.js";
 import { isServing, netTransport } from "../../src/daemon/net-transport.js";
 import { ManagerDaemon } from "../../src/daemon/manager.js";
 import { DaemonLivenessSupervisor } from "../../src/daemon/liveness-supervisor.js";
@@ -25,6 +26,13 @@ rl.on("line", (line) => {
 });
 `;
 
+const INITIALIZE = `${JSON.stringify({
+  jsonrpc: "2.0",
+  id: 0,
+  method: "initialize",
+  params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test-client", version: "0" } },
+})}\n`;
+
 function firstLine(child: ChildProcessWithoutNullStreams): Promise<string> {
   return new Promise((resolve) => {
     let out = "";
@@ -34,14 +42,6 @@ function firstLine(child: ChildProcessWithoutNullStreams): Promise<string> {
     });
     child.once("exit", () => resolve(out.trim()));
   });
-}
-
-function exited(child: ChildProcessWithoutNullStreams, withinMs: number): Promise<number | null | "running"> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(child.exitCode);
-  return Promise.race([
-    new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code))),
-    new Promise<"running">((resolve) => setTimeout(() => resolve("running"), withinMs)),
-  ]);
 }
 
 function stderrMentions(child: ChildProcessWithoutNullStreams, text: string): Promise<void> {
@@ -61,22 +61,10 @@ function childCommands(parentPid: number): string[] {
     .map((line) => line.trim().split(/\s+/).slice(1).join(" "));
 }
 
-async function waitUntil(condition: () => boolean, withinMs: number): Promise<void> {
-  const deadline = Date.now() + withinMs;
-  while (!condition() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-}
-
 async function deadPid(): Promise<number> {
   const child = spawn(process.execPath, ["-e", ""]);
   await new Promise((r) => child.once("exit", r));
   return child.pid!;
-}
-
-function daemonPidsRunning(script: string): number[] {
-  return execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" })
-    .split("\n")
-    .filter((line) => line.includes(script) && line.includes("daemon --internal-launch"))
-    .map((line) => Number(line.trim().split(/\s+/)[0]));
 }
 
 describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () => {
@@ -113,6 +101,12 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
     const child = spawn(process.execPath, args, { stdio: "pipe", env: env ?? process.env });
     children.push(child);
     return child;
+  }
+
+  function startBridge(configPath: string, env: NodeJS.ProcessEnv): ChildProcessWithoutNullStreams {
+    const bridge = start([cliScript, "--config", configPath], env);
+    bridge.stdin.write(INITIALIZE);
+    return bridge;
   }
 
   it.each([1, 2, 3])("processes stealing a dead daemon's lock: exactly one holds it (run %i)", async () => {
@@ -226,7 +220,7 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
     await writeFile(configPath, JSON.stringify({ mcpServers: servers }));
     const env = { ...process.env, HOME: dir };
 
-    const bridges = Array.from({ length: 4 }, () => start([cliScript, "--config", configPath], env));
+    const bridges = Array.from({ length: 4 }, () => startBridge(configPath, env));
     await Promise.all(bridges.map((b) => stderrMentions(b, "ready —")));
     await waitUntil(() => daemonPidsRunning(cliScript).length <= 1, 10_000);
 
@@ -248,7 +242,7 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
     await writeFile(stub, STUB_SERVER);
     const configPath = join(dir, "client.json");
     await writeFile(configPath, JSON.stringify({ mcpServers: { alpha: { command: process.execPath, args: [stub] } } }));
-    const bridge = start([cliScript, "--config", configPath], { ...process.env, HOME: dir });
+    const bridge = startBridge(configPath, { ...process.env, HOME: dir });
     let stderr = "";
     bridge.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
@@ -273,7 +267,7 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
     dir = await mkdtemp("/tmp/cbe-cli-");
     const configPath = join(dir, "client.json");
     await writeFile(configPath, JSON.stringify({ mcpServers: {} }));
-    const bridge = start([cliScript, "--config", configPath], { ...process.env, HOME: dir });
+    const bridge = startBridge(configPath, { ...process.env, HOME: dir });
     await stderrMentions(bridge, "ready —");
 
     bridge.stdin.end();

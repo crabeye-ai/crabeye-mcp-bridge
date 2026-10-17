@@ -1,6 +1,6 @@
 # How it works
 
-On startup the bridge launches every configured upstream server, connects to it, and discovers its tools. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
+When the AI assistant starts its session, the bridge launches every configured upstream server, connects to it, and discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
 
 Two meta-tools are exposed to the AI assistant:
 

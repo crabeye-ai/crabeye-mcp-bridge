@@ -40,6 +40,20 @@ function unavailableError(source: string): ProtocolError {
   );
 }
 
+export async function untilSettledOrCancelled(work: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw cancelledError();
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(cancelledError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function awaitConnectedClient(source: string, options: UpstreamWaitOptions): Promise<UpstreamClient> {
   const deadline = Date.now() + WAIT_FOR_RESPAWN_MS;
   let waiting = false;

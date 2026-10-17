@@ -85,6 +85,7 @@ export class UpstreamManager {
    * spawning a duplicate session.
    */
   private _hashLocks = new Map<string, Promise<void>>();
+  private _registrations = new Map<string, Promise<void>>();
   private _healthCheckInterval: number;
   private _healthTimer: ReturnType<typeof setInterval> | undefined;
   /**
@@ -154,6 +155,10 @@ export class UpstreamManager {
     return resolveCredentialTemplates(env, this._credentialStore);
   }
 
+  whenRegistered(name: string): Promise<void> {
+    return this._registrations.get(name) ?? Promise.resolve();
+  }
+
   private async _addClient(
     name: string,
     serverConfig: ServerConfig,
@@ -169,6 +174,28 @@ export class UpstreamManager {
       : (serverConfig as HttpServerConfig).type;
     log.info(`connecting (${transport})`);
 
+    const registration = this._register(name, serverConfig, log);
+    this._trackRegistration(name, registration);
+    const registered = await registration;
+    return "client" in registered ? this._connectGroup(registered, name, log) : registered;
+  }
+
+  private _trackRegistration(name: string, registration: Promise<unknown>): void {
+    const settled = registration.then(
+      () => {},
+      () => {},
+    );
+    this._registrations.set(name, settled);
+    void settled.then(() => {
+      if (this._registrations.get(name) === settled) this._registrations.delete(name);
+    });
+  }
+
+  private async _register(
+    name: string,
+    serverConfig: ServerConfig,
+    log: Logger,
+  ): Promise<ClientGroup | { name: string; error?: string }> {
     if (isStdioServer(serverConfig)) {
       let resolvedEnv: Record<string, string>;
       try {
@@ -253,7 +280,7 @@ export class UpstreamManager {
         }
       }
 
-      return this._connectGroup(group, name, log);
+      return group;
     }
 
     // HTTP: one group per name. Same factory-throw protection as above.
@@ -277,7 +304,7 @@ export class UpstreamManager {
     this._applyCategory(name, serverConfig);
     this._wireSubscriptions(group, log);
     this._notifyClientsChanged();
-    return this._connectGroup(group, name, log);
+    return group;
   }
 
   private _applyCategory(name: string, serverConfig: ServerConfig): void {

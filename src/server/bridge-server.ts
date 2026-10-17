@@ -3,10 +3,11 @@ import {
   StdioServerTransport,
   type StdioServerHandle,
 } from "@modelcontextprotocol/server/stdio";
-import { Server, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+import { Server, ProtocolError, ProtocolErrorCode, isJSONRPCRequest } from "@modelcontextprotocol/server";
 import type {
   CallToolResult,
   InputRequiredResult,
+  JSONRPCMessage,
   ProtocolEra,
   ServerContext,
   Transport,
@@ -16,7 +17,13 @@ import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
 import { ApprovalFlow } from "./policy-approval.js";
 import { ClientMetadata } from "./client-metadata.js";
-import { awaitConnectedClient, cancelledError, reauthorizationError, removedError } from "./upstream-wait.js";
+import {
+  awaitConnectedClient,
+  cancelledError,
+  reauthorizationError,
+  removedError,
+  untilSettledOrCancelled,
+} from "./upstream-wait.js";
 import type { UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
@@ -62,6 +69,7 @@ export interface BridgeServerOptions {
   toolSearchService?: ToolSearchService;
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
+  whenUpstreamRegistered?: (name: string) => Promise<void>;
   getRateLimiter?: (name: string) => RateLimiter | undefined;
   onClientsChanged?: (listener: () => void) => () => void;
   logger?: Logger;
@@ -81,9 +89,9 @@ interface Connection {
   clientLogged: boolean;
 }
 
-function observeStart(transport: Transport): {
+function interceptStart(transport: Transport, beforeStart: () => void): {
   started: Promise<void>;
-  stopObserving: () => void;
+  restoreStart: () => void;
 } {
   const originalStart = transport.start;
   let settleWith!: (startResult: Promise<void>) => void;
@@ -91,16 +99,21 @@ function observeStart(transport: Transport): {
     settleWith = (startResult) => startResult.then(resolve, reject);
   });
   transport.start = () => {
+    beforeStart();
     const startResult = originalStart.call(transport);
     settleWith(startResult);
     return startResult;
   };
   return {
     started,
-    stopObserving: () => {
+    restoreStart: () => {
       transport.start = originalStart;
     },
   };
+}
+
+function isVersionProbe(message: JSONRPCMessage): boolean {
+  return isJSONRPCRequest(message) && message.method === "server/discover";
 }
 
 function errorResult(text: string): CallToolResult {
@@ -121,9 +134,14 @@ export class BridgeServer {
   private approval = new ApprovalFlow();
   private unsubscribe: (() => void) | undefined;
   private options: BridgeServerOptions;
+  private markSessionStarted!: () => void;
+  private readonly sessionStart: Promise<void>;
 
   constructor(options?: BridgeServerOptions) {
     this.options = options ?? {};
+    this.sessionStart = new Promise<void>((resolve) => {
+      this.markSessionStarted = resolve;
+    });
     this.toolRegistry = options?.toolRegistry ?? new ToolRegistry();
     this.toolSearchService = options?.toolSearchService;
     this.policyEngine = options?.policyEngine;
@@ -166,6 +184,7 @@ export class BridgeServer {
     server.oninitialized = () => this.logClientOnce(connection);
 
     server.setRequestHandler("tools/list", (_request, ctx) => {
+      this.markSessionStarted();
       this.logClientOnce(connection, ctx);
       if (this.toolSearchService) {
         return { tools: this.toolSearchService.getVisibleTools() };
@@ -174,6 +193,7 @@ export class BridgeServer {
     });
 
     server.setRequestHandler("tools/call", async (request, ctx) => {
+      this.markSessionStarted();
       this.logClientOnce(connection, ctx);
       const { name, arguments: args } = request.params;
 
@@ -294,6 +314,8 @@ export class BridgeServer {
       );
     }
 
+    const signal = ctx.mcpReq.signal;
+    if (!getClient(parsed.source)) await this.awaitPendingRegistration(parsed.source, signal);
     if (!getClient(parsed.source)) {
       throw new ProtocolError(
         ProtocolErrorCode.InternalError,
@@ -301,7 +323,6 @@ export class BridgeServer {
       );
     }
 
-    const signal = ctx.mcpReq.signal;
     const waitOptions = {
       getClient,
       onClientsChanged: this.options.onClientsChanged,
@@ -337,6 +358,13 @@ export class BridgeServer {
     }
   }
 
+  private async awaitPendingRegistration(source: string, signal: AbortSignal): Promise<void> {
+    const whenRegistered = this.options.whenUpstreamRegistered;
+    if (!whenRegistered) return;
+    await this.sessionStart;
+    await untilSettledOrCancelled(whenRegistered(source), signal);
+  }
+
   private refuseIfPolicyTightened(
     source: string,
     toolName: string,
@@ -358,7 +386,7 @@ export class BridgeServer {
       throw new Error("BridgeServer is already connected — close() first");
     }
 
-    const { started, stopObserving } = observeStart(transport);
+    const { started, restoreStart } = interceptStart(transport, () => this.watchForSessionStart(transport));
 
     this.subscribeToolListChanged();
 
@@ -381,8 +409,24 @@ export class BridgeServer {
       await handle.close().catch(() => {});
       throw err;
     } finally {
-      stopObserving();
+      restoreStart();
     }
+  }
+
+  sessionStarted(): Promise<void> {
+    return this.sessionStart;
+  }
+
+  private watchForSessionStart(transport: Transport): void {
+    const deliver = transport.onmessage;
+    if (!deliver) {
+      this.markSessionStarted();
+      return;
+    }
+    transport.onmessage = (message, extra) => {
+      if (!isVersionProbe(message)) this.markSessionStarted();
+      deliver(message, extra);
+    };
   }
 
   async start(): Promise<void> {

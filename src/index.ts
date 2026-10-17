@@ -194,6 +194,7 @@ program
         policyEngine,
         logger,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
+        whenUpstreamRegistered: (name) => upstreamManager!.whenRegistered(name),
         getRateLimiter: (name) => rateLimiters.get(name),
         onClientsChanged: (listener) => upstreamManager!.onClientsChanged(listener),
         showStats: options.stats === true,
@@ -220,7 +221,7 @@ program
       await server.start();
 
       const serverCount = Object.keys(upstreams).length;
-      logger.info(`${APP_NAME} running — connecting to ${serverCount} upstream server${serverCount === 1 ? "" : "s"}`, { component: "bridge" });
+      logger.info(`${APP_NAME} running — will connect to ${serverCount} upstream server${serverCount === 1 ? "" : "s"} once the client starts its session`, { component: "bridge" });
 
       // Config hot-reload handler
       const onConfigReload = async (newConfig: typeof config) => {
@@ -282,10 +283,12 @@ program
         config = newConfig;
       };
 
-      // Connect upstreams in the background — tools appear as each server connects.
-      // Config watching starts only after initial connections settle to avoid
-      // race conditions between connectAll and applyConfigDiff.
-      upstreamManager.connectAll().then((result) => {
+      // Connect upstreams in the background once the client starts its session
+      // (a client that only checks the protocol version never triggers this) —
+      // tools appear as each server connects. Config watching starts only after
+      // initial connections settle to avoid race conditions between connectAll
+      // and applyConfigDiff.
+      server.sessionStarted().then(() => upstreamManager!.connectAll()).then((result) => {
         const tools = toolRegistry.listRegisteredTools().length;
         if (result.failed.length === 0) {
           logger.info(`${APP_NAME} ready — ${tools} tools from ${result.connected} servers`, { component: "bridge" });
