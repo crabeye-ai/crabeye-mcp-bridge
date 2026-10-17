@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { Server, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
+import { readBody, sendWebResponse, toWebRequest } from "./web-http.js";
 
 export type TokenEndpoint = "ok" | "invalid_grant" | "unavailable" | "rate_limited_json" | "unavailable_json";
 export type RefreshOutcome = Exclude<TokenEndpoint, "ok">;
@@ -11,6 +12,7 @@ export interface ProtectedUpstreamOptions {
   issParameterSupported?: boolean;
   metadataIssuer?: string;
   omitMetadata?: boolean;
+  mcpHandler?: (request: Request) => Promise<Response>;
 }
 
 export interface ProtectedUpstream {
@@ -23,15 +25,17 @@ export interface ProtectedUpstream {
   close: () => Promise<void>;
 }
 
-async function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
+async function serveEmptyToolList(request: Request): Promise<Response> {
+  const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
+  const mcp = new Server({ name: "protected", version: "1.0.0" }, { capabilities: { tools: {} } });
+  mcp.setRequestHandler("tools/list", () => ({ tools: [] }));
+  await mcp.connect(transport);
+  return transport.handleRequest(request);
 }
 
 export async function startProtectedUpstream(
   tokenEndpoint: TokenEndpoint,
-  { guard = "token", issParameterSupported, metadataIssuer, omitMetadata }: ProtectedUpstreamOptions = {},
+  { guard = "token", issParameterSupported, metadataIssuer, omitMetadata, mcpHandler = serveEmptyToolList }: ProtectedUpstreamOptions = {},
 ): Promise<ProtectedUpstream> {
   let mcpRequests = 0;
   let tokenRequests = 0;
@@ -89,19 +93,7 @@ export async function startProtectedUpstream(
         res.writeHead(401, { "www-authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"` });
         return res.end();
       }
-      const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
-      const mcp = new Server({ name: "protected", version: "1.0.0" }, { capabilities: { tools: {} } });
-      mcp.setRequestHandler("tools/list", () => ({ tools: [] }));
-      await mcp.connect(transport);
-      const response = await transport.handleRequest(
-        new Request(url, {
-          method: req.method,
-          headers: Object.entries(req.headers).filter((e): e is [string, string] => typeof e[1] === "string"),
-          body: req.method === "GET" ? undefined : new Uint8Array(body),
-        }),
-      );
-      res.writeHead(response.status, Object.fromEntries(response.headers));
-      return res.end(Buffer.from(await response.arrayBuffer()));
+      return sendWebResponse(res, await mcpHandler(toWebRequest(req, url, body)));
     }
     res.writeHead(404);
     res.end();

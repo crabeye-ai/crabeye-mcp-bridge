@@ -12,6 +12,13 @@ import { makeOriginPinningFetch } from "../oauth/origin-pinning.js";
 import { BaseUpstreamClient } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 
+const TRANSPORT_OWNED_HEADERS = new Set(["mcp-method", "mcp-name", "mcp-protocol-version", "mcp-session-id"]);
+
+function isTransportOwnedHeader(name: string): boolean {
+  const lower = name.toLowerCase();
+  return TRANSPORT_OWNED_HEADERS.has(lower) || lower.startsWith("mcp-param-");
+}
+
 export interface HttpUpstreamClientOptions extends BaseUpstreamClientOptions {
   config: HttpServerConfig;
   credentialStore?: CredentialStore;
@@ -25,6 +32,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
   private _resolvedClientSecret: string | undefined;
   private _hasStoredOAuth = false;
   private _authShadowWarned = false;
+  private _transportOwnedWarned = false;
   private _authProvider: BridgeOAuthClientProvider | undefined;
 
   constructor(options: HttpUpstreamClientOptions) {
@@ -119,34 +127,10 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
         : undefined;
     this._authProvider = authProvider;
 
-    // CRITICAL: strip (not just warn) any case-insensitive `Authorization`
-    // header when an `authProvider` is in play. The SDK's
-    // `_commonHeaders()` spreads transport `requestInit.headers` AFTER the
-    // provider's bearer, so leaving the static header in place would
-    // silently override the OAuth-managed token on every request — the
-    // exact opposite of what a user configuring `_bridge.auth` expects.
-    let effectiveHeaders = rawHeaders;
-    if (authProvider && rawHeaders) {
-      const filtered: Record<string, string> = {};
-      let shadowed = false;
-      for (const [k, v] of Object.entries(rawHeaders)) {
-        if (k.toLowerCase() === "authorization") {
-          shadowed = true;
-          continue;
-        }
-        filtered[k] = v;
-      }
-      if (shadowed && !this._authShadowWarned) {
-        this._authShadowWarned = true;
-        this._logger.warn(
-          `stripped static Authorization header for "${this.name}" — _bridge.auth manages tokens for this server`,
-        );
-      }
-      effectiveHeaders = filtered;
-    }
+    const effectiveHeaders = rawHeaders && this._configuredRequestHeaders(rawHeaders, authProvider !== undefined);
 
     const requestInit: RequestInit | undefined = effectiveHeaders
-      ? { headers: effectiveHeaders as Record<string, string> }
+      ? { headers: effectiveHeaders }
       : undefined;
 
     // Pin token-endpoint origin to authorization-endpoint origin via the
@@ -176,5 +160,44 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
       );
     }
     return new SSEClientTransport(url, transportOpts);
+  }
+
+  private _configuredRequestHeaders(
+    rawHeaders: Record<string, string>,
+    oauthManagesAuthorization: boolean,
+  ): Record<string, string> {
+    const filtered: Record<string, string> = {};
+    const transportOwned: string[] = [];
+    let shadowed = false;
+    for (const [k, v] of Object.entries(rawHeaders)) {
+      // CRITICAL: strip (not just warn) any case-insensitive `Authorization`
+      // header when `oauthManagesAuthorization`. The SDK's
+      // `_commonHeaders()` spreads transport `requestInit.headers` AFTER the
+      // provider's bearer, so leaving the static header in place would
+      // silently override the OAuth-managed token on every request — the
+      // exact opposite of what a user configuring `_bridge.auth` expects.
+      if (oauthManagesAuthorization && k.toLowerCase() === "authorization") {
+        shadowed = true;
+        continue;
+      }
+      if (isTransportOwnedHeader(k)) {
+        transportOwned.push(k);
+        continue;
+      }
+      filtered[k] = v;
+    }
+    if (shadowed && !this._authShadowWarned) {
+      this._authShadowWarned = true;
+      this._logger.warn(
+        `stripped static Authorization header for "${this.name}" — _bridge.auth manages tokens for this server`,
+      );
+    }
+    if (transportOwned.length > 0 && !this._transportOwnedWarned) {
+      this._transportOwnedWarned = true;
+      this._logger.warn(
+        `ignored configured headers ${transportOwned.join(", ")} for "${this.name}" — the MCP transport sets them itself`,
+      );
+    }
+    return filtered;
   }
 }
