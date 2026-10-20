@@ -75,7 +75,7 @@ export interface ScratchHome {
 /** A scratch HOME with a stub STDIO server configured as "stub" and a short daemon kill grace. */
 export async function scratchHome(
   scripts: () => string[],
-  extraConfig: { stubBridge?: Record<string, unknown>; bridge?: Record<string, unknown> } = {},
+  extraConfig: { stubBridge?: Record<string, unknown>; stubEnv?: Record<string, string>; bridge?: Record<string, unknown> } = {},
 ): Promise<ScratchHome> {
   const dir = await mkdtemp("/tmp/cbe-home-");
   const stub = join(dir, "stub.cjs");
@@ -84,7 +84,9 @@ export async function scratchHome(
   await writeFile(
     configPath,
     JSON.stringify({
-      mcpServers: { stub: { command: process.execPath, args: [stub], _bridge: extraConfig.stubBridge ?? {} } },
+      mcpServers: {
+        stub: { command: process.execPath, args: [stub], ...(extraConfig.stubEnv && { env: extraConfig.stubEnv }), _bridge: extraConfig.stubBridge ?? {} },
+      },
       ...(extraConfig.bridge && { _bridge: extraConfig.bridge }),
     }),
   );

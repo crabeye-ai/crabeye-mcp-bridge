@@ -1,29 +1,53 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { ChildHandle } from "../../src/daemon/child-handle.js";
+import { STDERR_DRAIN_MS } from "../../src/daemon/stderr-capture.js";
+import type { ChildExit } from "../../src/daemon/protocol.js";
 import { processExists } from "../../src/process/process-utils.js";
 import { until } from "../_helpers/daemon-fixtures.js";
 
 const IGNORES_SIGTERM = "process.on('SIGTERM', () => {}); process.stdout.write('{\"ready\":true}\\n'); setInterval(() => {}, 1e6)";
 const FLOODS_STDOUT = "process.stdout.write('x'.repeat(4096)); setInterval(() => {}, 1e6)";
 const CLOSES_STDOUT = "require('node:fs').closeSync(1); setInterval(() => {}, 1e6)";
+const WRITES_STDERR_THEN_EXITS = "process.stderr.write('noise\\n'.repeat(20000) + 'Error: missing API token\\n', () => process.exit(3))";
+const KILLS_ITSELF = "process.stderr.write('about to crash\\n', () => process.kill(process.pid, 'SIGKILL'))";
+const WRITES_STDERR_WITHOUT_NEWLINE_THEN_EXITS = "process.stderr.write('fatal: no newline', () => process.exit(1))";
+const spawnWithParentPidSharingStderr = (script: string, stdio: string) =>
+  `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(script)}, String(process.pid)], { stdio: ${stdio}, detached: true })`;
+const spawnSharingStderr = (script: string) => spawnWithParentPidSharingStderr(script, "['ignore', 'ignore', 'inherit']");
+const spawnSharingStderrThenOnceReady = (script: string, then: string) =>
+  `const sharer = ${spawnWithParentPidSharingStderr(`${script}; require('node:fs').writeSync(3, 'ready')`, "['ignore', 'ignore', 'inherit', 'pipe']")}; sharer.stdio[3].once('data', () => { ${then} })`;
+const LATE_LINE_DELAY_MS = 100;
+const WRITES_ONCE_PARENT_IS_GONE = `const parent = Number(process.argv[1]); setTimeout(() => process.exit(0), 10_000).unref(); const poll = setInterval(() => { try { process.kill(parent, 0); } catch { clearInterval(poll); setTimeout(() => process.stderr.write('Error: late line\\n'), ${LATE_LINE_DELAY_MS}); } }, 5)`;
+const EXITS_BEFORE_A_SHARER_WRITES_STDERR = spawnSharingStderrThenOnceReady(WRITES_ONCE_PARENT_IS_GONE, "process.exit(2)");
+const LEAVES_GRANDCHILD_ON_STDERR = `const g = ${spawnSharingStderr("setTimeout(() => {}, 30_000)")}; process.stderr.write('grandchild ' + g.pid + '\\n', () => process.exit(0))`;
+const WRITES_A_LINE_THEN_EXITS = "process.stderr.write('bye\\n', () => process.exit(3))";
 
 describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }, () => {
   const handles: ChildHandle[] = [];
+  const grandchildren: number[] = [];
+
+  const trackGrandchild = (stderr: string[]) => grandchildren.push(Number(stderr[0]!.split(" ")[1]));
 
   afterEach(async () => {
+    for (const pid of grandchildren.splice(0)) process.kill(pid, "SIGKILL");
     await Promise.all(handles.splice(0).map((h) => h.kill(0)));
   });
 
   function spawnChild(script: string, stdoutMaxBytes?: number) {
-    const events = { closes: 0, messages: 0 };
+    const events = { closes: 0, messages: 0, exits: [] as ChildExit[], stderr: [] as string[], stderrAtClose: [] as string[] };
     const handle = new ChildHandle({
       command: process.execPath,
       args: ["-e", script],
       env: process.env as Record<string, string>,
       ...(stdoutMaxBytes !== undefined && { stdoutMaxBytes }),
       onMessage: () => events.messages++,
-      onClose: () => events.closes++,
+      onClose: (exit) => {
+        events.closes++;
+        events.exits.push(exit);
+        events.stderrAtClose = [...events.stderr];
+      },
       onError: () => {},
+      onStderr: (line) => events.stderr.push(line),
     });
     handles.push(handle);
     return { handle, events };
@@ -48,6 +72,113 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
     await new Promise((r) => setTimeout(r, 200));
 
     expect(events.closes).toBe(1);
+    expect(events.exits).toEqual([{ cause: "output_flood", code: null, signal: null }]);
+  });
+
+  it("reports the exit code and keeps the last stderr line after a burst of output", async () => {
+    const { handle, events } = spawnChild(WRITES_STDERR_THEN_EXITS);
+
+    await until(() => events.closes > 0);
+
+    expect(events.exits).toEqual([{ cause: "exited", code: 3, signal: null }]);
+    expect(handle.stderrTail().at(-1)).toBe("Error: missing API token");
+    expect(events.stderrAtClose.at(-1)).toBe("Error: missing API token");
+  });
+
+  it("reports an ordinary exit as soon as stderr has closed, without waiting out the drain", async () => {
+    const { handle, events } = spawnChild(WRITES_A_LINE_THEN_EXITS);
+    await until(() => !handle.alive);
+    const exitedAt = Date.now();
+
+    await until(() => events.closes > 0);
+
+    expect(Date.now() - exitedAt).toBeLessThan(STDERR_DRAIN_MS / 2);
+    expect(events.exits).toEqual([{ cause: "exited", code: 3, signal: null }]);
+  });
+
+  it("reports the signal that killed the child", async () => {
+    const { handle, events } = spawnChild(KILLS_ITSELF);
+
+    await until(() => events.closes > 0);
+
+    expect(events.exits).toEqual([{ cause: "exited", code: null, signal: "SIGKILL" }]);
+    expect(handle.stderrTail()).toEqual(["about to crash"]);
+  });
+
+  it("does not wait past the drain time for a grandchild that keeps the child's stderr open", async () => {
+    const { events } = spawnChild(LEAVES_GRANDCHILD_ON_STDERR);
+    await until(() => events.stderr.length > 0);
+    trackGrandchild(events.stderr);
+    const startedAt = Date.now();
+
+    await until(() => events.closes > 0);
+
+    expect(Date.now() - startedAt).toBeLessThan(STDERR_DRAIN_MS + 1_000);
+    expect(events.exits).toEqual([{ cause: "exited", code: 0, signal: null }]);
+  });
+
+  it("reports a command that can't be started at once, with the reason as its last stderr line", async () => {
+    const events = { exits: [] as ChildExit[], stderr: [] as string[], errors: [] as string[] };
+    const handle = new ChildHandle({
+      command: "/nonexistent/cbe-no-such-server",
+      args: [],
+      env: process.env as Record<string, string>,
+      onMessage: () => {},
+      onClose: (exit) => events.exits.push(exit),
+      onError: (err) => events.errors.push(err.message),
+      onStderr: (line) => events.stderr.push(line),
+    });
+    handles.push(handle);
+    const startedAt = Date.now();
+
+    await until(() => events.exits.length > 0);
+
+    expect(Date.now() - startedAt).toBeLessThan(STDERR_DRAIN_MS);
+    expect(events.exits).toEqual([{ cause: "failed_to_start", code: null, signal: null }]);
+    expect(handle.stderrTail()).toEqual(["spawn /nonexistent/cbe-no-such-server ENOENT"]);
+    expect(events.stderr).toEqual(["spawn /nonexistent/cbe-no-such-server ENOENT"]);
+    expect(events.errors).toEqual(["spawn /nonexistent/cbe-no-such-server ENOENT"]);
+  });
+
+  it("waits for stderr that a process sharing it writes after the child has exited", async () => {
+    const { handle, events } = spawnChild(EXITS_BEFORE_A_SHARER_WRITES_STDERR);
+
+    await until(() => events.closes > 0);
+
+    expect(events.exits).toEqual([{ cause: "exited", code: 2, signal: null }]);
+    expect(events.stderrAtClose).toEqual(["Error: late line"]);
+    expect(handle.stderrTail()).toEqual(["Error: late line"]);
+  });
+
+  it("keeps a last stderr line written without a newline", async () => {
+    const { handle, events } = spawnChild(WRITES_STDERR_WITHOUT_NEWLINE_THEN_EXITS);
+
+    await until(() => events.closes > 0);
+
+    expect(events.stderrAtClose).toEqual(["fatal: no newline"]);
+    expect(handle.stderrTail()).toEqual(["fatal: no newline"]);
+  });
+
+  it("does not report a child that is killed while its stderr is still draining", async () => {
+    const { handle, events } = spawnChild(LEAVES_GRANDCHILD_ON_STDERR);
+    await until(() => events.stderr.length > 0);
+    trackGrandchild(events.stderr);
+    await until(() => !handle.alive);
+
+    void handle.kill(0);
+    await new Promise((r) => setTimeout(r, STDERR_DRAIN_MS + 200));
+
+    expect(events.closes).toBe(0);
+  });
+
+  it("does not report a child it was asked to kill", async () => {
+    const { handle, events } = spawnChild(IGNORES_SIGTERM);
+    await until(() => events.messages > 0);
+
+    await handle.kill(0);
+    await new Promise((r) => setTimeout(r, STDERR_DRAIN_MS + 200));
+
+    expect(events.closes).toBe(0);
   });
 
   it("still signals a child whose stdout closed while it kept running", async () => {

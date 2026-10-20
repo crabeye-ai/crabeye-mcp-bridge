@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { ManagerDaemon } from "../../src/daemon/manager.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
-import type { ChildHandle } from "../../src/daemon/child-handle.js";
+import type { ChildHandle, ProcessExit } from "../../src/daemon/child-handle.js";
 import type { StatusResult } from "../../src/daemon/protocol.js";
 
 const isWindows = process.platform === "win32";
@@ -22,7 +22,7 @@ async function tempPaths() {
 
 interface SpawnCallbacks {
   onMessage: (payload: unknown) => void;
-  onClose: () => void;
+  onClose: (exit: ProcessExit) => void;
   onError: (err: Error) => void;
   onStderr: (line: string) => void;
 }
@@ -37,6 +37,7 @@ function makeStubChildFull(
     pid: 99999,
     alive: true,
     cachedInit: null as unknown,
+    stderrTail: (): string[] => [],
     setCachedInit(init: unknown): void {
       handle.cachedInit = init;
     },

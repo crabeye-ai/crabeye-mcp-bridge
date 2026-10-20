@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { daemonPidsRunning } from "../_helpers/processes.js";
 import { until } from "../_helpers/daemon-fixtures.js";
@@ -54,7 +55,7 @@ describe.skipIf(isWindows)("upgrading from the released crabeye 1.3.0", { timeou
     expect(newBridge.stderr()).not.toContain(STILL_RUNNING);
   });
 
-  it("lets a 1.3.0 bridge started after the upgrade use the new daemon, sharing its child", async () => {
+  it("lets a 1.3.0 bridge started after the upgrade use the new daemon, sharing its child, and keeps serving it through that child's stderr and crash", async () => {
     const releasedScript = await workspace();
     const newBridge = await home.connectBridge(cliScript);
     expect(await callStubTool(newBridge)).toEqual(CALLED);
@@ -66,6 +67,11 @@ describe.skipIf(isWindows)("upgrading from the released crabeye 1.3.0", { timeou
     const shared = await home.status();
     expect(shared).toMatchObject({ pid: running!.pid, appVersion: APP_VERSION });
     expect(shared!.children).toEqual([expect.objectContaining({ refcount: 2 })]);
+
+    await callStubTool(newBridge, "stderr", { text: "seen by current bridges only" });
+    expect(await callStubTool(releasedBridge)).toEqual(CALLED);
+    await callStubTool(newBridge, "crash", { lines: ["Error: upstream gone"], code: 1 }).catch(() => {});
+    await until(async () => isDeepStrictEqual(await callStubTool(releasedBridge).catch(() => null), CALLED), 20_000);
   });
 
   it("keeps the 1.3.0 daemon a pre-release bridge leaves running, and serves that bridge's calls through it", async () => {

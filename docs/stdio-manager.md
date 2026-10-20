@@ -106,7 +106,14 @@ The manager broadcasts certain upstream notifications across every session shari
 | `notifications/resources/list_changed` | Broadcast to every attached session. | No — bridge does not implement this surface. |
 | `notifications/resources/updated` | Routed by per-session subscription tracker (only sessions that subscribed get the notification). | Yes. |
 | `notifications/progress`, `notifications/cancelled` | Routed to the originating session via rewritten progress/request tokens. | Yes. |
-| `notifications/message` (logging) | Broadcast to every attached session. | Yes. |
+
+Log messages an upstream sends as notifications are dropped; what a server writes to stderr appears in the bridge log instead (see below).
+
+## Upstream stderr
+
+Whatever a STDIO server writes to stderr shows up in the log of every bridge using it, at debug level, tagged with that bridge's name for the server. To see it, set `_bridge.logLevel` to `"debug"`. Control characters in these lines are escaped like any other log text. Very long lines are cut off, and when a server writes more than 100 lines a second, the extra lines are left out and the bridge logs how many.
+
+When a STDIO server stops (it can't be started, exits, crashes, stops answering, or is stopped for sending a message too large to read), every bridge using it logs a warning at the default log level with the server's last stderr lines. A server that fails at startup usually says why there, for example a missing token. If the command itself can't be started, the warning shows the error from starting it. While a server keeps failing the same way without connecting in between, later warnings are logged at debug level. A bridge from crabeye 1.3.0 or earlier doesn't receive any of this, and no bridge does while it uses a manager from crabeye 1.3.0 or earlier.
 
 ## Requests from upstream servers
 

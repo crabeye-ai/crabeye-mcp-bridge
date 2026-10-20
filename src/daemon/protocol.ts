@@ -16,10 +16,27 @@ export const PROTOCOL_VERSION = 2;
 export const MIN_BRIDGE_PROTOCOL_VERSION = 1;
 export const MIN_DAEMON_PROTOCOL_VERSION = 1;
 export const UNREPORTED_BRIDGE_PROTOCOL_VERSION = 1;
+export const STDERR_BRIDGE_PROTOCOL_VERSION = 2;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
+export const STDERR_LINE_MAX_CHARS = 1_000;
+export const STDERR_TAIL_LINES = 20;
+const STDERR_TRUNCATED_SUFFIX = " [truncated]";
+export const STDERR_LINE_MAX_SENT_CHARS = STDERR_LINE_MAX_CHARS + STDERR_TRUNCATED_SUFFIX.length;
+
+function isHighSurrogate(charCode: number): boolean {
+  return charCode >= 0xd800 && charCode <= 0xdbff;
+}
+
+export function capStderrLine(line: string, maxChars: number): string {
+  if (line.length <= maxChars) return line;
+  const cut = line.slice(0, maxChars);
+  const whole = isHighSurrogate(cut.charCodeAt(cut.length - 1)) ? cut.slice(0, -1) : cut;
+  return whole + STDERR_TRUNCATED_SUFFIX;
+}
 
 export type DaemonMethod =
   | "STATUS"
@@ -29,7 +46,8 @@ export type DaemonMethod =
   | "CLOSE"
   | "RESTART"
   | "PING"
-  | "SESSION_EVICTED";
+  | "SESSION_EVICTED"
+  | "STDERR";
 
 export interface DaemonRequest {
   id: string;
@@ -95,9 +113,24 @@ export interface RpcNotificationParams {
   payload: unknown;
 }
 
+export const CHILD_EXIT_CAUSES = ["exited", "failed_to_start", "unresponsive", "output_flood"] as const;
+
+export interface ChildExit {
+  cause: (typeof CHILD_EXIT_CAUSES)[number];
+  code: number | null;
+  signal: string | null;
+}
+
 export interface SessionEvictedParams {
   sessionId: string;
   reason: "child_exited" | "upstream_restarted";
+  exit?: ChildExit;
+  stderr?: string[];
+}
+
+export interface StderrParams {
+  sessionId: string;
+  line: string;
 }
 
 export interface StatusChild {

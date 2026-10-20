@@ -8,7 +8,7 @@ import type { SubscriptionTracker } from "./subscription-tracker.js";
  * Routing matrix (AIT-247):
  *   tools/prompts/resources list_changed -> broadcast all sessions
  *   resources/updated                    -> only subscribers of the URI
- *   logging/message                      -> broadcast
+ *   notifications/message                -> empty (upstream logging is not forwarded)
  *   notifications/initialized            -> empty (swallowed by manager)
  *   progress / cancelled                 -> NOT routed here; TokenRewriter handles them
  *   anything else (vendor, unknown)      -> broadcast (default-broadcast safe net)
@@ -21,11 +21,11 @@ export class NotificationRouter {
 
     switch (p.method) {
       case "notifications/initialized":
+      case "notifications/message":
         return [];
       case "notifications/tools/list_changed":
       case "notifications/prompts/list_changed":
       case "notifications/resources/list_changed":
-      case "notifications/message":
         return [...sessions];
       case "notifications/resources/updated": {
         const params = p.params as { uri?: unknown } | undefined;

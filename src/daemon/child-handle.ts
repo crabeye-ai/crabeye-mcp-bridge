@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { ERROR_CODE_BACKPRESSURE } from "./protocol.js";
+import { ERROR_CODE_BACKPRESSURE, type ChildExit } from "./protocol.js";
+import { STDERR_DRAIN_MS, StderrCapture } from "./stderr-capture.js";
 import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
 
 /**
@@ -17,6 +18,8 @@ const DEFAULT_QUEUE_MAX_BYTES = 1 * 1024 * 1024;
  * of stderr) would otherwise grow the buffer until the daemon OOMs.
  */
 const DEFAULT_STDOUT_MAX_BYTES = 8 * 1024 * 1024;
+
+export type ProcessExit = ChildExit & { cause: Exclude<ChildExit["cause"], "unresponsive"> };
 
 export class BackpressureError extends Error {
   readonly code = ERROR_CODE_BACKPRESSURE;
@@ -47,16 +50,22 @@ export interface ChildHandleOptions {
   cwd?: string;
   /** Called once per parsed newline-delimited JSON message from child stdout. */
   onMessage: (payload: unknown) => void;
-  /** Called once when the child dies by any means other than a `kill()` call from outside. */
-  onClose: () => void;
+  /**
+   * Called once: when the child exits, closes stdout or fails to start (once it
+   * has exited and its stderr has ended, or after `STDERR_DRAIN_MS`), or at once
+   * when it floods stdout. Not called after the owner calls `kill()`.
+   */
+  onClose: (exit: ProcessExit) => void;
   /** Called for unrecoverable errors (spawn failure, parse failure). */
   onError: (err: Error) => void;
-  /** Optional per-line stderr forwarder. */
+  /** Called once per non-blank stderr line, with trailing whitespace removed and cut like `capStderrLine`; a start failure arrives as its error message. */
   onStderr?: (line: string) => void;
   /** Override stdin queue cap. Defaults to 1 MiB. */
   queueMaxBytes?: number;
   /** Override stdout buffer cap. Defaults to 8 MiB. */
   stdoutMaxBytes?: number;
+  /** Override how long `onClose` waits for the child's exit and the end of its stderr. Defaults to `STDERR_DRAIN_MS`. */
+  stderrDrainMs?: number;
 }
 
 /**
@@ -64,10 +73,6 @@ export interface ChildHandleOptions {
  * JSON-RPC (the MCP stdio framing). Owns the single-writer stdin queue
  * and the stdout line parser; the daemon reads parsed payloads via the
  * `onMessage` callback.
- *
- * Phase B: at most one session writes through a `ChildHandle`. Phase C
- * fan-in from N sessions reuses this exact queue — `send()` is the only
- * write surface.
  */
 export class ChildHandle {
   readonly startedAt: number;
@@ -77,13 +82,22 @@ export class ChildHandle {
   private killing: Promise<void> | null = null;
   private readonly queueMaxBytes: number;
   private readonly stdoutMaxBytes: number;
+  private readonly stderrDrainMs: number;
   private readonly opts: ChildHandleOptions;
   private _cachedInit: CachedInit | null = null;
+  private readonly stderr: StderrCapture;
+  private exitStatus: Pick<ChildExit, "code" | "signal"> | null = null;
+  private failedToStart = false;
+  private resolveExited!: () => void;
+  private readonly exited = new Promise<void>((resolve) => (this.resolveExited = resolve));
+  private resolveStderrEnded!: () => void;
+  private readonly stderrEnded = new Promise<void>((resolve) => (this.resolveStderrEnded = resolve));
 
   constructor(opts: ChildHandleOptions) {
     this.opts = opts;
     this.queueMaxBytes = opts.queueMaxBytes ?? DEFAULT_QUEUE_MAX_BYTES;
     this.stdoutMaxBytes = opts.stdoutMaxBytes ?? DEFAULT_STDOUT_MAX_BYTES;
+    this.stderrDrainMs = opts.stderrDrainMs ?? STDERR_DRAIN_MS;
     this.startedAt = Date.now();
 
     try {
@@ -98,34 +112,34 @@ export class ChildHandle {
       );
     }
 
+    this.stderr = new StderrCapture((line) => opts.onStderr?.(line));
+
     this.child.on("error", (err) => {
-      if (this.closed) return;
-      opts.onError(err);
+      if (!this.closed) opts.onError(err);
+      if (this.child.pid === undefined) this.reportFailedStart(err);
     });
 
-    this.child.on("exit", () => {
-      if (this.closed) return;
-      this.closed = true;
-      opts.onClose();
+    this.child.once("exit", (code, signal) => {
+      this.exitStatus = { code, signal };
+      this.resolveExited();
+      this.reportExitWhenDrained();
     });
 
     this.child.stdout.setEncoding("utf-8");
     this.child.stdout.on("data", (chunk: string) => this._onStdout(chunk));
-    this.child.stdout.on("end", () => {
-      if (this.closed) return;
-      this.closed = true;
-      opts.onClose();
-    });
+    this.child.stdout.on("end", () => this.reportExitWhenDrained());
 
-    if (opts.onStderr) {
-      this.child.stderr.setEncoding("utf-8");
-      this.child.stderr.on("data", (chunk: string) => {
-        for (const line of chunk.split("\n")) {
-          const t = line.trimEnd();
-          if (t.length > 0) opts.onStderr!(t);
-        }
-      });
-    }
+    this.child.stderr.setEncoding("utf-8");
+    this.child.stderr.on("data", (chunk: string) => this.stderr.push(chunk));
+    this.child.stderr.once("close", () => {
+      this.stderr.end();
+      this.resolveStderrEnded();
+    });
+  }
+
+  /** The child's last stderr lines, oldest first. */
+  stderrTail(): string[] {
+    return this.stderr.tail();
   }
 
   /** PID of the spawned child, or null if the spawn never produced one. */
@@ -201,6 +215,40 @@ export class ChildHandle {
     await waitForExit(this.child, killGraceMs);
   }
 
+  private reportFailedStart(err: Error): void {
+    if (this.failedToStart) return;
+    this.failedToStart = true;
+    this.stderr.push(`${err.message}\n`);
+    this.resolveExited();
+    this.reportExitWhenDrained();
+  }
+
+  private reportExitWhenDrained(): void {
+    if (this.closed) return;
+    this.closed = true;
+    void this.drained().then(() => {
+      if (this.killing === null) this.opts.onClose(this.exitReport());
+    });
+  }
+
+  private exitReport(): ProcessExit {
+    return {
+      cause: this.failedToStart ? "failed_to_start" : "exited",
+      code: this.exitStatus?.code ?? null,
+      signal: this.exitStatus?.signal ?? null,
+    };
+  }
+
+  private drained(): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, this.stderrDrainMs).unref();
+      void Promise.all([this.exited, this.stderrEnded]).then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
   private _onStdout(chunk: string): void {
     if (this.closed) return;
     this.stdoutBuffer += chunk;
@@ -215,7 +263,7 @@ export class ChildHandle {
         ),
       );
       void this.kill(0);
-      this.opts.onClose();
+      this.opts.onClose({ cause: "output_flood", code: null, signal: null });
       return;
     }
     let nl = this.stdoutBuffer.indexOf("\n");

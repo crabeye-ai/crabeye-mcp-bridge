@@ -303,7 +303,7 @@ describe.skipIf(isWindows)("ManagerDaemon child teardown", { timeout: 30_000 }, 
     const pid = s.children[0]!.pid;
 
     await f.client.call("RESTART", { upstreamHash: s.children[0]!.upstreamHash });
-    callbacks!.onClose();
+    callbacks!.onClose({ cause: "exited", code: 0, signal: null });
     await f.manager.stop(0);
 
     expect(tracker.unregistered.filter((p) => p === pid)).toHaveLength(1);

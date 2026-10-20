@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { ManagerDaemon, type ManagerOptions } from "../../src/daemon/manager.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
-import type { DaemonNotification, OpenParams } from "../../src/daemon/protocol.js";
+import type { DaemonNotification, OpenParams, SessionEvictedParams, StderrParams } from "../../src/daemon/protocol.js";
 
 export async function until(check: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -134,6 +134,8 @@ export interface OpenSessionOpts {
   /** serverName override (not part of upstreamHash). */
   serverName?: string;
   resolvedEnv?: Record<string, string>;
+  /** The bridge's protocol version; omit to act as a bridge from before protocol versions. */
+  bridgeProtocolVersion?: number;
 }
 
 let nextSessionCounter = 0;
@@ -149,7 +151,8 @@ export class OpenSessionFixture {
   readonly sessionId: string;
   readonly spec: OpenParams["spec"];
   private inboundRpcHandlers: Array<(payload: unknown) => void> = [];
-  readonly evictions: Array<{ reason: string; framesBefore: number }> = [];
+  readonly evictions: Array<{ reason: string; framesBefore: number; params: SessionEvictedParams }> = [];
+  readonly stderrLines: string[] = [];
   private inboundFrames: unknown[] = [];
   private auxClient: DaemonClient;
 
@@ -181,9 +184,12 @@ export class OpenSessionFixture {
       clientCapabilities: {},
       protocolVersion: "2025-06-18",
     };
-    await c.call("OPEN", { sessionId, spec });
-
     const fixture = new OpenSessionFixture(sessionId, spec, c);
+    await c.call("OPEN", {
+      sessionId,
+      ...(opts.bridgeProtocolVersion !== undefined && { bridgeProtocolVersion: opts.bridgeProtocolVersion }),
+      spec,
+    });
     return fixture;
   }
 
@@ -251,10 +257,15 @@ export class OpenSessionFixture {
 
   private _onNotification(notif: DaemonNotification): void {
     if (notif.method === "SESSION_EVICTED") {
-      const evicted = notif.params as { sessionId?: string; reason?: string } | undefined;
+      const evicted = notif.params as SessionEvictedParams | undefined;
       if (evicted?.sessionId === this.sessionId) {
-        this.evictions.push({ reason: evicted.reason ?? "", framesBefore: this.inboundFrames.length });
+        this.evictions.push({ reason: evicted.reason ?? "", framesBefore: this.inboundFrames.length, params: evicted });
       }
+      return;
+    }
+    if (notif.method === "STDERR") {
+      const stderr = notif.params as StderrParams | undefined;
+      if (stderr?.sessionId === this.sessionId) this.stderrLines.push(stderr.line);
       return;
     }
     if (notif.method !== "RPC") return;

@@ -15,7 +15,7 @@ import {
 import { processExists } from "../process/process-utils.js";
 import { isForeignProcess } from "./daemon-identity.js";
 import { ChildHandle, BackpressureError } from "./child-handle.js";
-import type { CachedInit } from "./child-handle.js";
+import type { CachedInit, ProcessExit } from "./child-handle.js";
 import { ProcessTracker } from "./process-tracker.js";
 import { processTrackerPathFor } from "./paths.js";
 import {
@@ -34,9 +34,11 @@ import {
   INNER_ERROR_CODE_SESSION_CLOSED,
   MIN_BRIDGE_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  STDERR_BRIDGE_PROTOCOL_VERSION,
   UNREPORTED_BRIDGE_PROTOCOL_VERSION,
   isNotification,
   isRequest,
+  type ChildExit,
   type CloseParams,
   type DaemonError,
   type DaemonNotification,
@@ -52,6 +54,7 @@ import {
   type StatusChild,
   type StatusResult,
   type StatusSession,
+  type StderrParams,
   type UpstreamRestartedReason,
 } from "./protocol.js";
 import { InflightOverflowError, TokenRewriter, type InnerId } from "./token-rewriter.js";
@@ -60,6 +63,7 @@ import { NotificationRouter } from "./notification-router.js";
 import { answerChildRequest, isChildRequest, type ChildRequest } from "./child-requests.js";
 import { Telemetry, type KilledReason } from "./telemetry.js";
 import { ChildPing } from "./child-ping.js";
+import { StderrForwardLimit } from "./stderr-capture.js";
 import { SocketInUseError, type DaemonServer, type FrameChannel, type Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
@@ -135,6 +139,7 @@ export interface ChildGroup {
   rewriter: TokenRewriter;
   subscriptions: SubscriptionTracker;
   router: NotificationRouter;
+  stderrLimit: StderrForwardLimit;
   /** Sessions attached to this child. */
   sessions: Set<string>;
   /** Metadata captured at first spawn. */
@@ -170,11 +175,14 @@ type TeardownReason = KilledReason | "shutdown";
 
 type InflightFailure = { kind: "closed"; message: string } | { kind: "restarted"; reason: UpstreamRestartedReason };
 
+type StopReport = Required<Pick<SessionEvictedParams, "exit" | "stderr">>;
+
 export interface SessionAttachment {
   sessionId: string;
   channel: FrameChannel;
   group: ChildGroup;
   startedAt: number;
+  receivesStderr: boolean;
 }
 
 export interface ManagerOptions {
@@ -219,12 +227,14 @@ export interface ManagerOptions {
   processTrackerPath?: string;
   /** Pre-built tracker, used by tests to inject fakes. */
   processTracker?: ProcessTracker;
+  /** Override for tests: how long a child's close is held back waiting for its exit and the end of its stderr. */
+  _stderrDrainMs?: number;
   /** Override for tests: skip real spawn. */
   _spawnChild?: (
     spec: OpenParams["spec"],
     callbacks: {
       onMessage: (payload: unknown) => void;
-      onClose: () => void;
+      onClose: (exit: ProcessExit) => void;
       onError: (err: Error) => void;
       onStderr: (line: string) => void;
     },
@@ -925,6 +935,7 @@ export class ManagerDaemon {
       channel,
       group,
       startedAt: Date.now(),
+      receivesStderr: bridgeProtocolVersion >= STDERR_BRIDGE_PROTOCOL_VERSION,
     };
     this.sessions.set(params.sessionId, attachment);
     this.telemetry.recordSessionOpen();
@@ -938,7 +949,7 @@ export class ManagerDaemon {
 
   private liveGroupFor(hash: string): ChildGroup | undefined {
     const group = this.groupsByHash.get(hash);
-    if (group === undefined || group.teardown !== null) return undefined;
+    if (group === undefined || group.teardown !== null || !group.child.alive) return undefined;
     return group;
   }
 
@@ -947,22 +958,24 @@ export class ManagerDaemon {
     const subscriptions = new SubscriptionTracker();
     const router = new NotificationRouter();
     const groupRef: { value: ChildGroup | null } = { value: null };
+    const stderrLimit = new StderrForwardLimit((line) => {
+      const g = groupRef.value;
+      if (g !== null) this.forwardStderr(g, line);
+    });
 
     const callbacks = {
       onMessage: (payload: unknown): void => {
         const g = groupRef.value;
         if (g !== null) this.routeChildMessage(g, payload);
       },
-      onClose: (): void => {
+      onClose: (exit: ProcessExit): void => {
         const g = groupRef.value;
-        if (g !== null) void this.teardownGroup(g, "crash");
+        if (g !== null) void this.teardownGroup(g, "crash", exit);
       },
       onError: (err: Error): void => {
         this.logger.warn(`child error: ${err.message}`, { component: "daemon", upstreamHash: hash });
       },
-      onStderr: (line: string): void => {
-        this.logger.debug(line, { component: "daemon", upstreamHash: hash, stream: "stderr" });
-      },
+      onStderr: (line: string): void => stderrLimit.offer(line),
     };
 
     let child: ChildHandle;
@@ -974,6 +987,7 @@ export class ManagerDaemon {
             args: spec.args,
             env: buildSpawnEnv(spec.resolvedEnv),
             cwd: spec.cwd === "" ? undefined : spec.cwd,
+            stderrDrainMs: this.opts._stderrDrainMs,
             ...callbacks,
           });
     } catch (err) {
@@ -987,6 +1001,7 @@ export class ManagerDaemon {
       rewriter,
       subscriptions,
       router,
+      stderrLimit,
       sessions: new Set(),
       serverName: spec.serverName,
       startedAt: child.startedAt,
@@ -1028,6 +1043,7 @@ export class ManagerDaemon {
             group.child.send(payload);
           },
           onWedged: (reason) => {
+            if (!group.child.alive) return;
             this.logger.error(
               `child wedged: ${reason} — killing`,
               {
@@ -1037,7 +1053,7 @@ export class ManagerDaemon {
                 pid: group.child.pid,
               },
             );
-            void this.teardownGroup(group, "wedged");
+            void this.teardownGroup(group, "wedged", { cause: "unresponsive", code: null, signal: null });
           },
         },
       });
@@ -1207,10 +1223,10 @@ export class ManagerDaemon {
     }
   }
 
-  private teardownGroup(group: ChildGroup, reason: TeardownReason): Promise<void> {
+  private teardownGroup(group: ChildGroup, reason: TeardownReason, exit?: ChildExit): Promise<void> {
     if (group.teardown !== null) return group.teardown;
     const teardown: Promise<void> = Promise.resolve()
-      .then(() => this.runTeardown(group, reason))
+      .then(() => this.runTeardown(group, reason, exit))
       .catch((err: unknown) => {
         this.logger.error(`child teardown failed: ${err instanceof Error ? err.message : String(err)}`, {
           groupId: group.groupId,
@@ -1224,7 +1240,7 @@ export class ManagerDaemon {
     return teardown;
   }
 
-  private async runTeardown(group: ChildGroup, reason: TeardownReason): Promise<void> {
+  private async runTeardown(group: ChildGroup, reason: TeardownReason, exit?: ChildExit): Promise<void> {
     try {
       if (this.groups.get(group.groupId) === group) {
         this.groups.delete(group.groupId);
@@ -1233,7 +1249,8 @@ export class ManagerDaemon {
       if (this.groupsByHash.get(group.upstreamHash) === group) this.groupsByHash.delete(group.upstreamHash);
       this.cancelGraceTimer(group);
       group.childPing?.stop();
-      if (reason !== "shutdown") this.evictSessionsOf(group, reason);
+      group.stderrLimit.stop();
+      if (reason !== "shutdown") this.evictSessionsOf(group, reason, exit);
     } finally {
       const pid = group.child.pid;
       await group.child.kill(this.killGraceMs()).catch(() => {});
@@ -1244,13 +1261,14 @@ export class ManagerDaemon {
     }
   }
 
-  private evictSessionsOf(group: ChildGroup, reason: KilledReason): void {
+  private evictSessionsOf(group: ChildGroup, reason: KilledReason, exit?: ChildExit): void {
     const [evictionReason, inflightFailure]: [SessionEvictedParams["reason"], InflightFailure] =
       reason === "restart"
         ? ["upstream_restarted", { kind: "restarted", reason: "admin_restart" }]
         : ["child_exited", { kind: "closed", message: "child process exited" }];
+    const stop: StopReport | undefined = exit && { exit, stderr: group.child.stderrTail() };
     for (const att of Array.from(this.sessions.values())) {
-      if (att.group === group) this.evictSession(att.sessionId, evictionReason, inflightFailure);
+      if (att.group === group) this.evictSession(att.sessionId, evictionReason, inflightFailure, stop);
     }
   }
 
@@ -1271,11 +1289,20 @@ export class ManagerDaemon {
     sessionId: string,
     reason: SessionEvictedParams["reason"],
     inflightFailure: InflightFailure,
+    stop?: StopReport,
   ): void {
     const att = this.sessions.get(sessionId);
     if (att === undefined) return;
     void this.detachSession(sessionId, inflightFailure).catch(() => {});
-    att.channel.send({ method: "SESSION_EVICTED", params: { sessionId, reason } satisfies SessionEvictedParams });
+    const params: SessionEvictedParams = { sessionId, reason, ...(att.receivesStderr && stop) };
+    att.channel.send({ method: "SESSION_EVICTED", params });
+  }
+
+  private forwardStderr(group: ChildGroup, line: string): void {
+    for (const sessionId of group.sessions) {
+      const att = this.sessions.get(sessionId);
+      if (att?.receivesStderr) att.channel.send({ method: "STDERR", params: { sessionId, line } satisfies StderrParams });
+    }
   }
 
   /**

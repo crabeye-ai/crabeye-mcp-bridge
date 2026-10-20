@@ -25,6 +25,7 @@ import type { BaseUpstreamClientOptions } from "./base-client.js";
 import { IdempotencyTable } from "./idempotency-table.js";
 import { HeldOutbound } from "./held-outbound.js";
 import { cancelledRequestId, requestIdOf, type RequestId } from "./jsonrpc-ids.js";
+import { ChildStopWarnings, childStopWarning, stderrLineFor } from "./stderr-report.js";
 
 const OPEN_ATTEMPTS = 5;
 const OPEN_RETRY_MS = 100;
@@ -73,6 +74,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
   private readonly _rpcTimeoutMs: number;
   private readonly _heartbeatMs: number;
   private readonly _respawnLockWaitMs: number;
+  private readonly _stopWarnings: ChildStopWarnings;
   private _currentEnv: Record<string, string> = {};
 
   constructor(options: DaemonStdioClientOptions) {
@@ -91,6 +93,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
     this._rpcTimeoutMs = options.rpcTimeoutMs ?? 30_000;
     this._heartbeatMs = options.heartbeatMs ?? 5_000;
     this._respawnLockWaitMs = options.respawnLockWaitMs ?? 60_000;
+    this._stopWarnings = new ChildStopWarnings(this._logger);
   }
 
   /**
@@ -115,7 +118,12 @@ export class DaemonStdioClient extends BaseUpstreamClient {
       heartbeatMs: this._heartbeatMs,
       respawnLockWaitMs: this._respawnLockWaitMs,
       logger: this._logger,
+      stopWarnings: this._stopWarnings,
     });
+  }
+
+  protected override _afterConnect(): void {
+    this._stopWarnings.connected();
   }
 }
 
@@ -139,6 +147,7 @@ interface DaemonStdioTransportOpts {
   respawnLockWaitMs: number;
   /** Optional logger; defaults to noop. Used to emit force-respawn structured logs. */
   logger?: Logger;
+  stopWarnings: ChildStopWarnings;
 }
 
 /**
@@ -362,9 +371,15 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
 
 
   private _onNotification(notif: DaemonNotification): void {
+    if (notif.method === "STDERR") {
+      const line = stderrLineFor(notif.params, this._daemonSessionId);
+      if (line !== null) this._logger.debug(line);
+      return;
+    }
     if (notif.method === "SESSION_EVICTED") {
-      const params = notif.params as { sessionId?: string; reason?: string } | undefined;
+      const params = notif.params as { sessionId?: string; reason?: string; exit?: unknown; stderr?: unknown } | undefined;
       if (params && params.sessionId === this._daemonSessionId) {
+        this._warnIfChildStopped(params);
         const reasonErr = new Error(`daemon evicted session: ${params.reason ?? "unknown"}`);
         this.onerror?.(reasonErr);
         void this.supervisor.close();
@@ -383,6 +398,11 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
     } catch (err) {
       this.onerror?.(err instanceof Error ? err : new Error(String(err)));
     }
+  }
+
+  private _warnIfChildStopped(evicted: { exit?: unknown; stderr?: unknown }): void {
+    const warning = childStopWarning(evicted);
+    if (warning !== null) this.opts.stopWarnings.log(warning);
   }
 
   private _onSocketClose(): void {

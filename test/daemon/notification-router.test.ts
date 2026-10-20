@@ -26,7 +26,7 @@ describe("NotificationRouter", () => {
     expect(route).toEqual(["A"]);
   });
 
-  it("broadcasts logging/message", () => {
+  it("sends an upstream log message to no session", () => {
     const router = new NotificationRouter();
     const tracker = new SubscriptionTracker();
     const route = router.route(
@@ -34,7 +34,7 @@ describe("NotificationRouter", () => {
       ["A", "B"],
       tracker,
     );
-    expect(new Set(route)).toEqual(new Set(["A", "B"]));
+    expect(route).toEqual([]);
   });
 
   it("broadcasts unenumerated/vendor methods (default-broadcast)", () => {
