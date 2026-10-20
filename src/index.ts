@@ -1,4 +1,4 @@
-import { Command, Option } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import {
   loadConfig,
   ConfigError,
@@ -7,7 +7,8 @@ import {
   ConfigWatcher,
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
-import { findRemovedReconnectLimit, findSelfReferences, resolveUpstreams, isStdioServer } from "./config/schema.js";
+import { findSelfReferences, resolveUpstreams, isStdioServer } from "./config/schema.js";
+import { warnRemovedSettings } from "./config/removed-settings.js";
 import { launchedByAnotherBridge } from "./upstream/launch-guard.js";
 import type {
   BridgeConfig,
@@ -24,7 +25,7 @@ import { ToolSearchService } from "./search/index.js";
 import type { DiscoveryMode } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
-import { ensureDaemonRunning } from "./daemon/index.js";
+import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
 import type { Logger } from "./logging/index.js";
@@ -39,14 +40,12 @@ import { onClientDisconnect } from "./process/client-disconnect.js";
 
 const SHUTDOWN_DEADLINE_MS = 5_000;
 
-function warnRemovedReconnectLimit(config: BridgeConfig, logger: Logger): void {
-  const locations = findRemovedReconnectLimit(config);
-  if (locations.length === 0) return;
-  logger.warn(
-    `maxReconnectAttempts is no longer supported and is ignored (${locations.join(", ")}); ` +
-      "upstreams now retry indefinitely with capped backoff",
-    { component: "config" },
-  );
+function parseAwaitPredecessorMs(value: string): number {
+  const ms = Number(value);
+  if (!Number.isSafeInteger(ms) || ms < 0 || ms > MAX_AWAIT_PREDECESSOR_MS) {
+    throw new InvalidArgumentError(`expected a whole number of milliseconds up to ${MAX_AWAIT_PREDECESSOR_MS}`);
+  }
+  return ms;
 }
 
 const SELF_REFERENCE_REASON = `it launches ${APP_NAME} itself`;
@@ -146,7 +145,7 @@ program
         return;
       }
 
-      warnRemovedReconnectLimit(config, logger);
+      warnRemovedSettings(config, logger);
       logSelfReferences(config, logger);
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
@@ -157,7 +156,7 @@ program
       // keeps retrying on its own. HTTP-only configs skip this.
       const hasStdio = Object.values(upstreams).some(isStdioServer);
       if (hasStdio) {
-        ensureDaemonRunning().catch((err: unknown) => {
+        ensureDaemonRunning({ logger }).catch((err: unknown) => {
           logger.error(`failed to start manager daemon: ${err instanceof Error ? err.message : String(err)}`, {
             component: "bridge",
           });
@@ -233,7 +232,7 @@ program
           logger.info(`log level changed to ${diff.bridge.logLevel}`, { component: "reload" });
         }
 
-        warnRemovedReconnectLimit(newConfig, logger);
+        warnRemovedSettings(newConfig, logger);
         logSelfReferences(newConfig, logger);
 
         if (diff.bridge.healthCheckInterval !== undefined) {
@@ -659,13 +658,18 @@ program
       .hideHelp(),
   )
   .addOption(
+    new Option(`${AWAIT_PREDECESSOR_FLAG} <ms>`, "internal: wait this long for the daemon being replaced to exit")
+      .argParser(parseAwaitPredecessorMs)
+      .hideHelp(),
+  )
+  .addOption(
     new Option("--all", "with restart-upstream: restart every active upstream"),
   )
   .action(
     async (
       action: string | undefined,
       hash: string | undefined,
-      options: { internalLaunch?: boolean; all?: boolean },
+      options: { internalLaunch?: boolean; awaitPredecessorMs?: number; all?: boolean },
     ) => {
       try {
         const { runDaemonCommand, runDaemonInternal, runRestartUpstream } = await import(
@@ -673,7 +677,7 @@ program
         );
 
         if (options.internalLaunch) {
-          const code = await runDaemonInternal();
+          const code = await runDaemonInternal(options.awaitPredecessorMs);
           process.exit(code);
         }
 

@@ -30,7 +30,7 @@ const SPEC_BASE = {
   protocolVersion: "2025-06-18",
 };
 
-describe.skipIf(isWindows)("ManagerDaemon — group registry (Phase D)", () => {
+describe.skipIf(isWindows)("ManagerDaemon — group registry", () => {
   let paths: Awaited<ReturnType<typeof tempPaths>>;
   let manager: ManagerDaemon | null = null;
   let spawnCalls: number;
@@ -78,119 +78,22 @@ describe.skipIf(isWindows)("ManagerDaemon — group registry (Phase D)", () => {
     });
   }
 
-  it("two auto OPENs same hash dedupe to one shared child (refcount=2)", async () => {
+  it("sessions with the same spec share one child whatever sharing value an older bridge sends", async () => {
     manager = freshManager();
     await manager.start();
     const c = freshClient();
     try {
-      const spec = { ...SPEC_BASE, sharing: "auto" as const };
-      await c.call("OPEN", { sessionId: "11111111-1111-1111-1111-111111111111", spec });
-      await c.call("OPEN", { sessionId: "22222222-2222-2222-2222-222222222222", spec });
-      const status = (await c.call("STATUS")) as { children: Array<{ refcount: number; mode: string; sharing: string }> };
-      expect(status.children).toHaveLength(1);
-      expect(status.children[0]!.refcount).toBe(2);
-      expect(status.children[0]!.mode).toBe("shared");
-      expect(status.children[0]!.sharing).toBe("auto");
-      expect(spawnCalls).toBe(1);
-    } finally {
-      c.close();
-    }
-  });
-
-  it("two shared OPENs same hash dedupe to one shared child (refcount=2)", async () => {
-    manager = freshManager();
-    await manager.start();
-    const c = freshClient();
-    try {
-      const spec = { ...SPEC_BASE, sharing: "shared" as const };
-      await c.call("OPEN", { sessionId: "11111111-1111-1111-1111-111111111111", spec });
-      await c.call("OPEN", { sessionId: "22222222-2222-2222-2222-222222222222", spec });
-      const status = (await c.call("STATUS")) as { children: Array<{ refcount: number; mode: string; sharing: string }> };
-      expect(status.children).toHaveLength(1);
-      expect(status.children[0]!.refcount).toBe(2);
-      expect(status.children[0]!.mode).toBe("shared");
-      expect(status.children[0]!.sharing).toBe("shared");
-      expect(spawnCalls).toBe(1);
-    } finally {
-      c.close();
-    }
-  });
-
-  it("one auto + one shared same hash spawn TWO separate shared children", async () => {
-    manager = freshManager();
-    await manager.start();
-    const c = freshClient();
-    try {
-      await c.call("OPEN", {
-        sessionId: "11111111-1111-1111-1111-111111111111",
-        spec: { ...SPEC_BASE, sharing: "auto" as const },
-      });
-      await c.call("OPEN", {
-        sessionId: "22222222-2222-2222-2222-222222222222",
-        spec: { ...SPEC_BASE, sharing: "shared" as const },
-      });
-      const status = (await c.call("STATUS")) as {
-        children: Array<{ refcount: number; mode: string; sharing: string; upstreamHash: string }>;
-      };
-      expect(status.children).toHaveLength(2);
-      const sharings = status.children.map((c) => c.sharing).sort();
-      expect(sharings).toEqual(["auto", "shared"]);
-      for (const child of status.children) {
-        expect(child.refcount).toBe(1);
-        expect(child.mode).toBe("shared");
+      const sharingValues = ["auto", "shared", "dedicated", "bogus", undefined];
+      const sessionIds = sharingValues.map((_, i) => `${i + 1}`.repeat(8) + "-1111-1111-1111-111111111111");
+      for (const [i, sharing] of sharingValues.entries()) {
+        const spec = sharing === undefined ? SPEC_BASE : { ...SPEC_BASE, sharing };
+        await c.call("OPEN", { sessionId: sessionIds[i], spec });
       }
-      expect(spawnCalls).toBe(2);
-    } finally {
-      c.close();
-    }
-  });
-
-  it("two dedicated OPENs same hash spawn TWO dedicated children (refcount=1 each)", async () => {
-    manager = freshManager();
-    await manager.start();
-    const c = freshClient();
-    try {
-      const spec = { ...SPEC_BASE, sharing: "dedicated" as const };
-      await c.call("OPEN", { sessionId: "11111111-1111-1111-1111-111111111111", spec });
-      await c.call("OPEN", { sessionId: "22222222-2222-2222-2222-222222222222", spec });
-      const status = (await c.call("STATUS")) as { children: Array<{ refcount: number; mode: string; sharing: string }> };
-      expect(status.children).toHaveLength(2);
-      for (const child of status.children) {
-        expect(child.refcount).toBe(1);
-        expect(child.mode).toBe("dedicated");
-        expect(child.sharing).toBe("dedicated");
-      }
-      expect(spawnCalls).toBe(2);
-    } finally {
-      c.close();
-    }
-  });
-
-  it("dedicated + auto same hash spawn TWO children (one dedicated, one auto-shared)", async () => {
-    manager = freshManager();
-    await manager.start();
-    const c = freshClient();
-    try {
-      await c.call("OPEN", {
-        sessionId: "11111111-1111-1111-1111-111111111111",
-        spec: { ...SPEC_BASE, sharing: "dedicated" as const },
-      });
-      await c.call("OPEN", {
-        sessionId: "22222222-2222-2222-2222-222222222222",
-        spec: { ...SPEC_BASE, sharing: "auto" as const },
-      });
-      const status = (await c.call("STATUS")) as {
-        children: Array<{ refcount: number; mode: string; sharing: string }>;
-      };
-      expect(status.children).toHaveLength(2);
-      const byMode = Object.fromEntries(status.children.map((c) => [c.sharing, c]));
-      expect(byMode.dedicated).toBeDefined();
-      expect(byMode.auto).toBeDefined();
-      expect(byMode.dedicated!.mode).toBe("dedicated");
-      expect(byMode.dedicated!.refcount).toBe(1);
-      expect(byMode.auto!.mode).toBe("shared");
-      expect(byMode.auto!.refcount).toBe(1);
-      expect(spawnCalls).toBe(2);
+      const status = (await c.call("STATUS")) as { children: Array<{ refcount: number; sessions: string[] }> };
+      expect(status.children).toHaveLength(1);
+      expect(status.children[0]!.refcount).toBe(sharingValues.length);
+      expect(new Set(status.children[0]!.sessions)).toEqual(new Set(sessionIds));
+      expect(spawnCalls).toBe(1);
     } finally {
       c.close();
     }

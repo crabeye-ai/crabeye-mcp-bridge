@@ -68,7 +68,7 @@ describe.skipIf(process.platform === "win32")("a bridge calling tools while its 
     const replacementReleased = new Promise<void>((resolve) => (releaseReplacement = resolve));
     const c = (client = new DaemonStdioClient({
       name: "counting",
-      config: { command: process.execPath, args: ["-e", COUNTING_UPSTREAM, log], _bridge: { sharing: "dedicated" } } as never,
+      config: { command: process.execPath, args: ["-e", COUNTING_UPSTREAM, log] } as never,
       resolvedEnv: {},
       heartbeatMs: 60_000,
       _socketPath: f.socketPath,

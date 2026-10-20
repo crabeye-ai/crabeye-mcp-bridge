@@ -54,8 +54,8 @@ export function daemonFilesFor(socketPath: string): DaemonFiles {
   };
 }
 
-export function getProcessTrackerPath(): string {
-  return join(getDaemonRunDir(), PROCESS_TRACKER_FILENAME);
+export function processTrackerPathFor(lockPath: string): string {
+  return join(dirname(lockPath), PROCESS_TRACKER_FILENAME);
 }
 
 function sanitizeUser(name: string): string {

@@ -5,6 +5,7 @@ import { ManagerDaemon } from "../../src/daemon/manager.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 import { ChildHandle } from "../../src/daemon/child-handle.js";
+import { until } from "../_helpers/daemon-fixtures.js";
 
 const isWindows = process.platform === "win32";
 
@@ -111,7 +112,6 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
         args: [],
         resolvedEnv: {},
         cwd: "",
-        sharing: "auto" as const,
         clientInfo: { name: "test-bridge", version: "0.0.0" },
         clientCapabilities: {},
         protocolVersion: "2025-06-18",
@@ -136,7 +136,7 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-A", version: "1" } },
         },
       });
-      await new Promise((r) => setTimeout(r, 50));
+      await until(() => aResponses.length === 1);
       expect(aResponses).toHaveLength(1);
       expect(childMessages.find((m) => (m as { method?: string }).method === "initialize")).toBeDefined();
 
@@ -158,7 +158,7 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-B", version: "1" } },
         },
       });
-      await new Promise((r) => setTimeout(r, 50));
+      await until(() => bResponses.length === 1);
       expect(bResponses).toHaveLength(1);
       const initResp = bResponses[0] as { id: number; result: { protocolVersion: string } };
       expect(initResp.id).toBe(1);
@@ -205,7 +205,6 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
         args: [],
         resolvedEnv: {},
         cwd: "",
-        sharing: "auto" as const,
         clientInfo: { name: "test-bridge", version: "0.0.0" },
         clientCapabilities: {},
         protocolVersion: "2025-06-18",
@@ -226,7 +225,7 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-A", version: "1" } },
         },
       });
-      await new Promise((r) => setTimeout(r, 50));
+      await until(() => aResponses.length === 1);
       expect(aResponses).toHaveLength(1);
       const aInit = aResponses[0] as { result: { instructions?: string } };
       // First session: instructions came verbatim from the (real) child reply.
@@ -247,7 +246,7 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-B", version: "1" } },
         },
       });
-      await new Promise((r) => setTimeout(r, 50));
+      await until(() => bResponses.length === 1);
       expect(bResponses).toHaveLength(1);
       const bInit = bResponses[0] as { result: { instructions?: string } };
       // Second session: instructions came from the daemon's CachedInit replay,
@@ -290,7 +289,6 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
         args: [],
         resolvedEnv: {},
         cwd: "",
-        sharing: "auto" as const,
         clientInfo: { name: "test-bridge", version: "0.0.0" },
         clientCapabilities: {},
         protocolVersion: "2025-06-18",
@@ -298,6 +296,10 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
 
       await cA.connect();
       await cA.call("OPEN", { sessionId: "55555555-5555-5555-5555-555555555555", spec });
+      const aResponses: unknown[] = [];
+      cA.setNotificationHandler((notif) => {
+        if (notif.method === "RPC") aResponses.push((notif.params as { payload: unknown }).payload);
+      });
       cA.sendNotification("RPC", {
         sessionId: "55555555-5555-5555-5555-555555555555",
         payload: {
@@ -307,7 +309,7 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-A", version: "1" } },
         },
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await until(() => aResponses.length === 1);
 
       await cB.connect();
       await cB.call("OPEN", { sessionId: "66666666-6666-6666-6666-666666666666", spec });
@@ -324,7 +326,7 @@ describe.skipIf(isWindows)("ManagerDaemon — initialize short-circuit", () => {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-B", version: "1" } },
         },
       });
-      await new Promise((r) => setTimeout(r, 50));
+      await until(() => bResponses.length === 1);
       const bInit = bResponses[0] as { result: Record<string, unknown> };
       // Short-circuit reply must not carry an `instructions` key when upstream
       // didn't advertise one — keeps the wire format minimal.

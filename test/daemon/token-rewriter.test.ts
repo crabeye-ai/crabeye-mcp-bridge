@@ -117,7 +117,7 @@ describe("TokenRewriter (phase C opaque-int)", () => {
   );
 });
 
-describe("TokenRewriter — internal-id classifier (Phase D)", () => {
+describe("TokenRewriter — internal-id classifier", () => {
   it("classifies negative-id success responses as internal", () => {
     const rw = new TokenRewriter();
     const routing = rw.inboundFromChild({ jsonrpc: "2.0", id: -1, result: {} });

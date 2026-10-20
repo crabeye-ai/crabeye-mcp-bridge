@@ -13,19 +13,22 @@ vi.mock("../../src/daemon/bootstrap.js", async (importOriginal) => {
 });
 
 const { DaemonStdioClient } = await import("../../src/upstream/daemon-stdio-client.js");
+const { spyLogger } = await import("../_helpers/spy-logger.js");
 
 describe("DaemonStdioClient default daemon ensure", () => {
-  it("forwards a fresh-attempt request from the respawn path", async () => {
+  it("forwards a fresh-attempt request from the respawn path, with the client's logger", async () => {
+    const logger = spyLogger();
     const client = new DaemonStdioClient({
       name: "notes",
       config: { command: "node", args: ["server.js"] } as never,
       resolvedEnv: {},
       _socketPath: "/tmp/cbe-ensure.sock",
+      logger,
     });
     const ensure = (client as unknown as { _ensureDaemon: (o?: object) => Promise<void> })._ensureDaemon;
 
     await ensure({ freshAttempt: true });
 
-    expect(ensureCalls).toEqual([{ socketPath: "/tmp/cbe-ensure.sock", freshAttempt: true }]);
+    expect(ensureCalls).toEqual([{ socketPath: "/tmp/cbe-ensure.sock", logger, freshAttempt: true }]);
   });
 });

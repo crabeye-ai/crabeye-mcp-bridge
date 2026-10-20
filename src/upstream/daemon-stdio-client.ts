@@ -13,6 +13,8 @@ import {
   DAEMON_CONNECTION_CLOSED,
   DAEMON_REJECTED,
   ERROR_CODE_SESSION_IN_USE,
+  PROTOCOL_VERSION,
+  SHARING_FOR_OLDER_DAEMONS,
   type DaemonNotification,
   type EnsureAttemptOptions,
 } from "../daemon/index.js";
@@ -60,8 +62,8 @@ export interface DaemonStdioClientOptions extends BaseUpstreamClientOptions {
  * notifications in both directions for MCP JSON-RPC traffic, `CLOSE` on
  * teardown.
  *
- * Phase B: one socket connection per upstream session. Phase C will keep the
- * same shape; the daemon dedupes identical specs to a single child internally.
+ * One socket connection per upstream session; the daemon shares one child
+ * between every session whose spec has the same upstream hash.
  */
 export class DaemonStdioClient extends BaseUpstreamClient {
   private readonly _config: StdioServerConfig;
@@ -85,7 +87,7 @@ export class DaemonStdioClient extends BaseUpstreamClient {
     this._socketPath = options._socketPath ?? getDaemonSocketPath();
     this._ensureDaemon =
       options._ensureDaemon ??
-      ((opts) => ensureDaemonRunning({ socketPath: this._socketPath, ...opts }));
+      ((opts) => ensureDaemonRunning({ socketPath: this._socketPath, logger: this._logger, ...opts }));
     this._rpcTimeoutMs = options.rpcTimeoutMs ?? 30_000;
     this._heartbeatMs = options.heartbeatMs ?? 5_000;
     this._respawnLockWaitMs = options.respawnLockWaitMs ?? 60_000;
@@ -106,7 +108,6 @@ export class DaemonStdioClient extends BaseUpstreamClient {
       args: this._config.args ?? [],
       resolvedEnv: this._currentEnv,
       cwd: this._config.cwd ?? "",
-      sharing: this._config._bridge?.sharing ?? "auto",
       socketPath: this._socketPath,
       ...daemonFilesFor(this._socketPath),
       ensureDaemon: this._ensureDaemon,
@@ -124,7 +125,6 @@ interface DaemonStdioTransportOpts {
   args: string[];
   resolvedEnv: Record<string, string>;
   cwd: string;
-  sharing: "auto" | "shared" | "dedicated";
   socketPath: string;
   /** Daemon lockfile path. Required for force-respawn. */
   lockPath: string;
@@ -290,13 +290,14 @@ class DaemonStdioTransport implements Transport, ClassifiedAsStdioByEraProbe {
   private async _sendOpen(): Promise<void> {
     await this.supervisor.call("OPEN", {
       sessionId: this._daemonSessionId,
+      bridgeProtocolVersion: PROTOCOL_VERSION,
       spec: {
         serverName: this.opts.serverName,
         command: this.opts.command,
         args: this.opts.args,
         resolvedEnv: this.opts.resolvedEnv,
         cwd: this.opts.cwd,
-        sharing: this.opts.sharing,
+        sharing: SHARING_FOR_OLDER_DAEMONS,
         clientInfo: upstreamClientInfo(this.opts.serverName),
         // The bridge currently advertises no client-side MCP features (no
         // sampling, roots, or elicitation handlers), so we ship `{}`.

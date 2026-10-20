@@ -7,7 +7,8 @@
 
 import { setTimeout as delay } from "node:timers/promises";
 import { EventEmitter } from "node:events";
-import { ensureDaemonRunning, isDaemonReachable, type EnsureAttemptOptions } from "./bootstrap.js";
+import { daemonStatus, ensureDaemonRunning, isDaemonReachable, type EnsureAttemptOptions } from "./bootstrap.js";
+import { daemonFit } from "./daemon-version.js";
 import { DaemonClient, DaemonRpcError } from "./client.js";
 import { acquireLock, LockBusyError, type LockHandle } from "./lockfile.js";
 import { readPidFile, terminateDaemon } from "./daemon-process.js";
@@ -212,7 +213,8 @@ export class DaemonLivenessSupervisor extends EventEmitter {
   /**
    * When the connection dropped but a daemon still answers on the socket (an
    * orphaned daemon stepped down for its successor), reconnect without
-   * touching the lock. Otherwise respawn lock-first: try
+   * touching the lock, ensuring first if this bridge can't use that daemon
+   * as is. Otherwise respawn lock-first: try
    * `acquireLock({ stealStale: true })`; if the previous daemon's lockholder
    * pid is dead the steal succeeds and no kill is needed. When the lock is
    * held by a live pid, SIGKILL only the daemon this supervisor was connected
@@ -222,7 +224,10 @@ export class DaemonLivenessSupervisor extends EventEmitter {
    */
   private async forceRespawn(reason: LivenessFailureKind): Promise<void> {
     try {
-      if (reason === "socket_close" && (await isDaemonReachable(this.opts.socketPath))) {
+      const answering = reason === "socket_close" ? await daemonStatus(this.opts.socketPath) : null;
+      if (answering !== null) {
+        if (daemonFit(answering) !== "current") await this.ensure({ freshAttempt: true });
+        if (this.closed) return;
         await this.reconnect(reason);
         return;
       }
@@ -237,16 +242,17 @@ export class DaemonLivenessSupervisor extends EventEmitter {
       }
       await handle?.release();
       if (this.closed) return;
-      const ensure =
-        this.opts._ensureDaemonRunning ??
-        ((opts) => ensureDaemonRunning({ socketPath: this.opts.socketPath, ...opts }));
-      await ensure({ freshAttempt: true });
+      await this.ensure({ freshAttempt: true });
       if (this.closed) return;
       this.daemonRespawns++;
       await this.reconnect(reason);
     } catch (err) {
       this.emit("respawnFailed", err);
     }
+  }
+
+  private ensure(opts: EnsureAttemptOptions): Promise<void> {
+    return this.opts._ensureDaemonRunning?.(opts) ?? ensureDaemonRunning({ socketPath: this.opts.socketPath, ...opts });
   }
 
   private async reconnect(reason: LivenessFailureKind): Promise<void> {

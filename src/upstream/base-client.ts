@@ -1,4 +1,4 @@
-import { Client } from "@modelcontextprotocol/client";
+import { Client, MissingRequiredClientCapabilityError, SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import type {
   Transport,
   Tool,
@@ -8,7 +8,7 @@ import type {
 } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { Logger } from "../logging/index.js";
-import { createNoopLogger } from "../logging/index.js";
+import { createNoopLogger, methodLabel } from "../logging/index.js";
 import type {
   UpstreamClient,
   ConnectionStatus,
@@ -19,6 +19,12 @@ import type {
 
 const PROBE_TIMEOUT_MS = 10_000;
 const STABLE_CONNECTION_MS = 60_000;
+const CLIENT_INPUT_CAPABILITY_BY_METHOD = new Map([
+  ["elicitation/create", "elicitation"],
+  ["sampling/createMessage", "sampling"],
+  ["roots/list", "roots"],
+]);
+const CLIENT_INPUT_CAPABILITIES = new Set(CLIENT_INPUT_CAPABILITY_BY_METHOD.values());
 
 export function upstreamClientInfo(serverName: string): Implementation {
   return { name: `${APP_NAME}/${serverName}`, version: APP_VERSION };
@@ -216,7 +222,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       return (await client.callTool(params, options)) as CallToolResult;
     } catch (err) {
       this._pauseIfAuthFailure(client, err);
-      throw err;
+      throw unsupportedInputRequest(err) ?? err;
     }
   }
 
@@ -421,4 +427,23 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._reconnectTimer = undefined;
     }
   }
+}
+
+function unsupportedInputRequest(err: unknown): Error | null {
+  const requested = requestedClientInput(err);
+  if (requested.length === 0) return null;
+  const names = requested.map((name) => `"${name}"`).join(", ");
+  return new Error(`asked the client for input (${names}), which ${APP_NAME} doesn't support`);
+}
+
+function requestedClientInput(err: unknown): string[] {
+  if (err instanceof MissingRequiredClientCapabilityError) {
+    const required = Object.keys(err.requiredCapabilities ?? {});
+    return required.length > 0 && required.every((name) => CLIENT_INPUT_CAPABILITIES.has(name)) ? required : [];
+  }
+  if (err instanceof SdkError && err.code === SdkErrorCode.CapabilityNotSupported) {
+    const method = (err.data as { method?: unknown } | undefined)?.method;
+    return typeof method === "string" ? [CLIENT_INPUT_CAPABILITY_BY_METHOD.get(method) ?? methodLabel(method)] : [];
+  }
+  return [];
 }

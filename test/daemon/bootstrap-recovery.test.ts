@@ -4,12 +4,14 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonUnreachableError, DaemonUnresponsiveError, ensureDaemonRunning } from "../../src/daemon/bootstrap.js";
+import type { DaemonLauncher, LaunchOutcome } from "../../src/daemon/daemon-launch.js";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
 import { waitForExit } from "../../src/daemon/daemon-process.js";
 import { processExists } from "../../src/process/process-utils.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
-import { BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR, DEFAULT_KILL_GRACE_MS } from "../../src/constants.js";
+import { APP_VERSION, BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR, DEFAULT_KILL_GRACE_MS } from "../../src/constants.js";
 import { until } from "../_helpers/daemon-fixtures.js";
+import { countingLauncher } from "../_helpers/launchers.js";
 
 const WAIT_MS = 2_500;
 const DAEMON_ARGS = [...DAEMON_LAUNCH_ARGS];
@@ -72,7 +74,9 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
         decoder.push(chunk);
         for (let frame = decoder.next(); frame !== null; frame = decoder.next()) {
           const request = frame as { id?: string; method?: string };
-          if (request.method === "STATUS") sock.write(encodeFrame({ id: request.id, result: { pid: process.pid } }));
+          if (request.method === "STATUS") {
+            sock.write(encodeFrame({ id: request.id, result: { pid: process.pid, appVersion: APP_VERSION } }));
+          }
         }
       });
     });
@@ -86,9 +90,10 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
   }
 
   function launchReplacement(log: Launch[], wedged?: ChildProcess) {
-    return () => {
+    return async (): Promise<LaunchOutcome> => {
       log.push({ at: Date.now(), wedgedAlive: wedged?.pid !== undefined && processExists(wedged.pid) });
       void replaceWithAnsweringServer();
+      return "launched";
     };
   }
 
@@ -304,10 +309,11 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
     const wedged = await startWedgedDaemon();
     await lockHeldBy(wedged.pid!);
     let launches = 0;
-    const launchAnotherWedged = () => {
+    const launchAnotherWedged: DaemonLauncher = async () => {
       launches++;
       const replacement = spawnTracked(["-e", IDLE, ...DAEMON_ARGS]);
       void writeFile(lockPath, `${replacement.pid}\nreplacement\n`);
+      return "launched";
     };
 
     await expect(
@@ -317,12 +323,10 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning with a wedged
   });
 
   it("reports a launched daemon that never comes up after a single launch", async () => {
-    let launches = 0;
+    const { launch, calls } = countingLauncher();
 
-    await expect(
-      ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 1_000, launch: () => launches++ }),
-    ).rejects.toBeInstanceOf(DaemonUnreachableError);
-    expect(launches).toBe(1);
+    await expect(ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 1_000, launch })).rejects.toBeInstanceOf(DaemonUnreachableError);
+    expect(calls).toHaveLength(1);
   });
 
   it("does not launch while another live bridge is mid-recovery, then launches once it is done", async () => {

@@ -3,7 +3,6 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { createConnection } from "node:net";
 import { ManagerDaemon } from "../../src/daemon/manager.js";
-import { DaemonClient } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
 
@@ -20,7 +19,7 @@ async function tempPaths() {
   };
 }
 
-describe.skipIf(isWindows)("OPEN params — Phase D fields", () => {
+describe.skipIf(isWindows)("OPEN params", () => {
   let paths: Awaited<ReturnType<typeof tempPaths>>;
   let manager: ManagerDaemon | null = null;
 
@@ -55,68 +54,6 @@ describe.skipIf(isWindows)("OPEN params — Phase D fields", () => {
     });
   }
 
-  it("rejects OPEN missing sharing field", async () => {
-    manager = freshManager();
-    await manager.start();
-    const c = new DaemonClient({
-      socketPath: paths.sock,
-      transport: netTransport,
-      rpcTimeoutMs: 1_000,
-      connectTimeoutMs: 1_000,
-    });
-    try {
-      await expect(
-        c.call("OPEN", {
-          sessionId: "11111111-1111-1111-1111-111111111111",
-          spec: {
-            serverName: "x",
-            command: "node",
-            args: [],
-            resolvedEnv: {},
-            cwd: "",
-            // sharing missing
-            clientInfo: { name: "b", version: "1" },
-            clientCapabilities: {},
-            protocolVersion: "2025-06-18",
-          },
-        }),
-      ).rejects.toMatchObject({ code: "invalid_params" });
-    } finally {
-      c.close();
-    }
-  });
-
-  it("rejects OPEN with bogus sharing value", async () => {
-    manager = freshManager();
-    await manager.start();
-    const c = new DaemonClient({
-      socketPath: paths.sock,
-      transport: netTransport,
-      rpcTimeoutMs: 1_000,
-      connectTimeoutMs: 1_000,
-    });
-    try {
-      await expect(
-        c.call("OPEN", {
-          sessionId: "11111111-1111-1111-1111-111111111111",
-          spec: {
-            serverName: "x",
-            command: "node",
-            args: [],
-            resolvedEnv: {},
-            cwd: "",
-            sharing: "bogus",
-            clientInfo: { name: "b", version: "1" },
-            clientCapabilities: {},
-            protocolVersion: "2025-06-18",
-          },
-        }),
-      ).rejects.toMatchObject({ code: "invalid_params" });
-    } finally {
-      c.close();
-    }
-  });
-
   it("rejects OPEN with clientCapabilities exceeding 64KB", async () => {
     manager = freshManager();
     await manager.start();
@@ -137,7 +74,6 @@ describe.skipIf(isWindows)("OPEN params — Phase D fields", () => {
           args: [],
           resolvedEnv: {},
           cwd: "",
-          sharing: "auto",
           clientInfo: { name: "b", version: "1" },
           clientCapabilities: { huge: big },
           protocolVersion: "2025-06-18",

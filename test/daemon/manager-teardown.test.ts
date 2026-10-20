@@ -231,7 +231,7 @@ describe.skipIf(isWindows)("ManagerDaemon child teardown", { timeout: 30_000 }, 
         return child;
       },
     });
-    await Promise.all([open(f, ["ignore-sigterm"]), open(f, ["ignore-sigterm"]), open(f, ["ignore-sigterm"])]);
+    await Promise.all(["a", "b", "c"].map((label) => open(f, ["ignore-sigterm", label])));
 
     await f.manager.stop(0);
 

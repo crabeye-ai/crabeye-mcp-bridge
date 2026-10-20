@@ -1,3 +1,8 @@
+import { escapeControlCharacters } from "./escape.js";
+
+export { escapeControlCharacters } from "./escape.js";
+export { escapeLabel, methodLabel } from "./labels.js";
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface Logger {
@@ -28,19 +33,6 @@ function pad(n: number, width: number): string {
 function formatTime(): string {
   const d = new Date();
   return `${pad(d.getHours(), 2)}:${pad(d.getMinutes(), 2)}:${pad(d.getSeconds(), 2)}.${pad(d.getMilliseconds(), 3)}`;
-}
-
-const CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
-const NAMED_ESCAPES: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
-
-function hexEscape(code: number): string {
-  return code > 0xff
-    ? `\\u${code.toString(16).padStart(4, "0")}`
-    : `\\x${code.toString(16).padStart(2, "0")}`;
-}
-
-export function escapeControlCharacters(text: string): string {
-  return text.replace(CONTROL_CHARACTERS, (char) => NAMED_ESCAPES[char] ?? hexEscape(char.charCodeAt(0)));
 }
 
 function renderValue(value: unknown): string {

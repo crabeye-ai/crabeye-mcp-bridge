@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -39,6 +43,17 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+
+  test-windows-daemon-launch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run test/daemon/daemon-launch.test.ts
 
   build:
     runs-on: ubuntu-latest

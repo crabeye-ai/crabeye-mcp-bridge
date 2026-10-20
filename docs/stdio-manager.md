@@ -14,31 +14,13 @@ The manager collapses this: it owns the STDIO subprocesses and multiplexes sessi
 
 ![Manager-shared topology: every bridge connects to a single per-user manager process over UDS / named pipe; the manager owns one shared subprocess per unique upstream spec across all bridges.](img/topology-daemon-shared.png)
 
-## How sharing is decided
+## How sharing works
 
-Each upstream is identified by an **`upstreamHash`** — a SHA-256 of the canonical form of `(serverName, command, args, resolvedEnv, cwd)`. Two bridges with the same hash share a child; different credentials → different hash → different child.
+Each upstream is identified by an **`upstreamHash`** — a SHA-256 of the canonical form of `(command, args, resolvedEnv, cwd)`. Every bridge whose upstream has the same hash shares one child; different credentials → different hash → different child. The server's name in your config doesn't count, so two entries with different names but the same command, arguments, environment and working directory share a child.
 
-Per-upstream `_bridge.sharing` setting controls behavior:
+`_bridge.sharing` and the `_bridge.daemon` auto-fork settings no longer exist; the bridge ignores them and logs a warning when a config still sets them.
 
-| Value | Meaning |
-|-------|---------|
-| `auto` (default) | Share when safe. If the upstream issues a server→client request the manager can't fan out (sampling, elicitation, roots, unknown), the hash is marked non-shareable and each session falls back to a dedicated child. |
-| `shared` | Always share children with the same hash, regardless of server→client requests. |
-| `dedicated` | Always spawn a fresh child per session, never share. |
-
-```json
-{
-  "upstreamMcpServers": {
-    "linear": {
-      "command": "npx",
-      "args": ["-y", "@anthropic/linear-mcp-server"],
-      "_bridge": {
-        "sharing": "auto"
-      }
-    }
-  }
-}
-```
+A shared child serves all of its bridges at once. A server that keeps state in memory, such as a browser it opened, shares that state with every assistant using it. To keep two copies of a server apart, give them different `env` or `args`.
 
 The bridge dedupes config entries by `upstreamHash` locally — duplicate identical entries collapse to one session before reaching the manager.
 
@@ -51,9 +33,9 @@ The first bridge session against a child runs a real `initialize` round-trip. Th
 The manager is started automatically on first bridge connect. The `daemon` subcommand exists for manual control:
 
 ```bash
-crabeye-mcp-bridge daemon start      # spawn the manager (no-op if already running)
+crabeye-mcp-bridge daemon start      # spawn the manager (no-op if one it doesn't need to replace is running)
 crabeye-mcp-bridge daemon stop       # graceful shutdown; stops an unresponsive manager too
-crabeye-mcp-bridge daemon status     # uptime, children, sessions, telemetry
+crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, and requests from upstreams it refused
 crabeye-mcp-bridge daemon restart    # stop + start
 ```
 
@@ -126,17 +108,21 @@ The manager broadcasts certain upstream notifications across every session shari
 | `notifications/progress`, `notifications/cancelled` | Routed to the originating session via rewritten progress/request tokens. | Yes. |
 | `notifications/message` (logging) | Broadcast to every attached session. | Yes. |
 
-## Auto-fork
+## Requests from upstream servers
 
-If an upstream issues a server→client *request* the manager cannot fan out (e.g. `sampling/createMessage`, `elicitation/create`, `roots/list`, or any unknown method), the manager:
+An upstream can send requests to its client: to ask the user something (elicitation), to have the assistant's model write something (sampling), or to list the client's roots. The bridge supports none of these, so the manager answers them itself. A `ping` gets a normal reply; anything else gets an error saying the bridge doesn't support it. The child keeps serving every bridge attached to it. `daemon status` counts the refused requests by method under `refusedUpstreamRequests`, so you can see when a server asked for something the bridge can't provide.
 
-1. Marks the `upstreamHash` non-shareable.
-2. Spawns a dedicated child per attached session.
-3. Replays cached `initialize` and per-session `resources/subscribe` against each new child.
-4. Drains the old child cleanly: pending requests get a chance to complete (bounded by `autoForkDrainTimeoutMs`); pending non-idempotent requests surface a typed error.
-5. Routes the triggering request to the originating session only.
+When an upstream answers a tool call by asking for client input, the call fails with an error naming the upstream and saying the bridge doesn't support requests for client input.
 
-After auto-fork, future `auto`-mode OPENs for that hash spawn fresh dedicated children — the hash is "tainted" for the manager's lifetime.
+## After upgrading crabeye
+
+A manager started by an older crabeye version keeps running after an upgrade for as long as a bridge uses it. When a bridge from the new version finds one, it stops it and starts a manager of its own version in its place. Bridges still using the old manager reconnect to the new one on their own; calls they had in flight fail once. A bridge from crabeye 1.3.0 or earlier sometimes waits up to its `_bridge.daemon.respawnLockWaitMs` setting (one minute by default) before it reconnects. A manager of the same or a newer version is used as is. A bridge from a pre-release version (such as `2.1.0-beta.1`) only replaces an older pre-release manager, never a release one or one that reports no version, unless that manager is too old for the bridge to talk to.
+
+A bridge tries this once. A client that was started before the upgrade and runs the old version from its own install (for example a cached `npx` copy) can start the old manager again whenever it loses its connection. When a new bridge ends up on an old manager that way, or could not replace it, it logs a warning once for that manager; bridges use whichever manager is running until those clients restart.
+
+If a newer manager no longer accepts bridges as old as this one, the bridge's STDIO servers fail to start with an error saying so. Upgrading crabeye fixes it. The same happens when a manager is too old for the bridge to talk to and can't be replaced; `crabeye-mcp-bridge daemon stop` fixes that.
+
+`crabeye-mcp-bridge daemon start` replaces an older manager the same way. It exits with an error if an older one is still running afterwards, or if the running manager no longer accepts this bridge or is too old for the bridge to talk to.
 
 ## Telemetry
 
@@ -146,7 +132,8 @@ The manager's `STATUS` RPC returns a `telemetry` object alongside the existing `
 {
   "uptime": 1234567,
   "pid": 8412,
-  "version": 1,
+  "version": 2,
+  "appVersion": "2.0.0",                 // crabeye version of this manager
   "children": [ /* ... */ ],
   "sessions": [ /* ... */ ],
   "telemetry": {
@@ -155,7 +142,7 @@ The manager's `STATUS` RPC returns a `telemetry` object alongside the existing `
       "spawnedTotal": 12,                // counter: spawns since manager start
       "killedTotal": {
         "grace": 7, "restart": 2,
-        "fork": 0, "crash": 0, "wedged": 0
+        "crash": 0, "wedged": 0
       }
     },
     "sessions": {
@@ -163,10 +150,12 @@ The manager's `STATUS` RPC returns a `telemetry` object alongside the existing `
       "openedTotal": 24,
       "closedTotal": 19
     },
-    "fork": { "eventsTotal": 0 },        // upstreamHash non-shareable transitions
     "rpc": {
       "inFlight": 1,                     // gauge
       "errorsTotal": { "invalid_params": 3 }
+    },
+    "upstreamRequests": {
+      "refusedTotal": { "sampling/createMessage": 2 }  // requests from upstreams the manager refused, by method
     }
   }
 }
@@ -178,7 +167,6 @@ All counters are **process-lifetime** — they reset to zero on manager respawn.
 
 * **`grace`** — refcount dropped to zero and the `graceMs` timer fired.
 * **`restart`** — admin `RESTART` RPC (CLI `daemon restart-upstream`).
-* **`fork`** — child killed during auto-fork dedicated-spawn migration.
 * **`crash`** — child exited on its own (any exit code, or a signal the manager did not send), or was killed for flooding its output without line breaks.
 * **`wedged`** — child stopped answering the manager's health pings and was killed.
 

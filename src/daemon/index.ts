@@ -6,7 +6,9 @@ export {
   encodeFrame,
   FrameDecoder,
   FrameError,
+  MIN_BRIDGE_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  SHARING_FOR_OLDER_DAEMONS,
 } from "./protocol.js";
 export type {
   DaemonRequest,
@@ -22,6 +24,7 @@ export type {
   StatusChild,
   StatusSession,
   StatusResult,
+  DaemonStatus,
 } from "./protocol.js";
 export {
   isNotification,
@@ -38,12 +41,9 @@ export {
   ERROR_CODE_TOO_MANY_CONNECTIONS,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
-  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
   ERROR_CODE_UPSTREAM_RESTARTED,
   INNER_ERROR_CODE_BACKPRESSURE,
   INNER_ERROR_CODE_SESSION_CLOSED,
-  INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
-  INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
 } from "./protocol.js";
 export type {
@@ -65,7 +65,7 @@ export {
   getDaemonSocketPath,
   getDaemonPidPath,
   getDaemonLockPath,
-  getProcessTrackerPath,
+  processTrackerPathFor,
 } from "./paths.js";
 export {
   ProcessTracker,
@@ -76,12 +76,21 @@ export {
 export { acquireLock, LockBusyError } from "./lockfile.js";
 export type { LockHandle } from "./lockfile.js";
 export { netTransport } from "./net-transport.js";
+export { daemonFit, daemonVersionLabel, olderDaemonStillRunning, reportedDaemonPid, UNKNOWN_DAEMON_VERSION } from "./daemon-version.js";
 export {
+  AWAIT_PREDECESSOR_FLAG,
+  MAX_AWAIT_PREDECESSOR_MS,
+  reportToLauncher,
+  resolveEntryScript,
+} from "./daemon-launch.js";
+export {
+  DaemonRefusesBridgeError,
+  DaemonTooOldError,
   DaemonUnreachableError,
   DaemonUnresponsiveError,
+  daemonStatus,
   ensureDaemonRunning,
   isDaemonReachable,
-  resolveEntryScript,
   type EnsureAttemptOptions,
   type UnresponsiveReason,
 } from "./bootstrap.js";

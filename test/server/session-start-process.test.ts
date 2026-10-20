@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { daemonPidsRunning, exited, waitUntil } from "../_helpers/processes.js";
 import { startHeaderRecordingUpstream, type HeaderRecordingUpstream } from "../_helpers/header-recording-upstream.js";
+import { STUB_STDIO_SERVER } from "../_helpers/stub-stdio-server.js";
 
 const isWindows = process.platform === "win32";
 const META = {
@@ -22,24 +23,6 @@ const RUN_PLAIN = {
   method: "tools/call",
   params: { _meta: META, name: "run_tool", arguments: { name: "rec__plain", arguments: {} } },
 };
-const STUB_STDIO_SERVER = `
-const rl = require("node:readline").createInterface({ input: process.stdin });
-const reply = (id, body) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, ...body }) + "\\n");
-rl.on("line", (line) => {
-  const msg = JSON.parse(line);
-  if (msg.id === undefined || msg.method === undefined) return;
-  if (msg.method === "initialize") {
-    reply(msg.id, { result: { protocolVersion: msg.params.protocolVersion, serverInfo: { name: "stub", version: "0" }, capabilities: { tools: {} } } });
-  } else if (msg.method === "tools/list") {
-    reply(msg.id, { result: { tools: [{ name: "plain", inputSchema: { type: "object" } }] } });
-  } else if (msg.method === "tools/call") {
-    reply(msg.id, { result: { content: [{ type: "text", text: "called " + msg.params.name }] } });
-  } else {
-    reply(msg.id, { error: { code: -32601, message: "Method not found" } });
-  }
-});
-`;
-
 describe.skipIf(isWindows)("bridge process: upstream connections wait for the client's session", () => {
   let cliScript: string;
   let dir: string;

@@ -3,8 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { describeProcess, isSameProcess, terminateDaemon, waitForExit } from "../../src/daemon/daemon-process.js";
 import { parsePid, processExists } from "../../src/process/process-utils.js";
 
-const IGNORES_SIGTERM = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1e6);`;
-const EXITS_ON_SIGTERM = `process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1e6);`;
+const IGNORES_SIGTERM = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1e6); process.stdout.write("ready");`;
+const EXITS_ON_SIGTERM = `process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1e6); process.stdout.write("ready");`;
 
 describe.skipIf(process.platform === "win32")("daemon process helpers", () => {
   const children: ChildProcess[] = [];
@@ -15,10 +15,10 @@ describe.skipIf(process.platform === "win32")("daemon process helpers", () => {
 
   async function start(script: string, asDaemon: boolean): Promise<number> {
     const child = spawn(process.execPath, ["-e", script, ...(asDaemon ? ["daemon", "--internal-launch"] : [])], {
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "ignore"],
     });
     children.push(child);
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((resolve) => child.stdout!.once("data", resolve));
     return child.pid!;
   }
 

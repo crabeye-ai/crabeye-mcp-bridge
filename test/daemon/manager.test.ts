@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { ManagerDaemon, LockBusyError } from "../../src/daemon/manager.js";
 import { DAEMON_REJECTED, DaemonClient, DaemonRpcError } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
+import { DAEMON_DIR, DAEMON_RUN_SUBDIR, PROCESS_TRACKER_FILENAME } from "../../src/constants.js";
 
 // macOS UDS sun_path is 104 bytes. Tests under $TMPDIR overflow that, so we
 // stage sockets directly in /tmp where the path is short.
@@ -37,6 +38,31 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
       });
     }
     await rm(paths.dir, { recursive: true, force: true });
+  });
+
+  it("keeps its process tracker next to its lock file, leaving the one in HOME alone", async () => {
+    const home = await mkdtemp("/tmp/cbe-mgr-home-");
+    const homeTracker = join(home, DAEMON_DIR, DAEMON_RUN_SUBDIR, PROCESS_TRACKER_FILENAME);
+    await mkdir(join(home, DAEMON_DIR, DAEMON_RUN_SUBDIR), { recursive: true });
+    const tracked = JSON.stringify({ processes: [{ pid: process.pid, server: "real", startTime: "x", command: "y" }] });
+    await writeFile(homeTracker, tracked);
+    vi.stubEnv("HOME", home);
+    try {
+      manager = new ManagerDaemon({
+        socketPath: paths.sock,
+        pidPath: paths.pid,
+        lockPath: paths.lock,
+        idleMs: 60_000,
+        transport: netTransport,
+      });
+      await manager.start();
+
+      expect(await readFile(homeTracker, "utf-8")).toBe(tracked);
+      expect(JSON.parse(await readFile(join(paths.dir, PROCESS_TRACKER_FILENAME), "utf-8"))).toEqual({ processes: [] });
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it("STATUS returns version, pid, and empty children/sessions", async () => {

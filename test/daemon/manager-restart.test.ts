@@ -4,6 +4,7 @@ import {
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   type RestartParams,
   type RestartResult,
+  type StatusResult,
 } from "../../src/daemon/protocol.js";
 
 const isWindows = process.platform === "win32";
@@ -34,9 +35,26 @@ describe.skipIf(isWindows)("ManagerDaemon — RESTART handler", () => {
     // Telemetry: admin RESTART increments killedTotal.restart.
     expect(after.telemetry.children.killedTotal.restart).toBe(1);
     expect(after.telemetry.children.killedTotal.grace).toBe(0);
-    expect(after.telemetry.children.killedTotal.fork).toBe(0);
     expect(after.telemetry.children.killedTotal.crash).toBe(0);
     await session.close();
+  });
+
+  it("evicts only the sessions on the restarted child, leaving another server's session attached", async () => {
+    const restarted = await OpenSessionFixture.open(fx, { args: ["-e", "process.stdin.on('data', () => {})", "a"] });
+    const untouched = await OpenSessionFixture.open(fx, { args: ["-e", "process.stdin.on('data', () => {})", "b"] });
+    const before = (await fx.client.call("STATUS")) as StatusResult;
+    const hash = before.children.find((child) => child.sessions.includes(restarted.sessionId))!.upstreamHash;
+
+    await fx.client.call("RESTART", { upstreamHash: hash });
+
+    const after = (await fx.client.call("STATUS")) as StatusResult;
+    expect(after.sessions.map((s) => s.sessionId)).toEqual([untouched.sessionId]);
+    expect(after.children.map((child) => child.sessions)).toEqual([[untouched.sessionId]]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(untouched.evictions).toEqual([]);
+    expect(restarted.evictions).toEqual([expect.objectContaining({ reason: "upstream_restarted" })]);
+    await restarted.close();
+    await untouched.close();
   });
 
   it("returns ok with killed=0 for an unknown hash", async () => {

@@ -9,7 +9,6 @@ import {
   GlobalBridgeConfigSchema,
   isHttpServer,
   isStdioServer,
-  findRemovedReconnectLimit,
   resolveUpstreams,
   type ServerConfig,
   type BridgeConfig,
@@ -146,8 +145,6 @@ describe("schema validation", () => {
           idleMs: 60000,
           graceMs: 60000,
           killGraceMs: 2000,
-          autoForkDrainTimeoutMs: 60000,
-          autoForkInitializeTimeoutMs: 10000,
           rpcTimeoutMs: 30000,
           heartbeatMs: 5000,
           respawnLockWaitMs: 60000,
@@ -351,26 +348,6 @@ describe("invalid configs", () => {
     if (result.success) {
       expect(result.data._bridge.reconnect?.reconnectMaxDelay).toBe(120000);
     }
-  });
-
-  it("still loads a config that sets the removed maxReconnectAttempts, and reports where", () => {
-    const input = {
-      mcpServers: {
-        s: { command: "node", _bridge: { reconnect: { maxReconnectAttempts: 5 } } },
-        t: { command: "node" },
-      },
-      _bridge: { reconnect: { maxReconnectAttempts: -1 } },
-    };
-    const result = BridgeConfigSchema.safeParse(input);
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(findRemovedReconnectLimit(result.data)).toEqual(["_bridge", 'server "s"']);
-    }
-  });
-
-  it("reports nothing when no config sets maxReconnectAttempts", () => {
-    const result = BridgeConfigSchema.parse({ mcpServers: { s: { command: "node" } } });
-    expect(findRemovedReconnectLimit(result)).toEqual([]);
   });
 
   it.each([

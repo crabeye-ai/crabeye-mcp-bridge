@@ -133,7 +133,7 @@ export const ServerBridgeConfigSchema = z
     category: z.string().optional(),
     rateLimit: RateLimitConfigOrDisabledSchema.optional(),
     reconnect: ReconnectConfigSchema.optional(),
-    sharing: z.enum(["auto", "shared", "dedicated"]).optional(),
+    sharing: z.unknown().optional(),
     passthrough: PassthroughLevelSchema.optional(),
     /**
      * Per-server byte cap on the rendered passthrough block. Bounded at 1
@@ -210,8 +210,8 @@ export const DaemonConfigSchema = z
     graceMs: z.number().int().nonnegative().default(60_000),
     /** SIGTERM→SIGKILL window once kill is dispatched. */
     killGraceMs: z.number().int().nonnegative().default(DEFAULT_KILL_GRACE_MS),
-    autoForkDrainTimeoutMs: z.number().int().nonnegative().default(60_000),
-    autoForkInitializeTimeoutMs: z.number().int().nonnegative().default(10_000),
+    autoForkDrainTimeoutMs: z.unknown().optional(),
+    autoForkInitializeTimeoutMs: z.unknown().optional(),
     /** Per-RPC timeout the bridge applies to outbound daemon calls. Was hardcoded 10000 in DaemonStdioTransport. */
     rpcTimeoutMs: z.number().int().positive().default(30_000),
     /** Bridge sends `PING` on this cadence. Missed `PONG` for `heartbeatMs * 3` triggers a liveness failure. */
@@ -351,12 +351,4 @@ export function isStdioServer(
   config: ServerConfig,
 ): config is StdioServerConfig {
   return "command" in config;
-}
-
-export function findRemovedReconnectLimit(config: BridgeConfig): string[] {
-  const locations = Object.entries(resolveUpstreams(config))
-    .filter(([, server]) => server._bridge?.reconnect?.maxReconnectAttempts !== undefined)
-    .map(([name]) => `server "${name}"`);
-  if (config._bridge.reconnect?.maxReconnectAttempts !== undefined) locations.unshift("_bridge");
-  return locations;
 }

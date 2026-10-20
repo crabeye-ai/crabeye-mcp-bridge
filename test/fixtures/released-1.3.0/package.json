@@ -1,0 +1,7 @@
+{
+  "name": "released-crabeye-1.3.0-fixture",
+  "private": true,
+  "dependencies": {
+    "@crabeye-ai/crabeye-mcp-bridge": "1.3.0"
+  }
+}

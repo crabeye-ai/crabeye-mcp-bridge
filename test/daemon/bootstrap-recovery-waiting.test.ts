@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { countingLauncher } from "../_helpers/launchers.js";
 
 const identityReads = vi.hoisted(() => ({ count: 0 }));
 
@@ -44,9 +45,9 @@ describe.skipIf(process.platform === "win32")("a bridge waiting on another bridg
     children.push(wedged, otherBridge);
     await vi.waitFor(() => stat(socketPath), { timeout: 5_000 });
     await writeFile(lockPath, `${wedged.pid}\ntoken\n`);
-    let launches = 0;
+    const { launch, calls } = countingLauncher();
 
-    const attempt = ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 400, launch: () => launches++ });
+    const attempt = ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 400, launch });
     await vi.waitFor(() => expect(identityReads.count).toBeGreaterThan(0), { timeout: 10_000 });
     await writeFile(`${lockPath}.recover`, `${otherBridge.pid}\nrecovering\n`);
     await new Promise((r) => setTimeout(r, 2_500));
@@ -54,11 +55,11 @@ describe.skipIf(process.platform === "win32")("a bridge waiting on another bridg
     await new Promise((r) => setTimeout(r, 4_000));
 
     expect(identityReads.count).toBe(readsWhileWaiting);
-    expect(launches).toBe(0);
+    expect(calls).toHaveLength(0);
 
     wedged.kill("SIGKILL");
     await unlink(`${lockPath}.recover`);
     await expect(attempt).rejects.toBeInstanceOf(DaemonUnreachableError);
-    expect(launches).toBe(1);
+    expect(calls).toHaveLength(1);
   });
 });

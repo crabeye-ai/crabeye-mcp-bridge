@@ -140,7 +140,6 @@ describe.skipIf(isWindows)("e2e — two bridges share one daemon child", () => {
           args: [paths.stub],
           resolvedEnv: {},
           cwd: "",
-          sharing: "auto" as const,
           clientInfo: { name: "test-bridge", version: "0.0.0" },
           clientCapabilities: {},
           protocolVersion: "2025-06-18",

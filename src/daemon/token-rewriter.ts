@@ -147,7 +147,7 @@ export class TokenRewriter {
   inboundFromChild(payload: unknown): InboundRouting {
     if (!isJsonObject(payload)) return { sessionIds: [], payload, kind: "other" };
     const p = payload as Record<string, unknown>;
-    // Phase D: daemon-issued internal requests use negative ids.
+    // Daemon-issued internal requests use negative ids.
     // These never collide with the positive outerIds allocated for session→child traffic.
     if (
       typeof p.method !== "string" &&

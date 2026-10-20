@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { ensureDaemonRunning } from "../../../src/daemon/bootstrap.js";
 import { DAEMON_LAUNCH_ARGS } from "../../../src/daemon/daemon-identity.js";
+import type { DaemonLauncher } from "../../../src/daemon/daemon-launch.js";
 
 const [socketPath, cliScript, waitMs] = process.argv.slice(2);
 
 let launches = 0;
-const launch = () => {
+const launch: DaemonLauncher = async () => {
   launches++;
   const child = spawn(process.execPath, [cliScript!, ...DAEMON_LAUNCH_ARGS], {
     detached: true,
@@ -13,6 +14,7 @@ const launch = () => {
     env: process.env,
   });
   child.unref();
+  return "launched";
 };
 
 try {

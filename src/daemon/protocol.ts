@@ -8,12 +8,14 @@
  *   response:     { id, result | error }        reply to request
  *   notification: { method, params? }           no `id`, no reply expected
  *
- * The frame envelope is the same across phases B → C → D; phase B adds
- * notification frames so daemon and bridge can pipe MCP JSON-RPC messages
- * over `RPC` notifications without a per-message ack roundtrip.
+ * Notification frames let daemon and bridge pipe MCP JSON-RPC messages over
+ * `RPC` notifications without a per-message ack roundtrip.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+export const MIN_BRIDGE_PROTOCOL_VERSION = 1;
+export const MIN_DAEMON_PROTOCOL_VERSION = 1;
+export const UNREPORTED_BRIDGE_PROTOCOL_VERSION = 1;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
@@ -53,16 +55,19 @@ export interface DaemonResponse {
 
 export type DaemonFrame = DaemonRequest | DaemonResponse | DaemonNotification;
 
+export const SHARING_FOR_OLDER_DAEMONS = "shared";
+
 /** Spec passed in `OPEN.params`. `cwd` is empty-string when the bridge has none. */
 export interface OpenParams {
   sessionId: string;
+  bridgeProtocolVersion?: number;
   spec: {
     serverName: string;
     command: string;
     args: string[];
     resolvedEnv: Record<string, string>;
     cwd: string;
-    sharing: "auto" | "shared" | "dedicated";
+    sharing?: typeof SHARING_FOR_OLDER_DAEMONS;
     clientInfo: { name: string; version: string };
     clientCapabilities: Record<string, unknown>;
     protocolVersion: string;
@@ -92,7 +97,7 @@ export interface RpcNotificationParams {
 
 export interface SessionEvictedParams {
   sessionId: string;
-  reason: "auto_fork_initialize_failed" | "auto_fork_drain_timeout" | "child_exited" | "upstream_restarted";
+  reason: "child_exited" | "upstream_restarted";
 }
 
 export interface StatusChild {
@@ -102,9 +107,6 @@ export interface StatusChild {
   refcount: number;
   sessions: string[];
   subscriptionCount: number;
-  mode: "shared" | "dedicated";
-  sharing: "auto" | "shared" | "dedicated";
-  forked: boolean;
   cachedInit: { protocolVersion: string } | null;
 }
 
@@ -124,9 +126,18 @@ export interface StatusResult {
   uptime: number;
   pid: number;
   version: number;
+  minBridgeProtocolVersion: number;
+  appVersion: string;
   children: StatusChild[];
   sessions: StatusSession[];
   telemetry: _TelemetrySnapshot;
+}
+
+export interface DaemonStatus {
+  pid?: unknown;
+  version?: unknown;
+  appVersion?: unknown;
+  minBridgeProtocolVersion?: unknown;
 }
 
 // Typed error codes. Listed here so call sites and tests share the literal.
@@ -142,12 +153,11 @@ export const ERROR_CODE_SPAWN_FAILED = "spawn_failed";
 export const ERROR_CODE_INVALID_PARAMS = "invalid_params";
 export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
 export const ERROR_CODE_DAEMON_STOPPING = "daemon_stopping";
+export const ERROR_CODE_BRIDGE_UNSUPPORTED = "bridge_unsupported";
 /** Synthetic JSON-RPC error code emitted to inner requests when the session closes. */
 export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
 /** Synthetic JSON-RPC error code emitted when the per-child stdin queue overflows. */
 export const INNER_ERROR_CODE_BACKPRESSURE = -32001;
-/** Daemon-protocol-level error: failed to replay `initialize` against a forked child. */
-export const ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED = "auto_fork_initialize_failed";
 /** Daemon-protocol error: child was killed by an admin RESTART, or daemon was force-respawned. `data.reason` distinguishes the two. */
 export const ERROR_CODE_UPSTREAM_RESTARTED = "upstream_restarted";
 /** Inner JSON-RPC error: child was killed (admin RESTART or daemon respawn). MCP SDK requires numeric `code`; reason is carried in `data.reason`. */
@@ -174,10 +184,6 @@ export interface PingResult {
   seq: number;
   pid?: number;
 }
-/** Inner JSON-RPC error: drain window exceeded autoForkDrainTimeoutMs with old-child requests still pending. */
-export const INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT = -32002;
-/** Inner JSON-RPC error: per-session drain queue overflowed during fork. */
-export const INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE = -32003;
 
 const HEADER_BYTES = 4;
 

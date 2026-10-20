@@ -35,7 +35,7 @@ describe.skipIf(process.platform === "win32")("a bridge whose upstream is restar
     const f = (fx = await spawnTestManager({ manager: { childPingMs: 0 } }));
     const c = (client = new DaemonStdioClient({
       name: "local",
-      config: { command: process.execPath, args: [STUB], _bridge: { sharing: "dedicated" } } as never,
+      config: { command: process.execPath, args: [STUB] } as never,
       resolvedEnv: {},
       reconnectBaseDelay: 50,
       reconnectMaxDelay: 200,

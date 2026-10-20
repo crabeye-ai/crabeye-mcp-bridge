@@ -6,9 +6,10 @@
  * started_at gauge — uptime is sufficient signal).
  */
 
-export type KilledReason = "grace" | "restart" | "fork" | "crash" | "wedged";
+export type KilledReason = "grace" | "restart" | "crash" | "wedged";
 
 const RPC_ERROR_CODE_CAP = 64;
+const REFUSED_METHOD_CAP = 64;
 
 export interface TelemetrySnapshot {
   children: {
@@ -21,12 +22,12 @@ export interface TelemetrySnapshot {
     openedTotal: number;
     closedTotal: number;
   };
-  fork: {
-    eventsTotal: number;
-  };
   rpc: {
     inFlight: number;
     errorsTotal: Record<string, number>;
+  };
+  upstreamRequests: {
+    refusedTotal: Record<string, number>;
   };
 }
 
@@ -36,7 +37,6 @@ export class Telemetry {
   private childrenKilledTotal: Record<KilledReason, number> = {
     grace: 0,
     restart: 0,
-    fork: 0,
     crash: 0,
     wedged: 0,
   };
@@ -45,10 +45,9 @@ export class Telemetry {
   private sessionsOpenedTotal = 0;
   private sessionsClosedTotal = 0;
 
-  private forkEventsTotal = 0;
-
   private rpcInFlight = 0;
   private rpcErrorsTotal = new Map<string, number>();
+  private refusedUpstreamRequests = new Map<string, number>();
 
   recordSpawn(): void {
     this.childrenTotal += 1;
@@ -70,10 +69,6 @@ export class Telemetry {
     this.sessionsClosedTotal += 1;
   }
 
-  recordForkEvent(): void {
-    this.forkEventsTotal += 1;
-  }
-
   rpcInFlightInc(): void {
     this.rpcInFlight += 1;
   }
@@ -93,6 +88,11 @@ export class Telemetry {
     this.rpcErrorsTotal.set(code, (this.rpcErrorsTotal.get(code) ?? 0) + 1);
   }
 
+  recordRefusedUpstreamRequest(methodLabel: string): void {
+    if (!this.refusedUpstreamRequests.has(methodLabel) && this.refusedUpstreamRequests.size >= REFUSED_METHOD_CAP) return;
+    this.refusedUpstreamRequests.set(methodLabel, (this.refusedUpstreamRequests.get(methodLabel) ?? 0) + 1);
+  }
+
   snapshot(): TelemetrySnapshot {
     const errorsTotal: Record<string, number> = {};
     for (const [code, count] of this.rpcErrorsTotal) errorsTotal[code] = count;
@@ -107,8 +107,8 @@ export class Telemetry {
         openedTotal: this.sessionsOpenedTotal,
         closedTotal: this.sessionsClosedTotal,
       },
-      fork: { eventsTotal: this.forkEventsTotal },
       rpc: { inFlight: this.rpcInFlight, errorsTotal },
+      upstreamRequests: { refusedTotal: Object.fromEntries(this.refusedUpstreamRequests) },
     };
   }
 }

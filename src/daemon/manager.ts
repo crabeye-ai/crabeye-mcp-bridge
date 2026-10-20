@@ -1,20 +1,23 @@
 import { open, lstat, mkdir, chmod, unlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
-import { DEFAULT_KILL_GRACE_MS, UPSTREAM_MARKER_ENV } from "../constants.js";
-import { createNoopLogger, type Logger } from "../logging/index.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { APP_NAME, APP_VERSION, DEFAULT_KILL_GRACE_MS, UPSTREAM_MARKER_ENV } from "../constants.js";
+import { createNoopLogger, methodLabel, type Logger } from "../logging/index.js";
 import { upstreamHash } from "../upstream/upstream-hash.js";
 import {
   acquireLock,
   LockBusyError,
+  readLockHolderPid,
   sweepAbandonedLockFiles,
   type LockHandle,
 } from "./lockfile.js";
+import { processExists } from "../process/process-utils.js";
 import { isForeignProcess } from "./daemon-identity.js";
 import { ChildHandle, BackpressureError } from "./child-handle.js";
 import type { CachedInit } from "./child-handle.js";
-import { getProcessTrackerPath } from "./paths.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { processTrackerPathFor } from "./paths.js";
 import {
   ERROR_CODE_INVALID_PARAMS,
   ERROR_CODE_SESSION_IN_USE,
@@ -22,15 +25,16 @@ import {
   ERROR_CODE_SESSION_NOT_FOUND,
   ERROR_CODE_SPAWN_FAILED,
   ERROR_CODE_TOO_MANY_CONNECTIONS,
+  ERROR_CODE_BRIDGE_UNSUPPORTED,
   ERROR_CODE_DAEMON_STOPPING,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
-  INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
-  INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
   INNER_ERROR_CODE_BACKPRESSURE,
   INNER_ERROR_CODE_SESSION_CLOSED,
+  MIN_BRIDGE_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  UNREPORTED_BRIDGE_PROTOCOL_VERSION,
   isNotification,
   isRequest,
   type CloseParams,
@@ -53,13 +57,15 @@ import {
 import { InflightOverflowError, TokenRewriter, type InnerId } from "./token-rewriter.js";
 import { SubscriptionTracker } from "./subscription-tracker.js";
 import { NotificationRouter } from "./notification-router.js";
-import { AutoForkOrchestrator } from "./auto-fork.js";
+import { answerChildRequest, isChildRequest, type ChildRequest } from "./child-requests.js";
 import { Telemetry, type KilledReason } from "./telemetry.js";
 import { ChildPing } from "./child-ping.js";
 import { SocketInUseError, type DaemonServer, type FrameChannel, type Transport } from "./transport.js";
 
 const isWindows = process.platform === "win32";
 const PUBLICATION_CHECK_MS = 5_000;
+const PREDECESSOR_POLL_MS = 25;
+const PREDECESSOR_RECHECK_MS = 1_000;
 const MAX_EARLY_MESSAGES = 64;
 
 /** Bound on simultaneous IPC clients. Same-UID DoS hardening. */
@@ -89,15 +95,6 @@ const MAX_CLIENT_CAPS_BYTES = 64 * 1024;
 const MAX_PROTOCOL_VERSION_BYTES = 64;
 const MAX_CLIENT_INFO_NAME_BYTES = 256;
 const MAX_CLIENT_INFO_VERSION_BYTES = 64;
-
-/**
- * Phase D: cap on outbound bridge→child payloads buffered while a session is
- * in `draining` migration state. Beyond this, the daemon returns
- * `INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE` to the bridge so the client
- * can surface a retryable error rather than have the daemon's RAM grow
- * unbounded.
- */
-const MAX_QUEUE_PER_SESSION = 256;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -147,21 +144,13 @@ export interface ChildGroup {
   graceTimer: NodeJS.Timeout | null;
   /** True once the daemon has seen `notifications/initialized` from any session for this group. */
   initializedSeen: boolean;
-  /** Phase D: runtime state — "shared" or "dedicated". */
-  mode: "shared" | "dedicated";
-  /** Phase D: config intent at OPEN time — "auto", "shared", or "dedicated". */
-  sharing: "auto" | "shared" | "dedicated";
-  /** Phase D: true once this group has triggered an auto-fork. */
-  forked: boolean;
   /**
-   * Phase D (Task 11): pending daemon-issued internal-request callbacks,
-   * keyed by the negative id allocated for the request. The auto-fork
-   * orchestrator uses this for `initialize`/`resources/subscribe` replay
-   * against newly-spawned children.
+   * Pending daemon-issued internal-request callbacks (child pings), keyed by
+   * the negative id allocated for the request.
    */
   internalRequests: Map<number, (payload: unknown) => void>;
   /**
-   * Phase D (Task 11): next id to hand out for a daemon-issued request.
+   * Next id to hand out for a daemon-issued request.
    * Starts at -1 and decrements (so first id is -1, then -2, …). Negative
    * ids are routed back through the registry by `TokenRewriter` returning
    * `kind: "internal"`.
@@ -181,44 +170,11 @@ type TeardownReason = KilledReason | "shutdown";
 
 type InflightFailure = { kind: "closed"; message: string } | { kind: "restarted"; reason: UpstreamRestartedReason };
 
-/**
- * Phase D: per-session migration state machine for auto-fork.
- *
- * - `idle` — normal steady state; outbound traffic flows through the
- *   `group.child`.
- * - `draining` — a fork has been triggered. New outbound bridge→child traffic
- *   is queued in `queuedOutbound` (capped at `MAX_QUEUE_PER_SESSION`); the
- *   existing in-flight requests on the OLD child are allowed to drain. Once
- *   the new child is ready and replay completes, the queued payloads are
- *   sent and the session transitions to `migrated`.
- * - `migrated` — the session has switched over to its new group; this state
- *   is terminal for the migration cycle.
- */
-type MigrationState =
-  | { kind: "idle" }
-  | {
-      kind: "draining";
-      newGroup: ChildGroup;
-      queuedOutbound: unknown[];
-      drainDeadline: number;
-      drainTimer: NodeJS.Timeout | null;
-      replayDone: boolean;
-    }
-  | { kind: "migrated" };
-
 export interface SessionAttachment {
   sessionId: string;
   channel: FrameChannel;
   group: ChildGroup;
   startedAt: number;
-  // Phase D additions:
-  clientInfo: { name: string; version: string };
-  clientCapabilities: Record<string, unknown>;
-  protocolVersion: string;
-  sharing: "auto" | "shared" | "dedicated";
-  /** Original OPEN spec — needed by AutoForkOrchestrator to spawn replacement children. */
-  openSpec: OpenParams["spec"];
-  migration: MigrationState;
 }
 
 export interface ManagerOptions {
@@ -232,19 +188,6 @@ export interface ManagerOptions {
   graceMs?: number;
   /** SIGTERM→SIGKILL window. Default 2_000ms. */
   killGraceMs?: number;
-  /**
-   * Phase D (Task 11): drain window for non-originating sessions during
-   * an auto-fork migration, in ms. After this elapses with the OLD child
-   * still busy, the session is evicted. Default 60_000ms.
-   */
-  autoForkDrainTimeoutMs?: number;
-  /**
-   * Phase D (Task 11): timeout for the daemon-issued initialize replay
-   * against a fresh child during auto-fork migration, in ms. After this
-   * elapses without a response, the new child is killed and the session
-   * is evicted. Default 10_000ms.
-   */
-  autoForkInitializeTimeoutMs?: number;
   /** Cadence between daemon-side child pings. `0` disables. Default 15_000. */
   childPingMs?: number;
   /** Per-ping deadline. Default 5_000. */
@@ -252,6 +195,10 @@ export interface ManagerOptions {
   /** Wedge threshold: kill the child after N consecutive ping failures. Default 3. */
   childPingMaxConsecutiveFailures?: number;
   transport: Transport;
+  /** Keep retrying `start()` while another daemon holds the lock or socket, up to this long. Default 0. */
+  awaitPredecessorMs?: number;
+  /** Called once, the first time `start()` waits for the daemon it replaces to release the lock or socket. */
+  onWaitingForPredecessor?: () => void;
   /** Override pid for tests. */
   pid?: number;
   /** Cap on concurrent IPC connections. Defaults to 256. */
@@ -265,9 +212,9 @@ export interface ManagerOptions {
   /** Optional logger; defaults to noop. */
   logger?: Logger;
   /**
-   * Optional override for the process tracker file path. Defaults to the
-   * daemon-co-located `~/.crabeye/run/processes.json` (or its Windows
-   * equivalent).
+   * Optional override for the process tracker file path. Defaults to
+   * `processes.json` next to the lock file, which for the real daemon is the
+   * run dir (`~/.crabeye/run/processes.json` or its Windows equivalent).
    */
   processTrackerPath?: string;
   /** Pre-built tracker, used by tests to inject fakes. */
@@ -286,9 +233,8 @@ export interface ManagerOptions {
 
 /**
  * Manager daemon. Owns the lockfile, pidfile, IPC server, and the spawned
- * STDIO upstream children. Sessions sharing a `upstreamHash` (and `auto`/
- * `shared` sharing mode) collapse onto a single child; `dedicated` sessions
- * always get their own.
+ * STDIO upstream children. Sessions with the same `upstreamHash` share a
+ * single child.
  */
 export class ManagerDaemon {
   private server: DaemonServer | null = null;
@@ -307,10 +253,7 @@ export class ManagerDaemon {
   private connections = new Set<FrameChannel>();
   private groups = new Map<string, ChildGroup>();
   private readonly pendingTeardowns = new Set<Promise<void>>();
-  /** Phase D: index of currently-shareable groups, keyed by `${hash}:${sharing}`. dedicated entries never appear here. */
-  private shareableIndex = new Map<string, ChildGroup>();
-  /** Phase D: hashes where `auto` mode has triggered a fork. Future auto OPENs for these hashes spawn fresh dedicated. */
-  private autoTainted = new Set<string>();
+  private groupsByHash = new Map<string, ChildGroup>();
   private sessions = new Map<string, SessionAttachment>();
   private sessionsByChannel = new Map<FrameChannel, Set<string>>();
   private startedAt = 0;
@@ -322,19 +265,18 @@ export class ManagerDaemon {
   private readonly maxSessionsTotal: number;
   private readonly graceMs: number;
   private readonly killGraceMsValue: number;
-  private readonly autoForkDrainTimeoutMs: number;
-  private readonly autoForkInitializeTimeoutMs: number;
   private readonly childPingMs: number;
   private readonly childPingTimeoutMs: number;
   private readonly childPingMaxConsecutiveFailures: number;
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
-  private readonly autoFork: AutoForkOrchestrator;
   private readonly telemetry = new Telemetry();
   private readonly exitedPromise: Promise<number>;
   private exitedResolve: (code: number) => void = () => {
     /* replaced in constructor */
   };
+
+  private reportedWaitingForPredecessor = false;
 
   constructor(private readonly opts: ManagerOptions) {
     this.maxConnections = opts.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
@@ -342,8 +284,6 @@ export class ManagerDaemon {
     this.maxSessionsTotal = opts.maxSessionsTotal ?? DEFAULT_MAX_SESSIONS_TOTAL;
     this.graceMs = opts.graceMs ?? 60_000;
     this.killGraceMsValue = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
-    this.autoForkDrainTimeoutMs = opts.autoForkDrainTimeoutMs ?? 60_000;
-    this.autoForkInitializeTimeoutMs = opts.autoForkInitializeTimeoutMs ?? 10_000;
     this.childPingMs = opts.childPingMs ?? 15_000;
     this.childPingTimeoutMs = opts.childPingTimeoutMs ?? 5_000;
     this.childPingMaxConsecutiveFailures = opts.childPingMaxConsecutiveFailures ?? 3;
@@ -351,109 +291,9 @@ export class ManagerDaemon {
     this.tracker =
       opts.processTracker ??
       new ProcessTracker({
-        filePath: opts.processTrackerPath ?? getProcessTrackerPath(),
+        filePath: opts.processTrackerPath ?? processTrackerPathFor(opts.lockPath),
         logger: this.logger.child({ component: "process-tracker" }),
       });
-    this.autoFork = new AutoForkOrchestrator({
-      logger: this.logger.child({ component: "auto-fork" }),
-      sendToChild: (group, payload) => {
-        try {
-          group.child.send(payload);
-        } catch (err) {
-          this.logger.warn(
-            `auto-fork sendToChild failed: ${err instanceof Error ? err.message : String(err)}`,
-            { component: "auto-fork", upstreamHash: group.upstreamHash },
-          );
-        }
-      },
-      sendToSession: (group, sessionId, payload) => this.deliver(group, [sessionId], payload),
-      warnedShared: new Set<string>(),
-      taintAuto: (hash) => {
-        const wasTainted = this.autoTainted.has(hash);
-        this.autoTainted.add(hash);
-        this.shareableIndex.delete(`${hash}:auto`);
-        if (!wasTainted) this.telemetry.recordForkEvent();
-      },
-      delistShareable: (group, sharing) => {
-        const key = `${group.upstreamHash}:${sharing}`;
-        if (this.shareableIndex.get(key) === group) {
-          this.shareableIndex.delete(key);
-        }
-      },
-      spawnDedicatedForSession: (forSessionId) => {
-        const att = this.sessions.get(forSessionId);
-        if (att === undefined) return null;
-        const spawned = this.spawnGroup(att.group.upstreamHash, att.openSpec, "dedicated");
-        if (spawned instanceof Error) return null;
-        this.groups.set(spawned.groupId, spawned);
-        // Phase D (Task 11): move the session into the new group's `sessions`
-        // set so STATUS reflects ownership of the new dedicated child, but
-        // intentionally leave the OLD group's rewriter / subscriptions
-        // untouched. Task 12's drain-detection hook waits for
-        // `oldGroup.rewriter.inflightForSession(sid)` to reach zero before
-        // the migration completes; if we tore down the old rewriter state
-        // here, drain would be a no-op. `att.group` likewise stays pointing
-        // at the OLD group until migration completes — outbound is buffered
-        // in `att.migration.queuedOutbound` while draining, so it doesn't
-        // route through `att.group` anyway.
-        spawned.sessions.add(forSessionId);
-        att.group.sessions.delete(forSessionId);
-        // Don't register in shareableIndex — dedicated is never shareable.
-        return spawned;
-      },
-      getAttachment: (sessionId) => this.sessions.get(sessionId),
-      nextInternalId: (group) => {
-        const id = group.nextInternalId;
-        group.nextInternalId -= 1;
-        return id;
-      },
-      registerInternal: (group, id, cb) => {
-        group.internalRequests.set(id, cb);
-      },
-      unregisterInternal: (group, id) => {
-        group.internalRequests.delete(id);
-      },
-      killGroup: (group) => {
-        void this.teardownGroup(group, "fork");
-      },
-      evictSession: (sessionId, reason) => {
-        this.evictSession(sessionId, reason, { kind: "closed", message: `auto-fork eviction: ${reason}` });
-      },
-      urisForSession: (group, sessionId) => group.subscriptions.urisForSession(sessionId),
-      registerSubscription: (group, sessionId, uri) => {
-        group.subscriptions.subscribe(sessionId, uri);
-      },
-      attemptCompleteMigration: (oldGroup, newGroup, sessionId) => {
-        const att = this.sessions.get(sessionId);
-        if (att === undefined) return;
-        if (att.migration.kind !== "draining") return;
-        if (!att.migration.replayDone) return;
-        const inflight = oldGroup.rewriter.inflightForSession(sessionId);
-        if (inflight.length > 0) return;
-        this.completeMigration(oldGroup, newGroup, sessionId);
-      },
-      completeMigration: (oldGroup, newGroup, sessionId) => {
-        this.completeMigration(oldGroup, newGroup, sessionId);
-      },
-      synthDrainTimeoutErrors: (oldGroup, sessionId) => {
-        const att = this.sessions.get(sessionId);
-        if (att === undefined) return;
-        const inflight = oldGroup.rewriter.inflightForSession(sessionId);
-        for (const outerId of inflight) {
-          const origin = oldGroup.rewriter.peekOrigin(outerId);
-          if (origin === undefined) continue;
-          this.sendInnerError(
-            att.channel,
-            sessionId,
-            origin.originalId,
-            INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
-            "auto-fork drain timeout",
-          );
-        }
-      },
-      autoForkDrainTimeoutMs: this.autoForkDrainTimeoutMs,
-      autoForkInitializeTimeoutMs: this.autoForkInitializeTimeoutMs,
-    });
     this.exitedPromise = new Promise<number>((resolve) => {
       this.exitedResolve = resolve;
     });
@@ -470,9 +310,43 @@ export class ManagerDaemon {
    * connections (early ones are held until then). Throws `LockBusyError` when
    * another daemon holds the lock and `DaemonAlreadyRunningError` when
    * another daemon owns the socket; in both cases the pidfile, process
-   * tracker and live socket are left alone.
+   * tracker and live socket are left alone. With `awaitPredecessorMs`,
+   * retries until that daemon is gone or the wait runs out.
    */
   async start(): Promise<void> {
+    const deadline = Date.now() + (this.opts.awaitPredecessorMs ?? 0);
+    for (;;) {
+      try {
+        return await this.startOnce();
+      } catch (err) {
+        const heldByPredecessor = err instanceof LockBusyError || err instanceof DaemonAlreadyRunningError;
+        if (!heldByPredecessor || Date.now() >= deadline) throw err;
+        this.reportWaitingForPredecessor();
+        await this.waitBeforeRetryingStart(err instanceof LockBusyError ? err.heldByPid : null, deadline);
+      }
+    }
+  }
+
+  private reportWaitingForPredecessor(): void {
+    if (this.reportedWaitingForPredecessor) return;
+    this.reportedWaitingForPredecessor = true;
+    this.opts.onWaitingForPredecessor?.();
+  }
+
+  private async waitBeforeRetryingStart(lockHolder: number | null, deadline: number): Promise<void> {
+    await delay(PREDECESSOR_POLL_MS);
+    if (lockHolder === null) return;
+    const recheckAt = Math.min(deadline, Date.now() + PREDECESSOR_RECHECK_MS);
+    while (
+      Date.now() < recheckAt &&
+      processExists(lockHolder) &&
+      (await readLockHolderPid(this.opts.lockPath)) === lockHolder
+    ) {
+      await delay(PREDECESSOR_POLL_MS);
+    }
+  }
+
+  private async startOnce(): Promise<void> {
     await this.prepRunDir();
 
     this.lock = await acquireLock(this.opts.lockPath, {
@@ -649,18 +523,6 @@ export class ManagerDaemon {
   }
 
   /**
-   * @internal Test seam for AIT-248 auto-fork. Sets a session's migration
-   * state directly without going through the auto-fork orchestrator. DO NOT
-   * call this from production code — it bypasses the spawn/replay machinery
-   * and is only safe in unit tests that explicitly want to drive the
-   * migration state machine by hand. No-ops if the session is unknown.
-   */
-  setMigrationStateForTest(sessionId: string, state: MigrationState): void {
-    const att = this.sessions.get(sessionId);
-    if (att !== undefined) att.migration = state;
-  }
-
-  /**
    * @internal Test seam for AIT-249 liveness tests. Replaces every active
    * server-side channel's inbound message handler with a no-op so frames
    * arriving from the bridge are silently dropped — simulates a stalled
@@ -671,21 +533,6 @@ export class ManagerDaemon {
       channel.removeAllListeners("message");
       channel.on("message", () => { /* swallow */ });
     }
-  }
-
-  /**
-   * @internal Test seam for AIT-248 auto-fork. Emits a server→child message
-   * from the (single) currently-shared child as if it had arrived on the
-   * child's stdout. Used by fork tests to synthesize server→client requests
-   * without standing up a real upstream MCP server. Throws if no shared
-   * group exists or if multiple shared groups are present (ambiguous).
-   */
-  spawnedChildEmitForTest(payload: unknown): void {
-    const sharedGroups = Array.from(this.groups.values()).filter((g) => g.mode === "shared");
-    if (sharedGroups.length === 0) throw new Error("no shared group to emit from");
-    if (sharedGroups.length > 1) throw new Error("multiple shared groups; ambiguous");
-    const group = sharedGroups[0]!;
-    this.routeChildMessage(group, payload);
   }
 
   /** Manager-side request dispatch. Pure for STATUS and unknown_method. */
@@ -709,6 +556,8 @@ export class ManagerDaemon {
           uptime: this.uptimeMs(),
           pid: this.opts.pid ?? process.pid,
           version: PROTOCOL_VERSION,
+          minBridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION,
+          appVersion: APP_VERSION,
           children: this.statusChildren(),
           sessions: this.statusSessions(),
           telemetry: this.telemetry.snapshot(),
@@ -845,30 +694,6 @@ export class ManagerDaemon {
       return;
     }
     const group = att.group;
-
-    // Phase D auto-fork: while migrating, buffer outbound bridge→child
-    // traffic on the OLD child. The new child takes over once initialize
-    // replay completes (Task 12). Subscribe/unsubscribe and other dedupe
-    // logic is intentionally deferred until after the buffer flush — we
-    // want every payload (including subscribe replays from the bridge) to
-    // queue uniformly while draining.
-    if (att.migration.kind === "draining") {
-      const innerId = pickInnerId(params.payload);
-      if (att.migration.queuedOutbound.length >= MAX_QUEUE_PER_SESSION) {
-        if (innerId !== null) {
-          this.sendInnerError(
-            channel,
-            params.sessionId,
-            innerId,
-            INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
-            "session migration buffer full",
-          );
-        }
-        return;
-      }
-      att.migration.queuedOutbound.push(params.payload);
-      return;
-    }
 
     // Dedupe resources/subscribe and resources/unsubscribe.
     if (isResourceSubscribeRequest(params.payload)) {
@@ -1042,6 +867,14 @@ export class ManagerDaemon {
     if (params === null) {
       return errorResponse(requestId, ERROR_CODE_INVALID_PARAMS, "OPEN params malformed");
     }
+    const bridgeProtocolVersion = params.bridgeProtocolVersion ?? UNREPORTED_BRIDGE_PROTOCOL_VERSION;
+    if (bridgeProtocolVersion < MIN_BRIDGE_PROTOCOL_VERSION) {
+      return errorResponse(
+        requestId,
+        ERROR_CODE_BRIDGE_UNSUPPORTED,
+        `this daemon needs a bridge using protocol version ${MIN_BRIDGE_PROTOCOL_VERSION} or newer, not ${bridgeProtocolVersion}; restart the assistant to use the current ${APP_NAME}`,
+      );
+    }
     if (this.sessions.has(params.sessionId)) {
       return errorResponse(requestId, ERROR_CODE_SESSION_IN_USE, "sessionId already in use");
     }
@@ -1069,23 +902,14 @@ export class ManagerDaemon {
       cwd: params.spec.cwd,
     });
 
-    const sharing = params.spec.sharing;
     let group: ChildGroup;
 
-    const existing = this.findShareableGroup(hash, sharing);
+    const existing = this.liveGroupFor(hash);
     if (existing !== undefined) {
       group = existing;
       this.cancelGraceTimer(group);
     } else {
-      // Determine spawn mode:
-      // - sharing === "dedicated" → mode = "dedicated"
-      // - sharing === "auto" && hash is tainted → mode = "dedicated" (no sharing allowed)
-      // - otherwise → mode = "shared"
-      const spawnMode: "shared" | "dedicated" =
-        sharing === "dedicated" || (sharing === "auto" && this.autoTainted.has(hash))
-          ? "dedicated"
-          : "shared";
-      const spawned = this.spawnGroup(hash, params.spec, spawnMode);
+      const spawned = this.spawnGroup(hash, params.spec);
       if (spawned instanceof Error) {
         return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
       }
@@ -1101,12 +925,6 @@ export class ManagerDaemon {
       channel,
       group,
       startedAt: Date.now(),
-      clientInfo: params.spec.clientInfo,
-      clientCapabilities: params.spec.clientCapabilities,
-      protocolVersion: params.spec.protocolVersion,
-      sharing: params.spec.sharing,
-      openSpec: params.spec,
-      migration: { kind: "idle" },
     };
     this.sessions.set(params.sessionId, attachment);
     this.telemetry.recordSessionOpen();
@@ -1118,28 +936,13 @@ export class ManagerDaemon {
     return { id: requestId, result: { ok: true } };
   }
 
-  /**
-   * Find the currently shareable group for (hash, sharing). Returns undefined if
-   * no shareable group exists, or if `sharing === "dedicated"` (dedicated groups
-   * are never indexed), or if `sharing === "auto"` and the hash is tainted.
-   */
-  private findShareableGroup(
-    hash: string,
-    sharing: "auto" | "shared" | "dedicated",
-  ): ChildGroup | undefined {
-    if (sharing === "dedicated") return undefined;
-    if (sharing === "auto" && this.autoTainted.has(hash)) return undefined;
-    const key = `${hash}:${sharing}`;
-    const group = this.shareableIndex.get(key);
+  private liveGroupFor(hash: string): ChildGroup | undefined {
+    const group = this.groupsByHash.get(hash);
     if (group === undefined || group.teardown !== null) return undefined;
     return group;
   }
 
-  private spawnGroup(
-    hash: string,
-    spec: OpenParams["spec"],
-    mode: "shared" | "dedicated",
-  ): ChildGroup | Error {
+  private spawnGroup(hash: string, spec: OpenParams["spec"]): ChildGroup | Error {
     const rewriter = new TokenRewriter();
     const subscriptions = new SubscriptionTracker();
     const router = new NotificationRouter();
@@ -1178,7 +981,7 @@ export class ManagerDaemon {
     }
 
     const group: ChildGroup = {
-      groupId: `${hash}:${spec.sharing}:${this.nextGroupCounter++}`,
+      groupId: `${hash}:${this.nextGroupCounter++}`,
       upstreamHash: hash,
       child,
       rewriter,
@@ -1190,9 +993,6 @@ export class ManagerDaemon {
       graceTimer: null,
       teardown: null,
       initializedSeen: false,
-      mode,
-      sharing: spec.sharing,
-      forked: false,
       internalRequests: new Map(),
       nextInternalId: -1,
       childPing: null,
@@ -1243,9 +1043,7 @@ export class ManagerDaemon {
       });
     }
 
-    if (mode === "shared") {
-      this.shareableIndex.set(`${hash}:${spec.sharing}`, group);
-    }
+    this.groupsByHash.set(hash, group);
 
     this.telemetry.recordSpawn();
 
@@ -1305,8 +1103,10 @@ export class ManagerDaemon {
   /**
    * Route an inbound child→bridge message to the correct session(s).
    * - "response" / "progress" / "cancelled": sessionIds from rewriter (originating session)
+   * - "internal": a reply to a request the daemon sent itself (its own pings), handed to its callback
    * - "drop": silently discard
-   * - "other": defer to NotificationRouter for fan-out across all attached sessions
+   * - "other": a request from the child is answered by the daemon (child-requests.ts); a notification is
+   *   fanned out by NotificationRouter
    */
   private routeChildMessage(group: ChildGroup, payload: unknown): void {
     const routing = group.rewriter.inboundFromChild(payload);
@@ -1353,26 +1153,12 @@ export class ManagerDaemon {
         }
       }
       this.deliver(group, routing.sessionIds, routing.payload);
-      // Phase D (Task 12): after delivering a response, check whether any of
-      // these sessions are in a draining migration with this group as their
-      // OLD group. If so, attempt completion now that another inflight has
-      // resolved.
-      for (const sid of routing.sessionIds) {
-        const att = this.sessions.get(sid);
-        if (att === undefined) continue;
-        if (att.migration.kind !== "draining") continue;
-        const newGroup = att.migration.newGroup;
-        this.autoFork.onSessionInflightChanged(group, newGroup, sid);
-      }
       return;
     }
     if (routing.kind === "progress" || routing.kind === "cancelled") {
       this.deliver(group, routing.sessionIds, routing.payload);
       return;
     }
-    // Phase D (Task 11): daemon-issued internal requests resolve via the
-    // per-group registry. Lookup the pending callback by negative id and
-    // remove it from the map (callbacks fire exactly once).
     if (routing.kind === "internal") {
       const id = (routing.payload as { id?: number }).id;
       if (typeof id === "number") {
@@ -1384,84 +1170,25 @@ export class ManagerDaemon {
       }
       return;
     }
-    // "other" — could be a server→client request or a notification.
-    if (this.autoFork.isServerRequest(routing.payload)) {
-      void this.autoFork.handleServerRequest(group, routing.payload);
+    if (isChildRequest(routing.payload)) {
+      this.replyToChildRequest(group, routing.payload);
       return;
     }
-    // Notification — fan out via NotificationRouter (existing behavior).
     const sessions = group.router.route(routing.payload, Array.from(group.sessions), group.subscriptions);
     if (sessions.length > 0) this.deliver(group, sessions, routing.payload);
   }
 
-  /**
-   * Phase D (Task 12): finalize a session's auto-fork migration. Drops old
-   * group's subscription/rewriter state for the session, swings `att.group`
-   * to the new group, attaches to the new rewriter, and flushes the queued
-   * outbound buffer through the new child. Idempotent in the sense that it
-   * no-ops if the session is no longer draining.
-   */
-  private completeMigration(oldGroup: ChildGroup, newGroup: ChildGroup, sessionId: string): void {
-    const att = this.sessions.get(sessionId);
-    if (att === undefined) return;
-    if (att.migration.kind !== "draining") return;
-
-    // Drop subscriptions on old group, send unsubscribes for URIs that lose last subscriber.
-    const droppedUris = oldGroup.subscriptions.removeSession(sessionId);
-    for (const uri of droppedUris) {
-      try {
-        oldGroup.child.send({
-          jsonrpc: "2.0",
-          method: "resources/unsubscribe",
-          params: { uri },
-        });
-      } catch {
-        /* best-effort */
-      }
-    }
-
-    // Detach from old group's rewriter (cancels any outstanding outerIds — but we
-    // expect inflight to be empty at this point).
-    oldGroup.rewriter.detachSession(sessionId);
-
-    // Note: Task 11's fork already moved sessionId from oldGroup.sessions to newGroup.sessions
-    // (for STATUS visibility). Don't re-do that. Just attach to the new rewriter.
-    newGroup.rewriter.attachSession(sessionId);
-    att.group = newGroup;
-
-    // Flush queued outbound to new child.
-    const queue = att.migration.queuedOutbound;
-    const drainTimer = att.migration.drainTimer;
-    if (drainTimer !== null) clearTimeout(drainTimer);
-    att.migration = { kind: "migrated" };
-
-    for (const payload of queue) {
-      // Re-enter the outbound path on the new group via a synthetic local handler.
-      // We can't recursively call handleNotification here (it expects an RPC notif
-      // wrapper). Instead, replicate the core: rewriter.outboundForChild + child.send.
-      let rewritten: unknown;
-      try {
-        rewritten = newGroup.rewriter.outboundForChild(payload, sessionId);
-      } catch (err) {
-        this.logger.warn(
-          `auto-fork: failed to rewrite queued payload after migration: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          { component: "auto-fork", sessionId, upstreamHash: newGroup.upstreamHash },
-        );
-        continue;
-      }
-      if (rewritten === null) continue;
-      try {
-        newGroup.child.send(rewritten);
-      } catch (err) {
-        this.logger.warn(
-          `auto-fork: queued payload send failed after migration: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          { component: "auto-fork", sessionId, upstreamHash: newGroup.upstreamHash },
-        );
-      }
+  private replyToChildRequest(group: ChildGroup, request: ChildRequest): void {
+    const label = methodLabel(request.method);
+    if (request.method !== "ping") this.telemetry.recordRefusedUpstreamRequest(label);
+    try {
+      group.child.send(answerChildRequest(request, label));
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`could not answer child request "${label}": ${reason}`, {
+        component: "daemon",
+        upstreamHash: group.upstreamHash,
+      });
     }
   }
 
@@ -1503,11 +1230,10 @@ export class ManagerDaemon {
         this.groups.delete(group.groupId);
         if (reason !== "shutdown") this.telemetry.recordKill(reason);
       }
-      const indexKey = `${group.upstreamHash}:${group.sharing}`;
-      if (this.shareableIndex.get(indexKey) === group) this.shareableIndex.delete(indexKey);
+      if (this.groupsByHash.get(group.upstreamHash) === group) this.groupsByHash.delete(group.upstreamHash);
       this.cancelGraceTimer(group);
       group.childPing?.stop();
-      if (reason !== "shutdown" && reason !== "fork") this.evictSessionsOf(group, reason);
+      if (reason !== "shutdown") this.evictSessionsOf(group, reason);
     } finally {
       const pid = group.child.pid;
       await group.child.kill(this.killGraceMs()).catch(() => {});
@@ -1524,24 +1250,8 @@ export class ManagerDaemon {
         ? ["upstream_restarted", { kind: "restarted", reason: "admin_restart" }]
         : ["child_exited", { kind: "closed", message: "child process exited" }];
     for (const att of Array.from(this.sessions.values())) {
-      const migration = att.migration;
-      const migratingAway = migration.kind === "draining" && att.group === group;
-      const migratingHere = migration.kind === "draining" && migration.newGroup === group;
-      if (migratingAway) {
-        this.failInflightOn(group, att, inflightFailure);
-        this.autoFork.onSessionInflightChanged(group, migration.newGroup, att.sessionId);
-      } else if (att.group === group || migratingHere) {
-        this.evictSession(att.sessionId, evictionReason, inflightFailure);
-      }
+      if (att.group === group) this.evictSession(att.sessionId, evictionReason, inflightFailure);
     }
-  }
-
-  private failInflightOn(group: ChildGroup, att: SessionAttachment, inflightFailure: InflightFailure): void {
-    for (const outerId of group.rewriter.inflightForSession(att.sessionId)) {
-      const origin = group.rewriter.peekOrigin(outerId);
-      if (origin !== undefined) this.sendInflightFailure(att.channel, att.sessionId, origin.originalId, inflightFailure);
-    }
-    group.rewriter.detachSession(att.sessionId);
   }
 
   private sendInflightFailure(
@@ -1576,34 +1286,6 @@ export class ManagerDaemon {
   private async detachSession(sessionId: string, inflightFailure: InflightFailure): Promise<void> {
     const att = this.sessions.get(sessionId);
     if (att === undefined) return;
-
-    // Phase D (Task 13): if the session was mid-migration, clean up the new
-    // group and its drain timer before the standard detach path runs. The
-    // standard path operates on `att.group`, which is still the OLD group
-    // until completeMigration swings it — so the new group won't get cleaned
-    // up otherwise.
-    if (att.migration.kind === "draining") {
-      if (att.migration.drainTimer !== null) {
-        clearTimeout(att.migration.drainTimer);
-        att.migration.drainTimer = null;
-      }
-      for (const payload of att.migration.queuedOutbound) {
-        const innerId = (payload as { id?: unknown }).id;
-        if (typeof innerId === "string" || typeof innerId === "number") {
-          this.sendInflightFailure(att.channel, sessionId, innerId, inflightFailure);
-        }
-      }
-      att.migration.queuedOutbound.length = 0;
-      // Kill the not-yet-attached new child if it has no other sessions
-      // (or only this one).
-      const newGroup = att.migration.newGroup;
-      if (
-        newGroup.sessions.size === 0 ||
-        (newGroup.sessions.size === 1 && newGroup.sessions.has(sessionId))
-      ) {
-        void this.teardownGroup(newGroup, "fork");
-      }
-    }
 
     this.sessions.delete(sessionId);
     this.telemetry.recordSessionClose();
@@ -1752,9 +1434,6 @@ export class ManagerDaemon {
       refcount: g.sessions.size,
       sessions: Array.from(g.sessions),
       subscriptionCount: g.subscriptions.subscriptionCount(),
-      mode: g.mode,
-      sharing: g.sharing,
-      forked: g.forked,
       cachedInit:
         g.child.cachedInit === null
           ? null
@@ -1815,11 +1494,17 @@ function errorResponse(id: string, code: string, message: string): DaemonRespons
   return { id, error: { code, message } };
 }
 
+function isProtocolVersionNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
 function parseOpenParams(raw: unknown): OpenParams | null {
   if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as { sessionId?: unknown; spec?: unknown };
+  const r = raw as { sessionId?: unknown; bridgeProtocolVersion?: unknown; spec?: unknown };
   if (typeof r.sessionId !== "string" || !UUID_RE.test(r.sessionId)) return null;
   if (r.sessionId.length > MAX_SESSION_ID_BYTES) return null;
+  const { bridgeProtocolVersion } = r;
+  if (bridgeProtocolVersion !== undefined && !isProtocolVersionNumber(bridgeProtocolVersion)) return null;
   const spec = r.spec;
   if (typeof spec !== "object" || spec === null) return null;
   const s = spec as Record<string, unknown>;
@@ -1842,7 +1527,6 @@ function parseOpenParams(raw: unknown): OpenParams | null {
   // Reject relative cwd: it would resolve against the daemon's cwd (whatever
   // shell launched the daemon), almost never the bridge's intent.
   if (s.cwd !== "" && !isAbsolute(s.cwd)) return null;
-  if (s.sharing !== "auto" && s.sharing !== "shared" && s.sharing !== "dedicated") return null;
   if (typeof s.protocolVersion !== "string" || s.protocolVersion.length === 0
       || s.protocolVersion.length > MAX_PROTOCOL_VERSION_BYTES) return null;
   if (typeof s.clientInfo !== "object" || s.clientInfo === null || Array.isArray(s.clientInfo)) return null;
@@ -1856,13 +1540,13 @@ function parseOpenParams(raw: unknown): OpenParams | null {
 
   return {
     sessionId: r.sessionId,
+    ...(bridgeProtocolVersion !== undefined && { bridgeProtocolVersion }),
     spec: {
       serverName: s.serverName,
       command: s.command,
       args: s.args as string[],
       resolvedEnv: s.resolvedEnv as Record<string, string>,
       cwd: s.cwd,
-      sharing: s.sharing as "auto" | "shared" | "dedicated",
       clientInfo: { name: ci.name, version: ci.version },
       clientCapabilities: s.clientCapabilities as Record<string, unknown>,
       protocolVersion: s.protocolVersion,
@@ -1995,4 +1679,3 @@ export class DaemonAlreadyRunningError extends Error {
     this.name = "DaemonAlreadyRunningError";
   }
 }
-export type { MigrationState };

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { APP_VERSION } from "../../src/constants.js";
-import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
+import { encodeFrame, FrameDecoder, PROTOCOL_VERSION } from "../../src/daemon/protocol.js";
 import { DaemonStdioClient } from "../../src/upstream/daemon-stdio-client.js";
 import { until } from "../_helpers/daemon-fixtures.js";
 
@@ -51,10 +51,9 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     return new Promise<void>((resolve) => server!.listen(sockPath, resolve));
   }
 
-  it("ships sharing, clientInfo, clientCapabilities, protocolVersion in OPEN.spec", async () => {
+  async function capturedOpen(): Promise<{ bridgeProtocolVersion: unknown; spec: Record<string, unknown> }> {
     const captured: unknown[] = [];
     await startCapturingServer(captured);
-
     const client = new DaemonStdioClient({
       name: "test-upstream",
       config: {
@@ -77,14 +76,20 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     }
 
     const open = captured.find(
-      (f) =>
-        typeof f === "object" &&
-        f !== null &&
-        (f as { method?: string }).method === "OPEN",
-    ) as { params: { spec: Record<string, unknown> } } | undefined;
+      (f) => typeof f === "object" && f !== null && (f as { method?: string }).method === "OPEN",
+    ) as { params: { bridgeProtocolVersion: unknown; spec: Record<string, unknown> } } | undefined;
     expect(open).toBeDefined();
-    const spec = open!.params.spec;
-    expect(spec.sharing).toBe("dedicated");
+    return open!.params;
+  }
+
+  it("ships the bridge's protocol version in OPEN", async () => {
+    expect((await capturedOpen()).bridgeProtocolVersion).toBe(PROTOCOL_VERSION);
+  });
+
+  it("ships the sharing value older daemons require, clientInfo, clientCapabilities and protocolVersion in OPEN.spec, whatever sharing the config sets", async () => {
+    const { spec } = await capturedOpen();
+
+    expect(spec.sharing).toBe("shared");
     expect(spec.clientInfo).toEqual({
       name: "crabeye-mcp-bridge/test-upstream",
       version: APP_VERSION,
@@ -173,37 +178,6 @@ describe.skipIf(isWindows)("DaemonStdioClient — OPEN payload", () => {
     expect(opens).toHaveLength(5);
     expect(new Set(opens.map(sessionOf)).size).toBe(1);
   });
-
-  it('defaults sharing to "auto" when _bridge is absent', async () => {
-    const captured: unknown[] = [];
-    await startCapturingServer(captured);
-
-    const client = new DaemonStdioClient({
-      name: "test-upstream-2",
-      config: {
-        command: "node",
-        args: ["-e", "process.stdin.on('data', () => {})"],
-      } as never,
-      resolvedEnv: {},
-      _socketPath: sockPath,
-      _ensureDaemon: async () => {},
-    });
-
-    try {
-      await client.connect().catch(() => {});
-    } finally {
-      await client.close().catch(() => {});
-    }
-
-    const open = captured.find(
-      (f) =>
-        typeof f === "object" &&
-        f !== null &&
-        (f as { method?: string }).method === "OPEN",
-    ) as { params: { spec: { sharing?: string } } } | undefined;
-    expect(open).toBeDefined();
-    expect(open!.params.spec.sharing).toBe("auto");
-  });
 });
 
 describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () => {
@@ -253,7 +227,6 @@ describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () 
       config: {
         command: "node",
         args: ["-e", "process.stdin.on('data', () => {})"],
-        _bridge: { sharing: "auto" },
       } as never,
       resolvedEnv: {},
       _socketPath: sockPath,
@@ -277,7 +250,7 @@ describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () 
         method: "SESSION_EVICTED",
         params: {
           sessionId: capturedSessionId,
-          reason: "auto_fork_drain_timeout",
+          reason: "child_exited",
         },
       }),
     );
@@ -327,7 +300,6 @@ describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () 
       config: {
         command: "node",
         args: ["-e", "process.stdin.on('data', () => {})"],
-        _bridge: { sharing: "auto" },
       } as never,
       resolvedEnv: {},
       _socketPath: sockPath,
@@ -399,7 +371,7 @@ describe.skipIf(isWindows)("DaemonStdioClient — SESSION_EVICTED handling", () 
         method: "SESSION_EVICTED",
         params: {
           sessionId: "ffffffff-ffff-ffff-ffff-ffffffffffff",
-          reason: "auto_fork_drain_timeout",
+          reason: "child_exited",
         },
       }),
     );

@@ -1,16 +1,19 @@
 #!/usr/bin/env node
-// Stub MCP server for AIT-248 integration tests.
+// Stub MCP server that emits server→client requests.
 // Speaks newline-delimited JSON-RPC 2.0 over stdio.
 //
 // Tool: `emit_request`. Calling it causes the stub to first emit a
 // server→client request (default: sampling/createMessage) on stdout, then
-// respond to the tools/call. The method name can be overridden via
-// the tool args: `{ "name": "emit_request", "arguments": { "method": "roots/list" } }`.
+// respond to the tools/call. The method name and request id can be overridden via
+// the tool args: `{ "name": "emit_request", "arguments": { "method": "roots/list", "id": "r1" } }`.
+// Tool: `replies`. Returns, as JSON text, every reply the stub has received
+// to the requests it emitted.
 
 import { createInterface } from "node:readline";
 
 const rl = createInterface({ input: process.stdin, terminal: false });
 let nextServerRequestId = 100000;
+const replies = [];
 
 rl.on("line", (line) => {
   const trimmed = line.trim();
@@ -43,13 +46,19 @@ rl.on("line", (line) => {
       tools: [
         {
           name: "emit_request",
-          description: "Emit a server→client request (for AIT-248 fork tests).",
+          description: "Emit a server→client request.",
           inputSchema: {
             type: "object",
             properties: {
-              method: { type: "string", description: "Dangerous method to emit" },
+              method: { type: "string", description: "Method of the request to emit" },
+              id: { type: ["string", "number"], description: "Id of the request to emit" },
             },
           },
+        },
+        {
+          name: "replies",
+          description: "Return every reply received to emitted requests.",
+          inputSchema: { type: "object", properties: {} },
         },
       ],
     });
@@ -64,7 +73,7 @@ rl.on("line", (line) => {
       // Emit server→client request first.
       emit({
         jsonrpc: "2.0",
-        id: nextServerRequestId++,
+        id: msg.params?.arguments?.id ?? nextServerRequestId++,
         method: serverRequestMethod,
         params: {},
       });
@@ -74,6 +83,10 @@ rl.on("line", (line) => {
       });
       return;
     }
+    if (name === "replies") {
+      respond(msg.id, { content: [{ type: "text", text: JSON.stringify(replies) }] });
+      return;
+    }
     respond(msg.id, undefined, {
       code: -32601,
       message: `Unknown tool: ${name}`,
@@ -81,9 +94,8 @@ rl.on("line", (line) => {
     return;
   }
 
-  // Drop sampling/createMessage / roots/list / etc. responses from the bridge —
-  // we don't track them. The daemon routes them; the stub doesn't care.
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+    replies.push(msg);
     return;
   }
 

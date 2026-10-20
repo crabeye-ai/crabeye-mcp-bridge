@@ -109,7 +109,6 @@ describe.skipIf(isWindows)("daemon emits -32001 inner error on stdin backpressur
           args: [STUB],
           resolvedEnv: { STUB_HANG_ON_INIT: "1" },
           cwd: "",
-          sharing: "auto" as const,
           clientInfo: { name: "test-bridge", version: "0.0.0" },
           clientCapabilities: {},
           protocolVersion: "2025-06-18",

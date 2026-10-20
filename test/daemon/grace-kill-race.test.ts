@@ -79,7 +79,6 @@ describe.skipIf(isWindows)("ManagerDaemon — grace-kill race", () => {
         args: [],
         resolvedEnv: {},
         cwd: "",
-        sharing: "auto" as const,
         clientInfo: { name: "test-bridge", version: "0.0.0" },
         clientCapabilities: {},
         protocolVersion: "2025-06-18",

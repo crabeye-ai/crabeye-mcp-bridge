@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { countingLauncher } from "../_helpers/launchers.js";
 
 vi.mock("../../src/process/process-utils.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/process/process-utils.js")>()),
@@ -35,15 +36,15 @@ describe.skipIf(process.platform === "win32")("ensureDaemonRunning when the reco
     children.push(unidentified);
     await vi.waitFor(() => stat(socketPath), { timeout: 5_000 });
     await writeFile(lockPath, `${unidentified.pid}\ntoken\n`);
-    let launches = 0;
+    const { launch, calls } = countingLauncher();
 
-    const attempt = ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 1_000, launch: () => launches++ });
+    const attempt = ensureDaemonRunning({ socketPath, _startingDaemonWaitMs: 1_000, launch });
 
     await expect(attempt).rejects.toBeInstanceOf(DaemonUnresponsiveError);
     await expect(attempt).rejects.toMatchObject({ reason: "unconfirmed", pid: unidentified.pid });
     await expect(attempt).rejects.toThrow(/crabeye-mcp-bridge daemon stop/);
     expect(processExists(unidentified.pid!)).toBe(true);
-    expect(launches).toBe(0);
+    expect(calls).toHaveLength(0);
     await expect(stat(`${lockPath}.recover`)).rejects.toThrow();
   });
 });

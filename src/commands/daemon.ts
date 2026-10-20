@@ -2,8 +2,15 @@ import {
   DaemonClient,
   DaemonRpcError,
   ManagerDaemon,
+  daemonStatus,
   ensureDaemonRunning,
   isDaemonReachable,
+  reportToLauncher,
+  daemonFit,
+  daemonVersionLabel,
+  UNKNOWN_DAEMON_VERSION,
+  olderDaemonStillRunning,
+  reportedDaemonPid,
   daemonFilesFor,
   getDaemonSocketPath,
   netTransport,
@@ -14,14 +21,20 @@ import {
   terminateDaemon,
   waitForExit,
   isSocketAddressError,
-  type StatusResult,
+  type DaemonStatus,
   type TerminateResult,
 } from "../daemon/index.js";
 import { processExists } from "../process/index.js";
+import { escapeLabel } from "../logging/index.js";
 import { loadDaemonConfig, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
 import { APP_NAME } from "../constants.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
+
+interface StatusReply extends DaemonStatus {
+  uptime?: unknown;
+  telemetry?: { upstreamRequests?: { refusedTotal?: unknown } };
+}
 
 export interface RestartUpstreamOpts {
   hash?: string;
@@ -63,26 +76,31 @@ function dispatch(action: DaemonAction): Promise<number> {
  * Run as the daemon process itself. Called from the CLI when invoked with
  * `--internal-launch`. Resolves when the manager exits.
  */
-export async function runDaemonInternal(): Promise<number> {
+export async function runDaemonInternal(awaitPredecessorMs = 0): Promise<number> {
   const cfg = await loadDaemonConfig();
 
   const socketPath = getDaemonSocketPath();
+  let waitedForPredecessor = false;
   const manager = new ManagerDaemon({
     socketPath,
     ...daemonFilesFor(socketPath),
     idleMs: cfg.idleMs,
     graceMs: cfg.graceMs,
     killGraceMs: cfg.killGraceMs,
-    autoForkDrainTimeoutMs: cfg.autoForkDrainTimeoutMs,
-    autoForkInitializeTimeoutMs: cfg.autoForkInitializeTimeoutMs,
     childPingMs: cfg.childPingMs,
     childPingTimeoutMs: cfg.childPingTimeoutMs,
     childPingMaxConsecutiveFailures: cfg.childPingMaxConsecutiveFailures,
     transport: netTransport,
+    awaitPredecessorMs,
+    onWaitingForPredecessor: () => {
+      waitedForPredecessor = true;
+      reportToLauncher("waiting");
+    },
   });
 
   try {
     await manager.start();
+    if (!waitedForPredecessor) reportToLauncher("serving");
   } catch (err) {
     if (err instanceof LockBusyError || err instanceof DaemonAlreadyRunningError) {
       process.stderr.write(`daemon: ${err.message}; deferring to existing daemon\n`);
@@ -109,13 +127,22 @@ export async function runDaemonInternal(): Promise<number> {
 }
 
 async function runStart(): Promise<number> {
-  if (await isDaemonReachable(getDaemonSocketPath())) {
+  const socketPath = getDaemonSocketPath();
+  const running = await daemonStatus(socketPath);
+  if (running !== null && daemonFit(running) === "current") {
     process.stderr.write("daemon already running\n");
     return 0;
   }
 
   try {
     await ensureDaemonRunning();
+    const started = await daemonStatus(socketPath);
+    if (started !== null && daemonFit(started) === "older") {
+      process.stderr.write(
+        `${olderDaemonStillRunning(started)} and could not be replaced; run \`${APP_NAME} daemon stop\`, then start again\n`,
+      );
+      return 1;
+    }
     process.stderr.write("daemon started\n");
     return 0;
   } catch (err) {
@@ -191,14 +218,14 @@ async function runStatus(): Promise<number> {
   const client = makeClient({ rpcTimeoutMs: 1_500, connectTimeoutMs: 1_500 });
   try {
     await client.connect();
-    const status = (await client.call("STATUS")) as StatusResult;
-    process.stdout.write(
-      JSON.stringify(
-        { running: true, pid: status.pid, uptime: status.uptime },
-        null,
-        2,
-      ) + "\n",
-    );
+    const status = (await client.call("STATUS")) as StatusReply;
+    writeStatus({
+      running: true,
+      pid: reportedDaemonPid(status),
+      uptime: nonNegativeIntegerOrNull(status.uptime),
+      appVersion: daemonVersionLabel(status),
+      refusedUpstreamRequests: refusedRequestCounts(status.telemetry?.upstreamRequests?.refusedTotal),
+    });
     return 0;
   } catch (err) {
     if (isSocketAddressError(err)) throw err;
@@ -208,14 +235,34 @@ async function runStatus(): Promise<number> {
 
   const pid = await readPidFile(daemonFilesFor(getDaemonSocketPath()).pidPath);
   if (pid !== null && processExists(pid)) {
-    process.stdout.write(
-      JSON.stringify({ running: true, pid, uptime: null }, null, 2) + "\n",
-    );
+    writeStatus({ running: true, pid, uptime: null, appVersion: UNKNOWN_DAEMON_VERSION, refusedUpstreamRequests: null });
     return 0;
   }
 
-  process.stdout.write(JSON.stringify({ running: false }, null, 2) + "\n");
+  writeStatus({ running: false });
   return 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function nonNegativeIntegerOrNull(value: unknown): number | null {
+  return isNonNegativeInteger(value) ? value : null;
+}
+
+function refusedRequestCounts(value: unknown): Record<string, number> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const counts: [string, number][] = [];
+  for (const [method, count] of Object.entries(value)) {
+    if (!isNonNegativeInteger(count)) return null;
+    counts.push([escapeLabel(method), count]);
+  }
+  return Object.fromEntries(counts);
+}
+
+function writeStatus(status: Record<string, unknown>): void {
+  process.stdout.write(JSON.stringify(status, null, 2) + "\n");
 }
 
 async function runRestart(): Promise<number> {

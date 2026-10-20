@@ -4,12 +4,12 @@ import {
   FrameDecoder,
   FrameError,
   MAX_FRAME_BYTES,
+  MIN_BRIDGE_PROTOCOL_VERSION,
+  MIN_DAEMON_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  UNREPORTED_BRIDGE_PROTOCOL_VERSION,
   notImplementedResponse,
-  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
   ERROR_CODE_UPSTREAM_RESTARTED,
-  INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT,
-  INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   type SessionEvictedParams,
   type DaemonMethod,
@@ -125,27 +125,21 @@ describe("daemon protocol", () => {
       expect(r.error?.message).toContain("RPC");
     });
 
-    it("PROTOCOL_VERSION is a positive int", () => {
-      expect(Number.isInteger(PROTOCOL_VERSION)).toBe(true);
-      expect(PROTOCOL_VERSION).toBeGreaterThan(0);
+    it("speaks a protocol newer than crabeye 1.3.0's while still accepting every protocol from 1", () => {
+      expect(PROTOCOL_VERSION).toBe(2);
+      expect([MIN_BRIDGE_PROTOCOL_VERSION, MIN_DAEMON_PROTOCOL_VERSION, UNREPORTED_BRIDGE_PROTOCOL_VERSION]).toEqual([1, 1, 1]);
     });
   });
 
-  describe("protocol — Phase D additions", () => {
-    it("exports auto-fork error codes with correct shapes", () => {
-      expect(ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED).toBe("auto_fork_initialize_failed");
-      expect(INNER_ERROR_CODE_AUTO_FORK_DRAIN_TIMEOUT).toBe(-32002);
-      expect(INNER_ERROR_CODE_AUTO_FORK_DRAIN_BACKPRESSURE).toBe(-32003);
-    });
-
+  describe("protocol — SESSION_EVICTED", () => {
     it("typechecks SESSION_EVICTED method and params", () => {
       const m: DaemonMethod = "SESSION_EVICTED";
       const p: SessionEvictedParams = {
         sessionId: "11111111-1111-1111-1111-111111111111",
-        reason: "auto_fork_drain_timeout",
+        reason: "child_exited",
       };
       expect(m).toBe("SESSION_EVICTED");
-      expect(p.reason).toBe("auto_fork_drain_timeout");
+      expect(p.reason).toBe("child_exited");
     });
   });
 

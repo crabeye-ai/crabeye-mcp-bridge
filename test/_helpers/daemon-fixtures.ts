@@ -131,9 +131,7 @@ export interface OpenSessionOpts {
   command?: string;
   /** Spawned-child args. */
   args?: string[];
-  /** sharing override. */
-  sharing?: "auto" | "shared" | "dedicated";
-  /** serverName override (changes upstreamHash). */
+  /** serverName override (not part of upstreamHash). */
   serverName?: string;
   resolvedEnv?: Record<string, string>;
 }
@@ -179,7 +177,6 @@ export class OpenSessionFixture {
       args: opts.args ?? ["-e", "process.stdin.on('data', () => {})"],
       resolvedEnv: opts.resolvedEnv ?? {},
       cwd: "",
-      sharing: opts.sharing ?? "dedicated",
       clientInfo: { name: "test-bridge", version: "0.0.0" },
       clientCapabilities: {},
       protocolVersion: "2025-06-18",

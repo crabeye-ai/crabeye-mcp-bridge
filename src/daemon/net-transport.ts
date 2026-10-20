@@ -1,4 +1,4 @@
-import { createServer as createNetServer, createConnection, type Server } from "node:net";
+import { createServer as createNetServer, createConnection, type Server, type Socket } from "node:net";
 import { chmod, link, lstat, mkdir, readdir, unlink } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
@@ -15,12 +15,14 @@ import { socketAddress } from "./socket-address.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const SERVING_PROBE_TIMEOUT_MS = 1_000;
+const CLOSING_CONNECTION_GRACE_MS = 1_000;
 const STAGING_SOCKET_NAME = /^\.s[0-9a-f]{4}$/;
 const isWindows = process.platform === "win32";
 
 class NetDaemonServer implements DaemonServer {
   private server: Server | null = null;
   private bound: { dev: number; ino: number } | null = null;
+  private readonly sockets = new Set<Socket>();
 
   constructor(private readonly opts: DaemonServerOptions) {}
 
@@ -37,6 +39,8 @@ class NetDaemonServer implements DaemonServer {
     const bindAddress = isWindows ? bindPath : join(dirname(address), basename(bindPath));
 
     this.server = createNetServer((socket) => {
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
       this.opts.onConnection(wrapSocket(socket, this.opts.path));
     });
 
@@ -93,9 +97,13 @@ class NetDaemonServer implements DaemonServer {
         if (err.code !== "ENOENT") throw err;
       });
     }
+    const lingering = setTimeout(() => {
+      for (const socket of this.sockets) socket.destroy();
+    }, CLOSING_CONNECTION_GRACE_MS);
     await new Promise<void>((resolve) => {
       srv.close(() => resolve());
     });
+    clearTimeout(lingering);
   }
 
   async isPublished(): Promise<boolean> {

@@ -8,21 +8,14 @@ import {
   RateLimitConfigOrDisabledSchema,
 } from "../../src/config/schema.js";
 
-describe("config — Phase D sharing config", () => {
-  it("ServerBridgeConfigSchema accepts sharing enum and defaults to undefined", () => {
-    const parsed = ServerBridgeConfigSchema.parse({});
-    expect(parsed.sharing).toBeUndefined();
-    expect(ServerBridgeConfigSchema.parse({ sharing: "auto" }).sharing).toBe("auto");
-    expect(ServerBridgeConfigSchema.parse({ sharing: "shared" }).sharing).toBe("shared");
-    expect(ServerBridgeConfigSchema.parse({ sharing: "dedicated" }).sharing).toBe("dedicated");
-    expect(() => ServerBridgeConfigSchema.parse({ sharing: "bogus" })).toThrow();
+describe("config — removed sharing settings", () => {
+  it.each(["auto", "shared", "dedicated", "bogus", 42])("ServerBridgeConfigSchema still accepts sharing %j", (sharing) => {
+    expect(() => ServerBridgeConfigSchema.parse({ sharing })).not.toThrow();
   });
 
-  it("DaemonConfigSchema exposes auto-fork timeouts with sane defaults", () => {
-    const parsed = DaemonConfigSchema.parse({});
-    expect(parsed.autoForkDrainTimeoutMs).toBe(60_000);
-    expect(parsed.autoForkInitializeTimeoutMs).toBe(10_000);
-    expect(() => DaemonConfigSchema.parse({ autoForkDrainTimeoutMs: -1 })).toThrow();
+  it.each(["autoForkDrainTimeoutMs", "autoForkInitializeTimeoutMs"])("DaemonConfigSchema still accepts %s, with no default", (key) => {
+    expect(() => DaemonConfigSchema.parse({ [key]: -1 })).not.toThrow();
+    expect(DaemonConfigSchema.parse({})).not.toHaveProperty(key);
   });
 });
 

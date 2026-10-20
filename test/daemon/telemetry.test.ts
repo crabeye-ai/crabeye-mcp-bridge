@@ -8,11 +8,11 @@ describe("Telemetry", () => {
       children: {
         total: 0,
         spawnedTotal: 0,
-        killedTotal: { grace: 0, restart: 0, fork: 0, crash: 0, wedged: 0 },
+        killedTotal: { grace: 0, restart: 0, crash: 0, wedged: 0 },
       },
       sessions: { total: 0, openedTotal: 0, closedTotal: 0 },
-      fork: { eventsTotal: 0 },
       rpc: { inFlight: 0, errorsTotal: {} },
+      upstreamRequests: { refusedTotal: {} },
     });
   });
 
@@ -35,7 +35,7 @@ describe("Telemetry", () => {
       const s = t.snapshot();
       expect(s.children.total).toBe(0);
       expect(s.children.spawnedTotal).toBe(2);
-      expect(s.children.killedTotal).toEqual({ grace: 1, restart: 1, fork: 0, crash: 0, wedged: 0 });
+      expect(s.children.killedTotal).toEqual({ grace: 1, restart: 1, crash: 0, wedged: 0 });
     });
 
     it("recordKill never drops total below zero", () => {
@@ -47,9 +47,9 @@ describe("Telemetry", () => {
 
     it("counts each reason independently", () => {
       const t = new Telemetry();
-      const reasons: KilledReason[] = ["grace", "grace", "restart", "fork", "crash", "crash", "crash"];
+      const reasons: KilledReason[] = ["grace", "grace", "restart", "crash", "crash", "crash"];
       for (const r of reasons) t.recordKill(r);
-      expect(t.snapshot().children.killedTotal).toEqual({ grace: 2, restart: 1, fork: 1, crash: 3, wedged: 0 });
+      expect(t.snapshot().children.killedTotal).toEqual({ grace: 2, restart: 1, crash: 3, wedged: 0 });
     });
   });
 
@@ -70,16 +70,6 @@ describe("Telemetry", () => {
       t.recordSessionClose();
       expect(t.snapshot().sessions.total).toBe(0);
       expect(t.snapshot().sessions.closedTotal).toBe(1);
-    });
-  });
-
-  describe("fork events", () => {
-    it("recordForkEvent increments fork.eventsTotal", () => {
-      const t = new Telemetry();
-      t.recordForkEvent();
-      t.recordForkEvent();
-      t.recordForkEvent();
-      expect(t.snapshot().fork.eventsTotal).toBe(3);
     });
   });
 
@@ -121,6 +111,29 @@ describe("Telemetry", () => {
       t.recordRpcError("code_0");
       t.recordRpcError("code_0");
       expect(t.snapshot().rpc.errorsTotal.code_0).toBeGreaterThanOrEqual(3);
+    });
+  });
+
+  describe("upstream requests", () => {
+    it("counts refused requests by method", () => {
+      const t = new Telemetry();
+      t.recordRefusedUpstreamRequest("sampling/createMessage");
+      t.recordRefusedUpstreamRequest("sampling/createMessage");
+      t.recordRefusedUpstreamRequest("roots/list");
+      t.recordRefusedUpstreamRequest("__proto__");
+      const refused = t.snapshot().upstreamRequests.refusedTotal;
+      expect(refused).toEqual({ "sampling/createMessage": 2, "roots/list": 1, ["__proto__"]: 1 });
+      expect(Object.getPrototypeOf(refused)).toBe(Object.prototype);
+    });
+
+    it("stops adding methods at 64 but keeps counting the ones it has", () => {
+      const t = new Telemetry();
+      for (let i = 0; i < 70; i++) t.recordRefusedUpstreamRequest(`m${i}`);
+      t.recordRefusedUpstreamRequest("m0");
+      const refused = t.snapshot().upstreamRequests.refusedTotal;
+      expect(Object.keys(refused)).toHaveLength(64);
+      expect(refused.m0).toBe(2);
+      expect(refused.m64).toBeUndefined();
     });
   });
 

@@ -4,6 +4,7 @@ import { createConnection } from "node:net";
 import { lstat, mkdtemp, readFile, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ensureDaemonRunning } from "../../src/daemon/bootstrap.js";
+import type { DaemonLauncher } from "../../src/daemon/daemon-launch.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { encodeFrame } from "../../src/daemon/protocol.js";
 import { DaemonAlreadyRunningError, ManagerDaemon } from "../../src/daemon/manager.js";
@@ -131,11 +132,12 @@ describe.skipIf(isWindows)("daemon singleton (#205)", () => {
 
   it("concurrent ensureDaemonRunning calls in one process launch one daemon", async () => {
     let launches = 0;
-    const launch = (): void => {
+    const launch: DaemonLauncher = async () => {
       launches++;
       const m = manager(paths);
       started.push(m);
       void m.start();
+      return "launched";
     };
 
     await Promise.all(
@@ -148,11 +150,12 @@ describe.skipIf(isWindows)("daemon singleton (#205)", () => {
 
   it("starts a new attempt once the previous one has settled", async () => {
     let launches = 0;
-    const launch = (): void => {
+    const launch: DaemonLauncher = async () => {
       launches++;
       const m = manager(paths);
       started.push(m);
       void m.start();
+      return "launched";
     };
 
     await ensureDaemonRunning({ socketPath: paths.sock, launch });
@@ -164,11 +167,12 @@ describe.skipIf(isWindows)("daemon singleton (#205)", () => {
 
   it("a fresh attempt waits for one already in flight and re-probes instead of launching twice", async () => {
     let launches = 0;
-    const launch = (): void => {
+    const launch: DaemonLauncher = async () => {
       launches++;
       const m = manager(paths);
       started.push(m);
       void m.start();
+      return "launched";
     };
 
     await Promise.all([
@@ -181,12 +185,13 @@ describe.skipIf(isWindows)("daemon singleton (#205)", () => {
 
   it("a fresh attempt launches again when the attempt it waited for failed", async () => {
     let launches = 0;
-    const launch = (): void => {
+    const launch: DaemonLauncher = async () => {
       launches++;
-      if (launches === 1) return;
+      if (launches === 1) return "launched";
       const m = manager(paths);
       started.push(m);
       void m.start();
+      return "launched";
     };
 
     const [first, fresh] = await Promise.allSettled([
@@ -201,11 +206,12 @@ describe.skipIf(isWindows)("daemon singleton (#205)", () => {
 
   it("concurrent fresh attempts share one launch", async () => {
     let launches = 0;
-    const launch = (): void => {
+    const launch: DaemonLauncher = async () => {
       launches++;
       const m = manager(paths);
       started.push(m);
       void m.start();
+      return "launched";
     };
 
     await Promise.all(
@@ -459,11 +465,12 @@ describe.skipIf(isWindows)("daemon singleton (#205)", () => {
 
   it("keeps waiting for a launched daemon that is still reaping leaked children", async () => {
     let launches = 0;
-    const launch = (): void => {
+    const launch: DaemonLauncher = async () => {
       launches++;
       const m = managerWithSlowReap(new Promise<void>((r) => setTimeout(r, 10_000)));
       started.push(m);
       void m.start();
+      return "launched";
     };
 
     await ensureDaemonRunning({ socketPath: paths.sock, launch });

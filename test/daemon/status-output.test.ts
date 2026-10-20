@@ -6,7 +6,6 @@ import { DaemonClient } from "../../src/daemon/client.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
 import type { ChildHandle } from "../../src/daemon/child-handle.js";
 import {
-  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
   ERROR_CODE_BACKPRESSURE,
   ERROR_CODE_INVALID_PARAMS,
   ERROR_CODE_INVALID_REQUEST,
@@ -18,11 +17,12 @@ import {
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
   ERROR_CODE_UPSTREAM_RESTARTED,
+  PROTOCOL_VERSION,
   type StatusResult,
 } from "../../src/daemon/protocol.js";
+import { APP_VERSION } from "../../src/constants.js";
 
 const KNOWN_ERROR_CODES = new Set([
-  ERROR_CODE_AUTO_FORK_INITIALIZE_FAILED,
   ERROR_CODE_BACKPRESSURE,
   ERROR_CODE_INVALID_PARAMS,
   ERROR_CODE_INVALID_REQUEST,
@@ -49,7 +49,7 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
   beforeEach(async () => { paths = await tempPaths(); await mkdir(paths.dir, { recursive: true }); manager = null; });
   afterEach(async () => { if (manager !== null) await manager.stop(0).catch(() => {}); await rm(paths.dir, { recursive: true, force: true }); });
 
-  it("returns per-child entries with refcount, sessions, subscriptionCount, mode, cachedInit", async () => {
+  it("returns per-child entries with exactly pid, upstreamHash, startedAt, refcount, sessions, subscriptionCount and cachedInit", async () => {
     manager = new ManagerDaemon({
       socketPath: paths.sock, pidPath: paths.pid, lockPath: paths.lock,
       idleMs: 60_000, transport: netTransport, processTrackerPath: paths.proc,
@@ -68,7 +68,6 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
         args: [],
         resolvedEnv: {},
         cwd: "",
-        sharing: "auto" as const,
         clientInfo: { name: "test-bridge", version: "0.0.0" },
         clientCapabilities: {},
         protocolVersion: "2025-06-18",
@@ -81,14 +80,23 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       await new Promise((r) => setTimeout(r, 30));
 
       const status = (await c.call("STATUS")) as StatusResult;
+      expect(status.appVersion).toBe(APP_VERSION);
+      expect(status.version).toBe(PROTOCOL_VERSION);
+      expect(status.minBridgeProtocolVersion).toBe(1);
       expect(status.children).toHaveLength(1);
       const ch = status.children[0]!;
+      expect(Object.keys(ch).sort()).toEqual([
+        "cachedInit",
+        "pid",
+        "refcount",
+        "sessions",
+        "startedAt",
+        "subscriptionCount",
+        "upstreamHash",
+      ]);
       expect(ch.refcount).toBe(2);
       expect(new Set(ch.sessions)).toEqual(new Set([A, B]));
       expect(ch.subscriptionCount).toBe(1);
-      expect(ch.mode === "shared" || ch.mode === "dedicated").toBe(true);
-      expect(["auto", "shared", "dedicated"]).toContain(ch.sharing);
-      expect(typeof ch.forked).toBe("boolean");
       expect(ch.cachedInit).toBeNull();
       expect(typeof ch.upstreamHash).toBe("string");
       expect(typeof ch.startedAt).toBe("number");
@@ -96,11 +104,10 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       // Telemetry: 2 sessions opened on 1 shared child; nothing closed yet.
       expect(status.telemetry.children.total).toBe(1);
       expect(status.telemetry.children.spawnedTotal).toBe(1);
-      expect(status.telemetry.children.killedTotal).toEqual({ grace: 0, restart: 0, fork: 0, crash: 0, wedged: 0 });
+      expect(status.telemetry.children.killedTotal).toEqual({ grace: 0, restart: 0, crash: 0, wedged: 0 });
       expect(status.telemetry.sessions.total).toBe(2);
       expect(status.telemetry.sessions.openedTotal).toBe(2);
       expect(status.telemetry.sessions.closedTotal).toBe(0);
-      expect(status.telemetry.fork.eventsTotal).toBe(0);
       // STATUS itself is in-flight at the moment its snapshot is computed, so
       // this gauge reads 1 — the request that produced this snapshot.
       expect(status.telemetry.rpc.inFlight).toBe(1);
