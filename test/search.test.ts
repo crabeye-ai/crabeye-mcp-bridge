@@ -4,7 +4,13 @@ import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
 import { PolicyEngine } from "../src/policy/policy-engine.js";
-import { ToolSearchService, SEARCH_TOOL_NAME, RUN_TOOL_NAME } from "../src/search/index.js";
+import {
+  ToolSearchService,
+  SEARCH_TOOL_NAME,
+  RUN_TOOL_NAME,
+  runToolDefinition,
+  searchToolDefinition,
+} from "../src/search/index.js";
 import type { QueryResult } from "../src/search/index.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
 
@@ -52,14 +58,6 @@ describe("ToolSearchService", () => {
   beforeEach(() => {
     registry = new ToolRegistry();
     service = new ToolSearchService(registry);
-  });
-
-  describe("getVisibleTools", () => {
-    it("returns only meta-tools initially", () => {
-      const tools = service.getVisibleTools();
-      expect(tools).toHaveLength(2);
-      expect(tools.map((t) => t.name)).toEqual([SEARCH_TOOL_NAME, RUN_TOOL_NAME]);
-    });
   });
 
   describe("text search", () => {
@@ -355,26 +353,6 @@ describe("ToolSearchService", () => {
     });
   });
 
-  describe("auto-enable cap at 50", () => {
-    it("total enabled tools capped at MAX_LIMIT across queries", () => {
-      const tools = Array.from({ length: 60 }, (_, i) =>
-        makeTool(`src__tool_${String(i).padStart(2, "0")}`, `Tool number ${i}`),
-      );
-      registry.setToolsForSource("src", tools);
-
-      service.search({
-        queries: [
-          { tool: "Tool number", limit: 40 },
-          { tool: "Tool number", limit: 40 },
-        ],
-      });
-
-      const visible = service.getVisibleTools();
-      // 2 meta-tools + at most 50 enabled tools
-      expect(visible.length).toBeLessThanOrEqual(52);
-    });
-  });
-
   describe("error handling", () => {
     it("returns empty results when queries array is empty", () => {
       registry.setToolsForSource("a", [makeTool("a__tool")]);
@@ -437,77 +415,18 @@ describe("ToolSearchService", () => {
       expect(result.results[0].limit).toBe(10);
       expect(result.results[0].count).toBe(10);
     });
-
-    it("only paged tools are enabled in getVisibleTools", () => {
-      service.search({ queries: [{ tool: "Tool number", limit: 5, offset: 0 }] });
-      const visible = service.getVisibleTools();
-      // search_tools + run_tool + 5 paged tools
-      expect(visible).toHaveLength(7);
-    });
-
-    it("paging to next page replaces enabled tools", () => {
-      service.search({ queries: [{ tool: "Tool number", limit: 5, offset: 0 }] });
-      const page1Visible = service.getVisibleTools().map((t) => t.name).filter((n) => n !== SEARCH_TOOL_NAME && n !== RUN_TOOL_NAME);
-
-      service.search({ queries: [{ tool: "Tool number", limit: 5, offset: 5 }] });
-      const page2Visible = service.getVisibleTools().map((t) => t.name);
-
-      // Page 1 tools should no longer be visible
-      for (const name of page1Visible) {
-        expect(page2Visible).not.toContain(name);
-      }
-    });
   });
 
-  describe("enable/replace", () => {
-    beforeEach(() => {
-      registry.setToolsForSource("linear", [
-        makeTool("linear__create_issue", "Create issue"),
-        makeTool("linear__list_issues", "List issues"),
+  describe("results", () => {
+    it("always carry each tool's full input schema", () => {
+      const schema = { type: "object" as const, properties: { title: { type: "string" } }, required: ["title"] };
+      registry.setToolsForSource("linear", [{ name: "linear__create_issue", description: "Create issue", inputSchema: schema }]);
+
+      const result = service.search({ queries: [{ tool: "create" }] });
+
+      expect(allTools(result.results[0])).toEqual([
+        { tool_name: "linear__create_issue", source: "linear", description: "Create issue", input_schema: schema },
       ]);
-      registry.setToolsForSource("github", [
-        makeTool("github__create_pr", "Create PR"),
-      ]);
-    });
-
-    it("search results appear in getVisibleTools", () => {
-      service.search({ queries: [{ tool: "create" }] });
-      const tools = service.getVisibleTools();
-      const names = tools.map((t) => t.name);
-      expect(names).toContain(SEARCH_TOOL_NAME);
-      expect(names).toContain("linear__create_issue");
-      expect(names).toContain("github__create_pr");
-    });
-
-    it("new search replaces previously enabled tools", () => {
-      service.search({ queries: [{ tool: "create" }] });
-      let names = service.getVisibleTools().map((t) => t.name);
-      expect(names).toContain("linear__create_issue");
-      expect(names).toContain("github__create_pr");
-
-      service.search({ queries: [{ tool: "create_pr" }] });
-      names = service.getVisibleTools().map((t) => t.name);
-      expect(names).toContain("github__create_pr");
-      expect(names).not.toContain("linear__create_issue");
-      expect(names).not.toContain("linear__list_issues");
-    });
-
-    it("onVisibleToolsChanged fires when search enables tools", () => {
-      const callback = vi.fn();
-      service.onVisibleToolsChanged(callback);
-
-      service.search({ queries: [{ tool: "create" }] });
-      expect(callback).toHaveBeenCalledOnce();
-    });
-
-    it("onVisibleToolsChanged does not fire when results are identical", () => {
-      const callback = vi.fn();
-
-      service.search({ queries: [{ tool: "pull request" }] });
-      service.onVisibleToolsChanged(callback);
-
-      service.search({ queries: [{ tool: "pull request" }] });
-      expect(callback).not.toHaveBeenCalled();
     });
   });
 
@@ -526,32 +445,6 @@ describe("ToolSearchService", () => {
 
       result = service.search({ queries: [{ tool: "original" }] });
       expect(result.results[0].total).toBe(0);
-    });
-
-    it("enabled tools pruned when removed from registry", () => {
-      registry.setToolsForSource("a", [makeTool("a__tool1", "Alpha tool"), makeTool("a__tool2", "Alpha tool")]);
-      service.search({ queries: [{ tool: "Alpha tool" }] });
-
-      let visible = service.getVisibleTools().map((t) => t.name);
-      expect(visible).toContain("a__tool1");
-      expect(visible).toContain("a__tool2");
-
-      registry.setToolsForSource("a", [makeTool("a__tool1", "Alpha tool")]);
-
-      visible = service.getVisibleTools().map((t) => t.name);
-      expect(visible).toContain("a__tool1");
-      expect(visible).not.toContain("a__tool2");
-    });
-
-    it("visibleToolsChanged fires on prune", () => {
-      registry.setToolsForSource("a", [makeTool("a__tool1", "Alpha tool"), makeTool("a__tool2", "Alpha tool")]);
-      service.search({ queries: [{ tool: "Alpha tool" }] });
-
-      const callback = vi.fn();
-      service.onVisibleToolsChanged(callback);
-
-      registry.setToolsForSource("a", [makeTool("a__tool1")]);
-      expect(callback).toHaveBeenCalled();
     });
 
     it("new upstream tools become searchable", () => {
@@ -594,18 +487,13 @@ describe("ToolSearchService", () => {
   });
 
   describe("dispose", () => {
-    it("unsubscribes from registry", () => {
-      const callback = vi.fn();
-      service.onVisibleToolsChanged(callback);
-
+    it("stops following registry changes", () => {
       registry.setToolsForSource("a", [makeTool("a__t1", "Alpha tool")]);
-      service.search({ queries: [{ tool: "Alpha tool" }] });
-      callback.mockClear();
 
       service.dispose();
-
       registry.setToolsForSource("a", []);
-      expect(callback).not.toHaveBeenCalled();
+
+      expect(service.search({ queries: [{ tool: "Alpha tool" }] }).results[0].total).toBe(1);
     });
   });
 
@@ -721,39 +609,24 @@ describe("ToolSearchService", () => {
       // Second query: expand, should get ALL tools (not deduped)
       expect(allTools(result.results[1])).toHaveLength(2);
     });
-
-    it("does not auto-enable tools", () => {
-      const callback = vi.fn();
-      service.onVisibleToolsChanged(callback);
-
-      service.search({ queries: [{ provider: "linear" }] });
-
-      // No tools should be enabled
-      const visible = service.getVisibleTools();
-      expect(visible).toHaveLength(2); // only meta-tools
-      expect(callback).not.toHaveBeenCalled();
-    });
   });
 });
 
 // --- BridgeServer integration tests ---
 
-describe("BridgeServer with ToolSearchService", () => {
+describe("BridgeServer search_tools and run_tool", () => {
   async function createSearchTestPair(
     tools?: { source: string; tools: Tool[] }[],
     opts?: {
       modern?: boolean;
       policyEngine?: PolicyEngine;
       autoAccept?: boolean;
-      onToolsChanged?: () => void;
     },
   ) {
     const toolRegistry = new ToolRegistry();
     for (const { source, tools: t } of tools ?? []) {
       toolRegistry.setToolsForSource(source, t);
     }
-
-    const toolSearchService = new ToolSearchService(toolRegistry);
 
     const linearClient = makeMockUpstreamClient("linear", {
       callTool: vi.fn().mockResolvedValue({
@@ -763,7 +636,6 @@ describe("BridgeServer with ToolSearchService", () => {
 
     const server = new BridgeServer({
       toolRegistry,
-      toolSearchService,
       policyEngine: opts?.policyEngine,
       getUpstreamClient: (name) => (name === "linear" ? linearClient : undefined),
     });
@@ -773,13 +645,6 @@ describe("BridgeServer with ToolSearchService", () => {
       {
         ...(opts?.modern ? { versionNegotiation: { mode: "auto" as const } } : {}),
         ...(opts?.autoAccept ? { capabilities: { elicitation: {} } } : {}),
-        ...(opts?.onToolsChanged
-          ? {
-              listChanged: {
-                tools: { autoRefresh: false, onChanged: () => opts.onToolsChanged?.() },
-              },
-            }
-          : {}),
       },
     );
     if (opts?.autoAccept) {
@@ -797,7 +662,6 @@ describe("BridgeServer with ToolSearchService", () => {
       server,
       client,
       toolRegistry,
-      toolSearchService,
       linearClient,
       async cleanup() {
         await client.close();
@@ -805,20 +669,6 @@ describe("BridgeServer with ToolSearchService", () => {
       },
     };
   }
-
-  it("tools/list returns only meta-tools when no search done", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
-    ]);
-
-    const result = await client.listTools();
-    expect(result.tools).toHaveLength(2);
-    const names = result.tools.map((t) => t.name);
-    expect(names).toContain(SEARCH_TOOL_NAME);
-    expect(names).toContain(RUN_TOOL_NAME);
-
-    await cleanup();
-  });
 
   it("serves a modern-era client end to end: discover, search_tools, run_tool", async () => {
     const { client, linearClient, cleanup } = await createSearchTestPair(
@@ -828,10 +678,7 @@ describe("BridgeServer with ToolSearchService", () => {
 
     expect(client.getProtocolEra()).toBe("modern");
 
-    const listed = await client.listTools();
-    expect(listed.tools.map((t) => t.name)).toEqual(
-      expect.arrayContaining([SEARCH_TOOL_NAME, RUN_TOOL_NAME]),
-    );
+    expect((await client.listTools()).tools).toEqual([searchToolDefinition, runToolDefinition]);
 
     const search = await client.callTool({
       name: SEARCH_TOOL_NAME,
@@ -933,51 +780,37 @@ describe("BridgeServer with ToolSearchService", () => {
     await cleanup();
   });
 
-  it("auto-enabled tools appear in subsequent tools/list", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
-    ]);
+  it.each([false, true])("keeps the two bridge tools before and after searches (modern: %s)", async (modern) => {
+    const { client, toolRegistry, cleanup } = await createSearchTestPair(
+      [{ source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] }],
+      { modern },
+    );
+    expect((await client.listTools()).tools).toEqual([searchToolDefinition, runToolDefinition]);
+    expect(client.getProtocolEra()).toBe(modern ? "modern" : "legacy");
 
-    let list = await client.listTools();
-    expect(list.tools).toHaveLength(2);
+    await client.callTool({ name: SEARCH_TOOL_NAME, arguments: { queries: [{ tool: "create" }] } });
+    toolRegistry.setToolsForSource("github", [makeTool("github__create_pr", "Create PR")]);
+    await client.callTool({ name: SEARCH_TOOL_NAME, arguments: { queries: [{ provider: "github", expand_tools: true }] } });
 
-    await client.callTool({
-      name: SEARCH_TOOL_NAME,
-      arguments: { queries: [{ tool: "create" }] },
-    });
-
-    list = await client.listTools();
-    const names = list.tools.map((t) => t.name);
-    expect(names).toContain(SEARCH_TOOL_NAME);
-    expect(names).toContain("linear__create_issue");
+    expect((await client.listTools()).tools).toEqual([searchToolDefinition, runToolDefinition]);
 
     await cleanup();
   });
 
-  it.each([false, true])("tools/list_changed reaches the client after search (modern: %s)", async (modern) => {
-    let resolveChanged!: () => void;
-    const notificationReceived = new Promise<void>((resolve) => {
-      resolveChanged = resolve;
-    });
-    const { client, cleanup } = await createSearchTestPair(
+  it.each([false, true])("refuses a direct call of a searched tool and runs it through run_tool (modern: %s)", async (modern) => {
+    const { client, linearClient, cleanup } = await createSearchTestPair(
       [{ source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] }],
-      { modern, onToolsChanged: () => resolveChanged() },
+      { modern },
     );
-    expect(client.getProtocolEra()).toBe(modern ? "modern" : "legacy");
+    await client.callTool({ name: SEARCH_TOOL_NAME, arguments: { queries: [{ tool: "create" }] } });
 
-    await client.callTool({
-      name: SEARCH_TOOL_NAME,
-      arguments: { queries: [{ tool: "create" }] },
-    });
+    await expect(client.callTool({ name: "linear__create_issue", arguments: { title: "Test" } })).rejects.toThrow(
+      'Call "linear__create_issue" through run_tool',
+    );
+    expect(linearClient.callTool).not.toHaveBeenCalled();
 
-    await expect(
-      Promise.race([
-        notificationReceived,
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Timeout")), 2000),
-        ),
-      ]),
-    ).resolves.toBeUndefined();
+    const result = await client.callTool({ name: RUN_TOOL_NAME, arguments: { name: "linear__create_issue", arguments: { title: "Test" } } });
+    expect(result.content).toEqual([{ type: "text", text: "upstream result" }]);
 
     await cleanup();
   });
@@ -1000,30 +833,6 @@ describe("BridgeServer with ToolSearchService", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Bug" },
-    }, { signal: expect.any(AbortSignal) });
-
-    await cleanup();
-  });
-
-  it("namespaced tool calls still route to upstreams", async () => {
-    const { client, linearClient, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] },
-    ]);
-
-    await client.callTool({
-      name: SEARCH_TOOL_NAME,
-      arguments: { queries: [{ tool: "create" }] },
-    });
-
-    const result = await client.callTool({
-      name: "linear__create_issue",
-      arguments: { title: "Test" },
-    });
-
-    expect(result.content).toEqual([{ type: "text", text: "upstream result" }]);
-    expect(linearClient.callTool).toHaveBeenCalledWith({
-      name: "create_issue",
-      arguments: { title: "Test" },
     }, { signal: expect.any(AbortSignal) });
 
     await cleanup();
@@ -1164,17 +973,6 @@ describe("BridgeServer with ToolSearchService", () => {
         arguments: { name: "unknown__tool" },
       }),
     ).rejects.toThrow(/Upstream server not found/);
-
-    await cleanup();
-  });
-
-  it("run_tool is always visible in tools/list", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__tool")] },
-    ]);
-
-    const list = await client.listTools();
-    expect(list.tools.map((t) => t.name)).toContain(RUN_TOOL_NAME);
 
     await cleanup();
   });

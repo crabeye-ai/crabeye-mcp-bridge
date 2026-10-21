@@ -22,7 +22,6 @@ import { applyRateLimiters } from "./server/rate-limit-resolution.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { renderPassthrough } from "./server/passthrough.js";
 import { ToolSearchService } from "./search/index.js";
-import type { DiscoveryMode } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning } from "./daemon/index.js";
@@ -79,12 +78,7 @@ program
   .option("-c, --config <path>", "path to config file")
   .option("--validate", "validate config and list upstream servers, then exit")
   .option("--stats", "include session_stats in search_tools responses")
-  .addOption(
-    new Option(
-      "--discovery-mode <mode>",
-      "how searched tools are surfaced: search (response only), tools_list (native MCP tools list only), both (default)",
-    ).choices(["search", "tools_list", "both"]).default("both"),
-  )
+  .addOption(new Option("--discovery-mode <mode>").choices(["search", "tools_list", "both"]).hideHelp())
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
@@ -146,6 +140,9 @@ program
       }
 
       warnRemovedSettings(config, logger);
+      if (options.discoveryMode !== undefined) {
+        logger.warn("--discovery-mode no longer has any effect and is ignored; the bridge only exposes search_tools and run_tool", { component: "config" });
+      }
       logSelfReferences(config, logger);
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
@@ -177,8 +174,7 @@ program
         serverBridgeConfigs,
       );
 
-      const discoveryMode = options.discoveryMode as DiscoveryMode;
-      toolSearchService = new ToolSearchService(toolRegistry, policyEngine, discoveryMode);
+      toolSearchService = new ToolSearchService(toolRegistry, policyEngine);
 
       applyRateLimiters({
         upstreams,

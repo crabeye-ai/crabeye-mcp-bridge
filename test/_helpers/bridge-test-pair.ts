@@ -1,6 +1,6 @@
 import { vi } from "vitest";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
-import type { Tool } from "@modelcontextprotocol/client";
+import type { JSONRPCMessage, Tool } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { BridgeServer } from "../../src/server/bridge-server.js";
 import type { BridgeServerOptions } from "../../src/server/bridge-server.js";
@@ -14,13 +14,22 @@ export function makeTool(name: string, description?: string): Tool {
   };
 }
 
-export async function createTestPair(options?: Partial<BridgeServerOptions> & { registry?: ToolRegistry }) {
-  const { registry, ...serverOptions } = options ?? {};
+export async function createTestPair(options?: Partial<BridgeServerOptions> & { registry?: ToolRegistry; modern?: boolean }) {
+  const { registry, modern, ...serverOptions } = options ?? {};
   const toolRegistry = registry ?? new ToolRegistry();
   const server = new BridgeServer({ ...serverOptions, toolRegistry });
 
-  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const client = new Client(
+    { name: "test-client", version: "1.0.0" },
+    modern ? { versionNegotiation: { mode: "auto" } } : undefined,
+  );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const sentByServer: JSONRPCMessage[] = [];
+  const send = serverTransport.send.bind(serverTransport);
+  serverTransport.send = (message, sendOptions) => {
+    sentByServer.push(message);
+    return send(message, sendOptions);
+  };
 
   await server.connect(serverTransport);
   await client.connect(clientTransport);
@@ -29,6 +38,7 @@ export async function createTestPair(options?: Partial<BridgeServerOptions> & { 
     server,
     client,
     toolRegistry,
+    notificationsFromServer: () => sentByServer.filter((message) => !("id" in message)),
     async cleanup() {
       await client.close();
       await server.close();

@@ -45,8 +45,6 @@ export interface SearchToolsResponse {
   results: QueryResult[];
 }
 
-type VisibleToolsChangedCallback = () => void;
-
 interface IndexedTool {
   id: string;
   name: string;
@@ -55,8 +53,6 @@ interface IndexedTool {
   source: string;
   category: string;
 }
-
-export type DiscoveryMode = "search" | "tools_list" | "both";
 
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 10;
@@ -108,14 +104,6 @@ function fingerprintTools(
   return `${rows.length}|${rows.join("\x1e")}`;
 }
 
-function setsEqual(a: Set<string>, b: Set<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const item of a) {
-    if (!b.has(item)) return false;
-  }
-  return true;
-}
-
 function matchesPrefixOrRegex(value: string, pattern: string): boolean {
   const regex = parseRegex(pattern);
   if (regex) return regex.test(value);
@@ -139,7 +127,7 @@ export const searchToolDefinition: Tool = {
     "- User wants to perform an action (create, update, query, etc.) — search by tool keyword",
     "- User asks what tools or integrations are available — search by provider or category for summaries",
     "- User asks 'can you...?' about external capabilities — search before answering",
-    "- You need a tool you haven't seen yet — many tools are available but not listed until searched",
+    "- You need a tool you haven't seen yet — every tool from the connected servers is found through this search",
     "",
     "Response shape: results[].providers[].tools[]",
     "Without a tool filter, only provider summaries are returned (name, category, tool_count). Use a tool query or expand_tools: true to get full tool definitions.",
@@ -205,7 +193,7 @@ export const runToolDefinition: Tool = {
   name: RUN_TOOL_NAME,
   description: [
     "Execute any tool from any connected MCP server by its full namespaced name (provider__tool_name format).",
-    "Use this after discovering tools via search_tools. The tool does not need to be enabled first.",
+    "Use this after discovering tools via search_tools.",
     "Pass the exact namespaced name from search results and the required arguments.",
   ].join("\n"),
   inputSchema: {
@@ -229,8 +217,6 @@ export class ToolSearchService {
   private registry: ToolRegistry;
   private index: MiniSearch<IndexedTool>;
   private indexedTools = new Map<string, IndexedTool>();
-  private enabledTools = new Set<string>();
-  private listeners = new Set<VisibleToolsChangedCallback>();
   private unsubscribeRegistry: () => void;
   private policyEngine: PolicyEngine | undefined;
   /**
@@ -242,12 +228,9 @@ export class ToolSearchService {
    */
   private lastFingerprint = "";
 
-  private discoveryMode: DiscoveryMode;
-
-  constructor(registry: ToolRegistry, policyEngine?: PolicyEngine, discoveryMode: DiscoveryMode = "both") {
+  constructor(registry: ToolRegistry, policyEngine?: PolicyEngine) {
     this.registry = registry;
     this.policyEngine = policyEngine;
-    this.discoveryMode = discoveryMode;
     this.index = this.createIndex();
     this.rebuildIndex();
     this.unsubscribeRegistry = this.registry.onChanged(() => {
@@ -300,19 +283,6 @@ export class ToolSearchService {
       this.indexedTools.set(tool.name, doc);
       this.index.add(doc);
     }
-
-    // Prune enabled tools that no longer exist
-    let pruned = false;
-    for (const name of this.enabledTools) {
-      if (!this.indexedTools.has(name)) {
-        this.enabledTools.delete(name);
-        pruned = true;
-      }
-    }
-
-    if (pruned) {
-      this.notifyVisibleToolsChanged();
-    }
   }
 
   search(params: SearchToolsParams): SearchToolsResponse {
@@ -329,7 +299,6 @@ export class ToolSearchService {
     }
 
     const seenTools = new Set<string>();
-    const allEnabled: string[] = [];
     const results: QueryResult[] = [];
 
     for (const query of queries) {
@@ -389,7 +358,7 @@ export class ToolSearchService {
           offset,
           limit,
         });
-        // Do NOT add to seenTools or allEnabled in summary mode
+        // Do NOT add to seenTools in summary mode
         continue;
       }
 
@@ -543,98 +512,15 @@ export class ToolSearchService {
         limit,
       });
 
-      // Mark tools as seen for deduplication, collect enabled tools
       for (const name of deduped) {
         seenTools.add(name);
-      }
-
-      // Only enable tools in the current page (skip disabled ones)
-      for (const name of paged) {
-        if (!disabledSet.has(name) && this.indexedTools.has(name) && this.registry.getTool(name)) {
-          allEnabled.push(name);
-        }
-      }
-    }
-
-    // In "search" mode, don't populate enabledTools (tools only appear in search responses).
-    // In "tools_list" and "both" modes, expose searched tools in the MCP tools list.
-    if (this.discoveryMode !== "search") {
-      const cappedEnabled = allEnabled.slice(0, MAX_LIMIT);
-      const newEnabled = new Set(cappedEnabled);
-      const changed = !setsEqual(this.enabledTools, newEnabled);
-      this.enabledTools = newEnabled;
-
-      if (changed) {
-        this.notifyVisibleToolsChanged();
-      }
-    }
-
-    // In "tools_list" mode, strip input_schema from search results
-    // (the assistant gets schemas from the tools list instead).
-    if (this.discoveryMode === "tools_list") {
-      for (const queryResult of results) {
-        for (const provider of queryResult.providers) {
-          for (const tool of provider.tools) {
-            if (!tool.disabled) {
-              tool.input_schema = {};
-            }
-          }
-        }
       }
     }
 
     return { results };
   }
 
-  getVisibleTools(): Tool[] {
-    const sources = this.registry.listSources().map((s) => s.name);
-    const searchTool: Tool =
-      sources.length > 0
-        ? {
-            ...searchToolDefinition,
-            description:
-              searchToolDefinition.description +
-              `\n\nAvailable integrations: ${sources.join(", ")}`,
-          }
-        : searchToolDefinition;
-
-    const runTool: Tool = this.enabledTools.size > 0
-      ? {
-          ...runToolDefinition,
-          description: runToolDefinition.description +
-            "\nYou can also call the discovered tools directly by their namespaced name.",
-        }
-      : runToolDefinition;
-
-    const tools: Tool[] = [searchTool, runTool];
-    for (const name of this.enabledTools) {
-      const registered = this.registry.getTool(name);
-      if (registered) {
-        tools.push(registered.tool);
-      }
-    }
-    return tools;
-  }
-
-  onVisibleToolsChanged(callback: VisibleToolsChangedCallback): () => void {
-    this.listeners.add(callback);
-    return () => {
-      this.listeners.delete(callback);
-    };
-  }
-
   dispose(): void {
     this.unsubscribeRegistry();
-    this.listeners.clear();
-  }
-
-  private notifyVisibleToolsChanged(): void {
-    for (const listener of this.listeners) {
-      try {
-        listener();
-      } catch {
-        // Listeners must not throw, but don't let one block others
-      }
-    }
   }
 }

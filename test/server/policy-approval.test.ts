@@ -14,6 +14,7 @@ import {
   hashArgs,
 } from "../../src/server/policy-approval.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
+import { viaRunTool } from "../_helpers/run-tool.js";
 
 function makeTool(name: string): Tool {
   return {
@@ -139,10 +140,7 @@ describe.each(["legacy", "modern"] as const)(
         elicit: "accept",
       });
 
-      const result = await client.callTool({
-        name: "linear__create_issue",
-        arguments: { title: "Bug" },
-      });
+      const result = await client.callTool(viaRunTool("linear__create_issue", { title: "Bug" }));
 
       expect(result.content).toEqual([
         { type: "text", text: "called on linear" },
@@ -166,8 +164,8 @@ describe.each(["legacy", "modern"] as const)(
         elicit: "accept",
       });
 
-      await client.callTool({ name: "linear__create_issue", arguments: { n: 1 } });
-      await client.callTool({ name: "linear__create_issue", arguments: { n: 1 } });
+      await client.callTool(viaRunTool("linear__create_issue", { n: 1 }));
+      await client.callTool(viaRunTool("linear__create_issue", { n: 1 }));
 
       expect(elicitHandler).toHaveBeenCalledTimes(2);
       expect(upstream.callTool).toHaveBeenCalledTimes(2);
@@ -183,7 +181,7 @@ describe.each(["legacy", "modern"] as const)(
       });
 
       const failure = await client
-        .callTool({ name: "linear__create_issue", arguments: {} })
+        .callTool(viaRunTool("linear__create_issue"))
         .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
       expect(failure?.message).toMatch(/declined by user/);
       expect(failure?.code).toBe(ProtocolErrorCode.InvalidRequest);
@@ -200,7 +198,7 @@ describe.each(["legacy", "modern"] as const)(
       });
 
       await expect(
-        client.callTool({ name: "linear__create_issue", arguments: {} }),
+        client.callTool(viaRunTool("linear__create_issue")),
       ).rejects.toThrow(/declined by user/);
       expect(upstream.callTool).not.toHaveBeenCalled();
 
@@ -215,7 +213,7 @@ describe.each(["legacy", "modern"] as const)(
       });
 
       await expect(
-        client.callTool({ name: "linear__create_issue", arguments: {} }),
+        client.callTool(viaRunTool("linear__create_issue")),
       ).rejects.toThrow(/disabled by policy/);
       expect(elicitHandler).not.toHaveBeenCalled();
       expect(upstream.callTool).not.toHaveBeenCalled();
@@ -234,7 +232,7 @@ describe.each(["legacy", "modern"] as const)("prompt policy with a url-only elic
     });
 
     const failure = await client
-      .callTool({ name: "linear__create_issue", arguments: {} })
+      .callTool(viaRunTool("linear__create_issue"))
       .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
     expect(failure?.message).toMatch(/does not support elicitation/);
     expect(failure?.code).toBe(ProtocolErrorCode.InvalidRequest);
@@ -252,7 +250,7 @@ describe("prompt policy without client elicitation support", () => {
     });
 
     const failure = await client
-      .callTool({ name: "linear__create_issue", arguments: {} })
+      .callTool(viaRunTool("linear__create_issue"))
       .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
     expect(failure?.message).toMatch(/does not support elicitation/);
     expect(failure?.code).toBe(ProtocolErrorCode.InvalidRequest);
@@ -268,11 +266,7 @@ describe("prompt policy without client elicitation support", () => {
     });
 
     const failure = await client
-      .callTool({
-        name: "linear__create_issue",
-        arguments: {},
-        _meta: { [CLIENT_CAPABILITIES_META_KEY]: { elicitation: { form: {} } } },
-      })
+      .callTool(viaRunTool("linear__create_issue", {}, { _meta: { [CLIENT_CAPABILITIES_META_KEY]: { elicitation: { form: {} } } } }))
       .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
     expect(failure?.message).toMatch(/does not support elicitation/);
     expect(upstream.callTool).not.toHaveBeenCalled();
@@ -287,7 +281,7 @@ describe("prompt policy without client elicitation support", () => {
     });
 
     await expect(
-      client.callTool({ name: "linear__create_issue", arguments: {} }),
+      client.callTool(viaRunTool("linear__create_issue")),
     ).rejects.toThrow(/capabilit|elicitation/i);
     expect(upstream.callTool).not.toHaveBeenCalled();
 
@@ -301,7 +295,7 @@ describe("approval state binding (manual MRTR, modern era)", () => {
 
   async function firstRound(client: Client, name: string, args: Record<string, unknown>) {
     const round = (await client.callTool(
-      { name, arguments: args },
+      viaRunTool(name, args),
       { allowInputRequired: true },
     )) as unknown as Round;
     expect(typeof round.requestState).toBe("string");
@@ -309,8 +303,8 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     return round.requestState!;
   }
 
-  function redeem(client: Client, params: Record<string, unknown>) {
-    return client.callTool(params as never, { allowInputRequired: true });
+  function redeem(client: Client, name: string, args: Record<string, unknown>, round: Record<string, unknown>) {
+    return client.callTool(viaRunTool(name, args, round) as never, { allowInputRequired: true });
   }
 
   it("redeems an approval only for the exact tool and arguments it was minted for", async () => {
@@ -323,25 +317,16 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
 
     await expect(
-      client.callTool(
-        { name: "linear__create_issue", arguments: { title: "Other" }, inputResponses: accept, requestState } as never,
-        { allowInputRequired: true },
-      ),
+      redeem(client, "linear__create_issue", { title: "Other" }, { inputResponses: accept, requestState }),
     ).rejects.toThrow(/does not match this call/);
 
     await expect(
-      client.callTool(
-        { name: "linear__delete_issue", arguments: { title: "Bug" }, inputResponses: accept, requestState } as never,
-        { allowInputRequired: true },
-      ),
+      redeem(client, "linear__delete_issue", { title: "Bug" }, { inputResponses: accept, requestState }),
     ).rejects.toThrow(/does not match this call/);
 
     expect(upstream.callTool).not.toHaveBeenCalled();
 
-    const result = await client.callTool(
-      { name: "linear__create_issue", arguments: { title: "Bug" }, inputResponses: accept, requestState } as never,
-      { allowInputRequired: true },
-    );
+    const result = await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState });
     expect(result.content).toEqual([{ type: "text", text: "called on linear" }]);
     expect(upstream.callTool).toHaveBeenCalledTimes(1);
 
@@ -355,14 +340,13 @@ describe("approval state binding (manual MRTR, modern era)", () => {
       elicit: "accept",
       manual: true,
     });
-    const params = { name: "linear__create_issue", arguments: { title: "Bug" } };
-    const requestState = await firstRound(client, params.name, params.arguments);
+    const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
 
-    await redeem(client, { ...params, inputResponses: accept, requestState });
+    await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState });
     expect(upstream.callTool).toHaveBeenCalledTimes(1);
 
     await expect(
-      redeem(client, { ...params, inputResponses: accept, requestState }),
+      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState }),
     ).rejects.toThrow(/already used/);
     expect(upstream.callTool).toHaveBeenCalledTimes(1);
 
@@ -376,15 +360,14 @@ describe("approval state binding (manual MRTR, modern era)", () => {
       elicit: "accept",
       manual: true,
     });
-    const params = { name: "linear__create_issue", arguments: { title: "Bug" } };
-    const requestState = await firstRound(client, params.name, params.arguments);
+    const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
     const decline = { approval: { action: "decline" } };
 
     await expect(
-      redeem(client, { ...params, inputResponses: decline, requestState }),
+      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: decline, requestState }),
     ).rejects.toThrow(/declined by user/);
     await expect(
-      redeem(client, { ...params, inputResponses: accept, requestState }),
+      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState }),
     ).rejects.toThrow(/already used/);
     expect(upstream.callTool).not.toHaveBeenCalled();
 
@@ -400,10 +383,7 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     });
     const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
 
-    const again = (await client.callTool(
-      { name: "linear__create_issue", arguments: { title: "Bug" }, inputResponses: {}, requestState } as never,
-      { allowInputRequired: true },
-    )) as unknown as Round;
+    const again = (await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: {}, requestState })) as unknown as Round;
     expect(typeof again.requestState).toBe("string");
     expect(again.inputRequests).toHaveProperty("approval");
     expect(upstream.callTool).not.toHaveBeenCalled();
@@ -422,10 +402,7 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     const tampered = tamper(requestState);
 
     await expect(
-      client.callTool(
-        { name: "linear__create_issue", arguments: { title: "Bug" }, inputResponses: accept, requestState: tampered } as never,
-        { allowInputRequired: true },
-      ),
+      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState: tampered }),
     ).rejects.toThrow(/Invalid or expired requestState/);
     expect(upstream.callTool).not.toHaveBeenCalled();
 

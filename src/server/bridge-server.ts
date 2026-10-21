@@ -51,14 +51,14 @@ const BASE_INSTRUCTIONS = [
   "- You are about to claim a tool is unavailable or that you cannot perform an action — search first, then answer",
   "- You are about to fall back to a web search for something that might be available as a tool",
   "",
-  "Skip search_tools when you already have everything you need to call the tool. If a server below documents a tool with its full input schema (or the tool is already auto-enabled), call it directly via run_tool — searching first only burns a round-trip. Search remains required when you don't yet know the namespaced tool name or its arguments.",
+  "Skip search_tools when you already have everything you need to call the tool. If a server below documents a tool with its full input schema, call it via run_tool right away — searching first only burns a round-trip. Search remains required when you don't yet know the namespaced tool name or its arguments.",
   "",
   "Discovery workflow:",
   '1. Start broad: search by provider or category to get summaries: { "queries": [{ "provider": "linear" }] }',
   '2. Drill in: use a tool filter or expand_tools to get full definitions: { "queries": [{ "provider": "linear", "expand_tools": true }] } or { "queries": [{ "tool": "create", "provider": "linear" }] }',
   "",
   "Results are always grouped by provider: results[].providers[].tools[]",
-  "After discovering tools, use run_tool to execute them. You can also call auto-enabled tools directly by their namespaced name.",
+  "After discovering tools, use run_tool to execute them; it is the only way to call them.",
   "When in doubt, search — it is always better to search and find nothing than to miss an available tool.",
 ].join("\n");
 
@@ -120,19 +120,27 @@ function errorResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }], isError: true };
 }
 
+const BRIDGE_TOOLS = [searchToolDefinition, runToolDefinition];
+
+function directCallError(name: string): ProtocolError {
+  const quoted = JSON.stringify(name);
+  const advice = parseNamespacedName(name)
+    ? `Call ${quoted} through run_tool: { "name": ${quoted}, "arguments": { ... } }.`
+    : `Unknown tool ${quoted}; call upstream tools through run_tool.`;
+  return new ProtocolError(ProtocolErrorCode.InvalidParams, `${advice} This bridge's only tools are search_tools and run_tool.`);
+}
+
 function throwIfDenied(decision: PolicyDecision | undefined): void {
   if (decision?.kind === "deny") throw new ProtocolError(ProtocolErrorCode.InvalidRequest, decision.reason);
 }
 
 export class BridgeServer {
-  private server: Server | undefined;
   private handle: StdioServerHandle | undefined;
   private toolRegistry: ToolRegistry;
-  private toolSearchService: ToolSearchService | undefined;
+  private toolSearchService: ToolSearchService;
   private policyEngine: PolicyEngine | undefined;
-  private sessionStats: SessionStats | undefined;
+  private sessionStats: SessionStats;
   private approval = new ApprovalFlow();
-  private unsubscribe: (() => void) | undefined;
   private options: BridgeServerOptions;
   private markSessionStarted!: () => void;
   private readonly sessionStart: Promise<void>;
@@ -143,35 +151,16 @@ export class BridgeServer {
       this.markSessionStarted = resolve;
     });
     this.toolRegistry = options?.toolRegistry ?? new ToolRegistry();
-    this.toolSearchService = options?.toolSearchService;
     this.policyEngine = options?.policyEngine;
-
-    if (this.toolSearchService) {
-      this.sessionStats = new SessionStats(
-        this.toolRegistry,
-        [searchToolDefinition, runToolDefinition],
-      );
-    }
-
-    this.subscribeToolListChanged();
-  }
-
-  private subscribeToolListChanged(): void {
-    if (this.unsubscribe) return;
-    const notify = () => {
-      this.server?.sendToolListChanged().catch(() => {
-      });
-    };
-    this.unsubscribe = this.toolSearchService
-      ? this.toolSearchService.onVisibleToolsChanged(notify)
-      : this.toolRegistry.onChanged(notify);
+    this.toolSearchService = options?.toolSearchService ?? new ToolSearchService(this.toolRegistry, this.policyEngine);
+    this.sessionStats = new SessionStats(this.toolRegistry, BRIDGE_TOOLS);
   }
 
   private buildServer(era: ProtocolEra): Server {
     const server = new Server(
       { name: APP_NAME, version: APP_VERSION },
       {
-        capabilities: { tools: { listChanged: true } },
+        capabilities: { tools: {} },
         instructions: this.composeInstructions(),
         requestState: { verify: this.approval.verify },
       },
@@ -186,10 +175,7 @@ export class BridgeServer {
     server.setRequestHandler("tools/list", (_request, ctx) => {
       this.markSessionStarted();
       this.logClientOnce(connection, ctx);
-      if (this.toolSearchService) {
-        return { tools: this.toolSearchService.getVisibleTools() };
-      }
-      return { tools: this.toolRegistry.listTools() };
+      return { tools: BRIDGE_TOOLS };
     });
 
     server.setRequestHandler("tools/call", async (request, ctx) => {
@@ -197,23 +183,12 @@ export class BridgeServer {
       this.logClientOnce(connection, ctx);
       const { name, arguments: args } = request.params;
 
-      if (this.toolSearchService && name === SEARCH_TOOL_NAME) {
-        return this.handleSearchTools(this.toolSearchService, args);
-      }
-      if (this.toolSearchService && name === RUN_TOOL_NAME) {
-        return this.handleRunTool(args, ctx, connection);
-      }
-
-      // Direct tool call (tool must be in registry)
-      if (!this.toolRegistry.getTool(name)) {
-        throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown tool: ${name}`);
-      }
-      return this.routeToUpstream(name, args, ctx, connection);
+      if (name === SEARCH_TOOL_NAME) return this.handleSearchTools(args);
+      if (name === RUN_TOOL_NAME) return this.handleRunTool(args, ctx, connection);
+      throw directCallError(name);
     });
 
     this.options.logger?.info("server instance built", { component: "bridge", era });
-
-    this.server = server;
     return server;
   }
 
@@ -231,10 +206,7 @@ export class BridgeServer {
     });
   }
 
-  private handleSearchTools(
-    service: ToolSearchService,
-    args: Record<string, unknown> | undefined,
-  ): CallToolResult {
+  private handleSearchTools(args: Record<string, unknown> | undefined): CallToolResult {
     const params = (args ?? {}) as unknown as SearchToolsParams;
 
     if (!Array.isArray(params.queries) || params.queries.length === 0) {
@@ -249,16 +221,11 @@ export class BridgeServer {
       }
     }
 
-    const result = service.search(params);
-    let response: object = result;
-    if (this.sessionStats) {
-      this.sessionStats.recordSearchResponse(JSON.stringify(result));
-      const snapshot = this.sessionStats.getSnapshot();
-      if (this.options.showStats) {
-        response = { session_stats: snapshot, ...result };
-      }
-      this.options.onSearchStats?.(snapshot);
-    }
+    const result = this.toolSearchService.search(params);
+    this.sessionStats.recordSearchResponse(JSON.stringify(result));
+    const snapshot = this.sessionStats.getSnapshot();
+    const response: object = this.options.showStats ? { session_stats: snapshot, ...result } : result;
+    this.options.onSearchStats?.(snapshot);
     return { content: [{ type: "text", text: JSON.stringify(response) }] };
   }
 
@@ -388,8 +355,6 @@ export class BridgeServer {
 
     const { started, restoreStart } = interceptStart(transport, () => this.watchForSessionStart(transport));
 
-    this.subscribeToolListChanged();
-
     const handle = serveStdio((mcpCtx) => this.buildServer(mcpCtx.era), {
       transport,
       onerror: (error) => {
@@ -405,7 +370,6 @@ export class BridgeServer {
       await started;
     } catch (err) {
       this.handle = undefined;
-      this.server = undefined;
       await handle.close().catch(() => {});
       throw err;
     } finally {
@@ -438,12 +402,8 @@ export class BridgeServer {
   }
 
   async close(): Promise<void> {
-    this.unsubscribe?.();
-    this.unsubscribe = undefined;
-    this.sessionStats?.dispose();
     await this.handle?.close();
     this.handle = undefined;
-    this.server = undefined;
   }
 
   getToolRegistry(): ToolRegistry {

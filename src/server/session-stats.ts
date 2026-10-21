@@ -15,14 +15,10 @@ export class SessionStats {
   private registry: ToolRegistry;
   private metaToolTokens: number = 0;
   private cumulativeSearchTokens: number = 0;
-  private unsubscribe: () => void;
 
   constructor(registry: ToolRegistry, metaTools: Tool[]) {
     this.registry = registry;
     this.metaToolTokens = estimateTokens(JSON.stringify(metaTools));
-    this.unsubscribe = this.registry.onChanged(() => {
-      // Baseline recalculated on every snapshot, nothing to cache
-    });
   }
 
   recordSearchResponse(responseJson: string): void {
@@ -38,9 +34,5 @@ export class SessionStats {
       baseline_tokens: baselineTokens,
       bridge_tokens: bridgeTokens,
     };
-  }
-
-  dispose(): void {
-    this.unsubscribe();
   }
 }

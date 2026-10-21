@@ -13,6 +13,7 @@ import {
   DAEMON_SOCKET_FILENAME,
 } from "../../src/constants.js";
 import { daemonPidsRunning, signalIfRunning, waitUntil } from "./processes.js";
+import { viaRunTool } from "./run-tool.js";
 import { STUB_STDIO_SERVER } from "./stub-stdio-server.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -37,21 +38,36 @@ export async function cliAtVersion(cliScript: string, dir: string, version: stri
 export interface BridgeProcess {
   client: Client;
   stderr: () => string;
+  notifications: () => string[];
 }
 
-export async function connectBridgeProcess(script: string, configPath: string, env: NodeJS.ProcessEnv): Promise<BridgeProcess> {
+export interface BridgeLaunch {
+  extraArgs?: string[];
+  modern?: boolean;
+}
+
+export async function connectBridgeProcess(
+  script: string,
+  configPath: string,
+  env: NodeJS.ProcessEnv,
+  { extraArgs = [], modern = false }: BridgeLaunch = {},
+): Promise<BridgeProcess> {
   const definedEnv = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [script, "--config", configPath],
+    args: [script, "--config", configPath, ...extraArgs],
     env: definedEnv,
     stderr: "pipe",
   });
   let stderr = "";
   transport.stderr!.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-  const client = new Client({ name: "test-client", version: "0" });
+  const client = new Client({ name: "test-client", version: "0" }, modern ? { versionNegotiation: { mode: "auto" } } : undefined);
+  const notifications: string[] = [];
+  client.fallbackNotificationHandler = async (notification) => {
+    notifications.push(notification.method);
+  };
   await client.connect(transport);
-  return { client, stderr: () => stderr };
+  return { client, stderr: () => stderr, notifications: () => [...notifications] };
 }
 
 export async function callStubTool(
@@ -59,7 +75,7 @@ export async function callStubTool(
   tool = "plain",
   args: Record<string, unknown> = {},
 ): Promise<unknown> {
-  return (await client.callTool({ name: "run_tool", arguments: { name: `stub__${tool}`, arguments: args } })).content;
+  return (await client.callTool(viaRunTool(`stub__${tool}`, args))).content;
 }
 
 export interface ScratchHome {
@@ -68,7 +84,7 @@ export interface ScratchHome {
   socketPath: string;
   env: () => NodeJS.ProcessEnv;
   status: () => Promise<StatusResult | null>;
-  connectBridge: (script: string) => Promise<BridgeProcess>;
+  connectBridge: (script: string, launch?: BridgeLaunch) => Promise<BridgeProcess>;
   cleanUp: () => Promise<void>;
 }
 
@@ -101,8 +117,8 @@ export async function scratchHome(
     socketPath,
     env,
     status: async () => (await daemonStatus(socketPath)) as StatusResult | null,
-    connectBridge: async (script) => {
-      const bridge = await connectBridgeProcess(script, configPath, env());
+    connectBridge: async (script, launch) => {
+      const bridge = await connectBridgeProcess(script, configPath, env(), launch);
       bridges.push(bridge);
       return bridge;
     },

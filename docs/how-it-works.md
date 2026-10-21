@@ -2,14 +2,12 @@
 
 When the AI assistant starts its session, the bridge launches every configured upstream server, connects to it, and discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
 
-Two meta-tools are exposed to the AI assistant:
+The bridge exposes exactly two tools to the AI assistant, and that list never changes during a session:
 
-- **`search_tools`** — Fuzzy-search across all discovered tools by name, description, provider, or category. Matching tools are automatically enabled for use.
-- **`run_tool`** — Execute any discovered tool directly by its namespaced name (e.g. `linear__create_issue`).
+- **`search_tools`** — Fuzzy-search across all discovered tools by name, description, provider, or category.
+- **`run_tool`** — Run any discovered tool by its namespaced name (e.g. `linear__create_issue`).
 
-The AI assistant calls `search_tools` automatically when it detects a relevant intent, then uses `run_tool` or calls the auto-enabled tools directly.
-
-When `search_tools` is called, the assistant receives the matching tools and their input schemas. The bridge also directly exposes the searched tools to the assistant so they can be called natively. Some assistants don't refresh their tool list mid-session, so they may not see the newly exposed tools — but they can still call them through `run_tool` and the call is executed exactly as if made directly on the original tool.
+The AI assistant calls `search_tools` when it detects a relevant intent, then runs the tool it found with `run_tool`. When a search returns tools, each comes with its full input schema. Upstream tools can only be run through `run_tool`: calling one by its own name fails with an error that says to use `run_tool`.
 
 The bridge tracks how many tokens it saves compared to exposing all upstream tool definitions directly. Token savings are always logged to stderr after each search. To also include them in `search_tools` responses, pass `--stats`:
 
@@ -153,7 +151,7 @@ The bridge returns matching tools with their full input schemas, grouped by prov
 }
 ```
 
-Matching tools are automatically enabled for direct use by the assistant — no extra step needed.
+The assistant runs any of these tools with `run_tool`, passing its `tool_name` as `name`.
 
 ### Multiple queries
 
@@ -174,9 +172,9 @@ Pass multiple query objects to search for different things in a single call. Res
 
 The first query returns tool details (has `tool` filter), the second returns a provider summary, and the third returns expanded tool details for design tools. Each query produces its own result set with independent pagination.
 
-### Running a tool directly
+### Running a tool without searching
 
-If the assistant already knows the namespaced name, it can skip the search and call `run_tool` directly:
+If the assistant already knows the namespaced name, it can skip the search and call `run_tool` right away:
 
 ```json
 {

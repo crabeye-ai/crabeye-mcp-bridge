@@ -70,7 +70,7 @@ describe("BridgeServer connect lifecycle", () => {
     await expect(server.close()).resolves.toBeUndefined();
   });
 
-  it("still notifies tool-list changes after a connect/close/connect cycle", async () => {
+  it("still finds newly registered upstream tools through search after a connect/close/connect cycle", async () => {
     const registry = new ToolRegistry();
     const server = new BridgeServer({ toolRegistry: registry });
 
@@ -83,19 +83,12 @@ describe("BridgeServer connect lifecycle", () => {
     await server.connect(s);
     await client.connect(c);
 
-    const notified = new Promise<void>((resolve) => {
-      client.setNotificationHandler("notifications/tools/list_changed", () => resolve());
-    });
     registry.setToolsForSource("linear", [
       { name: "linear__create_issue", description: "x", inputSchema: { type: "object" } },
     ]);
+    const result = await client.callTool({ name: "search_tools", arguments: { queries: [{ tool: "create_issue" }] } });
 
-    await expect(
-      Promise.race([
-        notified,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000)),
-      ]),
-    ).resolves.toBeUndefined();
+    expect(JSON.stringify(result.content)).toContain("linear__create_issue");
 
     await client.close();
     await server.close();

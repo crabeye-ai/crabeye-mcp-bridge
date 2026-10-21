@@ -4,6 +4,7 @@ import { RateLimiter } from "../../src/server/rate-limiter.js";
 import { PolicyEngine } from "../../src/policy/policy-engine.js";
 import type { StatusChangeCallback, UpstreamClient } from "../../src/upstream/types.js";
 import { createTestPair, FakeUpstreams, makeMockUpstreamClient, makeTool } from "../_helpers/bridge-test-pair.js";
+import { viaRunTool } from "../_helpers/run-tool.js";
 
 type Pair = Awaited<ReturnType<typeof createTestPair>>;
 
@@ -63,7 +64,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { limiter, acquired, release } = gatedRateLimiter();
     const { client } = await connect(limiter);
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await acquired;
     upstreams.set("srv", undefined);
     release();
@@ -80,7 +81,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const queue = queuedWaiters(limiter);
     const { client } = await connect(limiter);
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await vi.waitFor(() => expect(queue).toHaveLength(1));
     limiter.dispose();
     upstreams.set("srv", undefined);
@@ -98,7 +99,7 @@ describe("run_tool waits across reloads and cancellation", () => {
       callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from replacement" }] }),
     });
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await acquired;
     upstreams.set("srv", replacement);
     release();
@@ -112,7 +113,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     upstreams.set("srv", down);
     const { client } = await connect();
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await vi.waitFor(() => expect(listeners.size).toBe(1));
     upstreams.set("srv", undefined);
 
@@ -127,7 +128,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { client } = await connect(undefined, policy);
     const replacement = makeMockUpstreamClient("srv");
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await vi.waitFor(() => expect(listeners.size).toBe(1));
     policy.update("always", { srv: { toolPolicy: "never" } });
     upstreams.set("srv", replacement);
@@ -143,7 +144,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { limiter, acquired, release } = gatedRateLimiter();
     const { client } = await connect(limiter, policy);
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await acquired;
     policy.update("always", { srv: { toolPolicy: "never" } });
     release();
@@ -161,7 +162,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { client: down, listeners } = disconnectedClient("srv");
     const replacement = makeMockUpstreamClient("srv");
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await acquired;
     upstreams.set("srv", down);
     release();
@@ -181,7 +182,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { client } = await connect(undefined, policy);
     const replacement = makeMockUpstreamClient("srv");
 
-    const call = client.callTool({ name: "srv__op", arguments: {} });
+    const call = client.callTool(viaRunTool("srv__op"));
     await vi.waitFor(() => expect(listeners.size).toBe(1));
     policy.update("always", { srv: { toolPolicy: "prompt" } });
     upstreams.set("srv", replacement);
@@ -196,7 +197,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { client } = await connect();
     const controller = new AbortController();
 
-    const call = client.callTool({ name: "srv__op", arguments: {} }, { signal: controller.signal });
+    const call = client.callTool(viaRunTool("srv__op"), { signal: controller.signal });
     await vi.waitFor(() => expect(listeners.size).toBe(1));
     controller.abort();
 
@@ -214,9 +215,9 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { client } = await connect(limiter);
     const controller = new AbortController();
 
-    const cancelled = client.callTool({ name: "srv__op", arguments: { n: 1 } }, { signal: controller.signal });
+    const cancelled = client.callTool(viaRunTool("srv__op", { n: 1 }), { signal: controller.signal });
     await vi.waitFor(() => expect(queue).toHaveLength(1));
-    const next = client.callTool({ name: "srv__op", arguments: { n: 2 } });
+    const next = client.callTool(viaRunTool("srv__op", { n: 2 }));
     await vi.waitFor(() => expect(queue).toHaveLength(2));
     controller.abort();
 
@@ -242,7 +243,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     const { client } = await connect();
     const controller = new AbortController();
 
-    const call = client.callTool({ name: "srv__op", arguments: {} }, { signal: controller.signal });
+    const call = client.callTool(viaRunTool("srv__op"), { signal: controller.signal });
     await vi.waitFor(() => expect(upstreamSignal).toBeDefined());
     controller.abort();
 

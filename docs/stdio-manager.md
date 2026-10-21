@@ -101,7 +101,7 @@ The manager broadcasts certain upstream notifications across every session shari
 
 | Notification | Manager behavior | Forwarded to MCP client? |
 |--------------|------------------|--------------------------|
-| `notifications/tools/list_changed` | Broadcast to every attached session. | **Yes** — each bridge forwards to its MCP client. |
+| `notifications/tools/list_changed` | Broadcast to every attached session. | No — each bridge re-indexes its search; its own tool list never changes. |
 | `notifications/prompts/list_changed` | Broadcast to every attached session. | No — bridge does not implement this surface. |
 | `notifications/resources/list_changed` | Broadcast to every attached session. | No — bridge does not implement this surface. |
 | `notifications/resources/updated` | Routed by per-session subscription tracker (only sessions that subscribed get the notification). | Yes. |

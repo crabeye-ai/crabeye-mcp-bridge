@@ -24,6 +24,11 @@ const tools = {
     text(id, "endless");
   },
   "stdout-flood": () => process.stdout.write("x".repeat(9 * 1024 * 1024)),
+  "add-tool": (id, args) => {
+    TOOLS.push(args.name);
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }) + "\\n");
+    text(id, "added");
+  },
   "ignore-pings": (id) => {
     answersPings = false;
     text(id, "ignoring pings");
@@ -47,7 +52,7 @@ const serve = () => onNewlineOnlyLines((line) => {
   const msg = JSON.parse(line);
   if (msg.id === undefined || msg.method === undefined) return;
   if (msg.method === "initialize") {
-    reply(msg.id, { result: { protocolVersion: msg.params.protocolVersion, serverInfo: { name: "stub", version: "0" }, capabilities: { tools: {} } } });
+    reply(msg.id, { result: { protocolVersion: msg.params.protocolVersion, serverInfo: { name: "stub", version: "0" }, capabilities: { tools: { listChanged: true } } } });
   } else if (msg.method === "tools/list" && process.env.${STUB_EXIT_ON_TOOLS_LIST_ENV}) {
     process.stderr.write("Error: cannot list tools\\n", () => process.exit(4));
   } else if (msg.method === "tools/list") {

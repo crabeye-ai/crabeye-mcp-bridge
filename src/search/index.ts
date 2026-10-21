@@ -6,7 +6,6 @@ export {
   runToolDefinition,
 } from "./tool-search-service.js";
 export type {
-  DiscoveryMode,
   SearchQuery,
   SearchToolsParams,
   SearchToolsResponse,

@@ -9,8 +9,10 @@ import {
 } from "@modelcontextprotocol/server";
 import type { ProtocolEra, ServerContext } from "@modelcontextprotocol/server";
 import { BridgeServer } from "../../src/server/bridge-server.js";
+import { runToolDefinition, searchToolDefinition } from "../../src/search/index.js";
 import { ClientMetadata, type HandshakeSource } from "../../src/server/client-metadata.js";
 import { spyLogger, type SpyLogger } from "../_helpers/spy-logger.js";
+import { viaRunTool } from "../_helpers/run-tool.js";
 
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const expectedProtocolVersion: Record<ProtocolEra, string> = {
@@ -34,7 +36,7 @@ async function connectClient(bridge: BridgeServer, era: ProtocolEra, name = "cla
 }
 
 function callMissingTool(client: Client) {
-  return client.callTool({ name: "nope__missing", arguments: {} }).catch(() => undefined);
+  return client.callTool(viaRunTool("nope__missing")).catch(() => undefined);
 }
 
 function burstOfRequests(client: Client) {
@@ -144,7 +146,7 @@ describe("client identity logging on a legacy connection", () => {
     const bridge = new BridgeServer({ logger });
     const client = await connectClient(bridge, "legacy", "");
 
-    await expect(client.listTools()).resolves.toEqual({ tools: [] });
+    await expect(client.listTools()).resolves.toEqual({ tools: [searchToolDefinition, runToolDefinition] });
 
     expect(clientConnectedLines(logger)).toEqual([]);
 
@@ -179,7 +181,7 @@ describe("client identity logging on a modern connection", () => {
       };
     });
     await transport.send(request);
-    expect(await replied).toMatchObject({ id: request.id, result: { tools: [] } });
+    expect(await replied).toMatchObject({ id: request.id, result: { tools: [searchToolDefinition, runToolDefinition] } });
   }
 
   it("logs when the first request is a tool call", async () => {

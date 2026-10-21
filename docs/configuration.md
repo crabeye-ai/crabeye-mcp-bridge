@@ -132,7 +132,7 @@ Levels:
 | `"tools"` | Instructions plus a `### Tools` list with each namespaced tool name and description. |
 | `"full"` | Same as `"tools"` plus each tool's `inputSchema` as compact JSON. |
 
-The literal `true` is not accepted — pick a level explicitly. Headings use the config key (e.g. `linear`), which is also the namespace prefix the model uses when invoking tools (`linear__create_issue`). Tools filtered out by `_bridge.tools` allow/deny do not appear in the rendered list.
+The literal `true` is not accepted — pick a level explicitly. Headings use the config key (e.g. `linear`), which is also the namespace prefix of the tool names the model passes to `run_tool` (`linear__create_issue`). Tools filtered out by `_bridge.tools` allow/deny do not appear in the rendered list.
 
 `_bridge.passthroughMaxBytes` (optional, positive integer) caps the per-server rendered block in UTF-8 bytes. Excess content is truncated at a codepoint boundary and `…(truncated)` is appended. The marker itself is not counted toward the cap.
 

@@ -27,7 +27,6 @@ npx @crabeye-ai/crabeye-mcp-bridge [command] [options]
 | `-c, --config <path>` | Path to config file (or set `MCP_BRIDGE_CONFIG`) |
 | `--validate` | Validate config and list upstream servers, then exit |
 | `--stats` | Include `session_stats` in `search_tools` responses (always logged to stderr) |
-| `--discovery-mode <mode>` | How searched tools are surfaced: `search`, `tools_list`, or `both` (default) |
 | `-V, --version` | Print version |
 | `-h, --help` | Print help |
 
