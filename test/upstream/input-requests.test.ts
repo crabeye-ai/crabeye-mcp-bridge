@@ -14,6 +14,7 @@ import { readBody, sendWebResponse, toWebRequest } from "../_helpers/web-http.js
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { spawnTestManager, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { APP_NAME } from "../../src/constants.js";
+import { errorResult } from "../_helpers/run-tool.js";
 
 const isWindows = process.platform === "win32";
 
@@ -146,9 +147,9 @@ describe("an upstream that asks the client for input", () => {
       });
       cleanups.push(cleanup);
 
-      await expect(
-        client.callTool({ name: "run_tool", arguments: { name: "asker__ask", arguments: {} } }),
-      ).rejects.toThrow(`Upstream server "asker" error: ${refusal("elicitation")}`);
+      expect(await client.callTool({ name: "run_tool", arguments: { name: "asker__ask", arguments: {} } })).toMatchObject(
+        errorResult(`Upstream server "asker" error: ${refusal("elicitation")}`),
+      );
     });
   });
 

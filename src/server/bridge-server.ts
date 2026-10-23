@@ -3,13 +3,15 @@ import {
   StdioServerTransport,
   type StdioServerHandle,
 } from "@modelcontextprotocol/server/stdio";
-import { Server, ProtocolError, ProtocolErrorCode, isJSONRPCRequest } from "@modelcontextprotocol/server";
+import { McpServer, fromJsonSchema, isJSONRPCRequest } from "@modelcontextprotocol/server";
 import type {
   CallToolResult,
   InputRequiredResult,
   JSONRPCMessage,
+  JsonSchemaType,
   ProtocolEra,
   ServerContext,
+  Tool,
   Transport,
 } from "@modelcontextprotocol/server";
 import type { Readable, Writable } from "node:stream";
@@ -27,12 +29,10 @@ import {
 import type { UpstreamClient } from "../upstream/types.js";
 import {
   ToolSearchService,
-  SEARCH_TOOL_NAME,
-  RUN_TOOL_NAME,
   searchToolDefinition,
   runToolDefinition,
 } from "../search/index.js";
-import type { SearchToolsParams } from "../search/index.js";
+import type { RunToolParams, SearchToolsParams } from "../search/index.js";
 import type { PolicyDecision, PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
 import type { SessionStatsSnapshot } from "./session-stats.js";
@@ -120,18 +120,12 @@ function errorResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }], isError: true };
 }
 
+type ToolCallOutcome = CallToolResult | InputRequiredResult | Promise<CallToolResult | InputRequiredResult>;
+
 const BRIDGE_TOOLS = [searchToolDefinition, runToolDefinition];
 
-function directCallError(name: string): ProtocolError {
-  const quoted = JSON.stringify(name);
-  const advice = parseNamespacedName(name)
-    ? `Call ${quoted} through run_tool: { "name": ${quoted}, "arguments": { ... } }.`
-    : `Unknown tool ${quoted}; call upstream tools through run_tool.`;
-  return new ProtocolError(ProtocolErrorCode.InvalidParams, `${advice} This bridge's only tools are search_tools and run_tool.`);
-}
-
 function throwIfDenied(decision: PolicyDecision | undefined): void {
-  if (decision?.kind === "deny") throw new ProtocolError(ProtocolErrorCode.InvalidRequest, decision.reason);
+  if (decision?.kind === "deny") throw new Error(decision.reason);
 }
 
 export class BridgeServer {
@@ -156,40 +150,60 @@ export class BridgeServer {
     this.sessionStats = new SessionStats(this.toolRegistry, BRIDGE_TOOLS);
   }
 
-  private buildServer(era: ProtocolEra): Server {
-    const server = new Server(
+  private buildServer(era: ProtocolEra): McpServer {
+    const mcp = new McpServer(
       { name: APP_NAME, version: APP_VERSION },
       {
-        capabilities: { tools: {} },
+        capabilities: { tools: { listChanged: false } },
         instructions: this.composeInstructions(),
         requestState: { verify: this.approval.verify },
       },
     );
 
     const connection: Connection = {
-      client: new ClientMetadata(era, server),
+      client: new ClientMetadata(era, mcp.server),
       clientLogged: false,
     };
-    server.oninitialized = () => this.logClientOnce(connection);
+    mcp.server.oninitialized = () => this.logClientOnce(connection);
 
-    server.setRequestHandler("tools/list", (_request, ctx) => {
-      this.markSessionStarted();
-      this.logClientOnce(connection, ctx);
-      return { tools: BRIDGE_TOOLS };
-    });
+    const tools = [
+      this.registerBridgeTool<SearchToolsParams>(mcp, searchToolDefinition, connection, (args) =>
+        this.handleSearchTools(args),
+      ),
+      this.registerBridgeTool<RunToolParams>(mcp, runToolDefinition, connection, (args, ctx) =>
+        this.handleRunTool(args, ctx, connection),
+      ),
+    ];
 
-    server.setRequestHandler("tools/call", async (request, ctx) => {
-      this.markSessionStarted();
-      this.logClientOnce(connection, ctx);
-      const { name, arguments: args } = request.params;
-
-      if (name === SEARCH_TOOL_NAME) return this.handleSearchTools(args);
-      if (name === RUN_TOOL_NAME) return this.handleRunTool(args, ctx, connection);
-      throw directCallError(name);
+    mcp.server.setRequestHandler("tools/list", (_request, ctx) => {
+      this.startSession(connection, ctx);
+      return { tools };
     });
 
     this.options.logger?.info("server instance built", { component: "bridge", era });
-    return server;
+    return mcp;
+  }
+
+  private registerBridgeTool<T>(
+    mcp: McpServer,
+    tool: Tool,
+    connection: Connection,
+    handle: (args: T, ctx: ServerContext) => ToolCallOutcome,
+  ): Tool {
+    mcp.registerTool(
+      tool.name,
+      { description: tool.description, inputSchema: fromJsonSchema<T>(tool.inputSchema as JsonSchemaType) },
+      (args, ctx) => {
+        this.startSession(connection, ctx);
+        return handle(args, ctx);
+      },
+    );
+    return tool;
+  }
+
+  private startSession(connection: Connection, ctx: ServerContext): void {
+    this.markSessionStarted();
+    this.logClientOnce(connection, ctx);
   }
 
   private logClientOnce(connection: Connection, ctx?: ServerContext): void {
@@ -206,10 +220,8 @@ export class BridgeServer {
     });
   }
 
-  private handleSearchTools(args: Record<string, unknown> | undefined): CallToolResult {
-    const params = (args ?? {}) as unknown as SearchToolsParams;
-
-    if (!Array.isArray(params.queries) || params.queries.length === 0) {
+  private handleSearchTools(params: SearchToolsParams): CallToolResult {
+    if (params.queries.length === 0) {
       return errorResult("Error: 'queries' must be a non-empty array of query objects.");
     }
     for (let i = 0; i < params.queries.length; i++) {
@@ -230,19 +242,16 @@ export class BridgeServer {
   }
 
   private handleRunTool(
-    args: Record<string, unknown> | undefined,
+    { name, arguments: toolArgs }: RunToolParams,
     ctx: ServerContext,
     connection: Connection,
-  ): Promise<CallToolResult | InputRequiredResult> | CallToolResult {
-    const toolName = (args as { name?: string })?.name;
-    const toolArgs = (args as { arguments?: Record<string, unknown> })?.arguments;
-
-    if (!toolName) {
+  ): ToolCallOutcome {
+    if (!name) {
       return errorResult(
         "Error: 'name' is required — provide the full namespaced tool name (e.g. 'linear__create_issue').",
       );
     }
-    return this.routeToUpstream(toolName, toolArgs, ctx, connection);
+    return this.routeToUpstream(name, toolArgs, ctx, connection);
   }
 
   private async routeToUpstream(
@@ -253,10 +262,7 @@ export class BridgeServer {
   ): Promise<CallToolResult | InputRequiredResult> {
     const parsed = parseNamespacedName(name);
     if (!parsed) {
-      throw new ProtocolError(
-        ProtocolErrorCode.InvalidParams,
-        `Invalid tool name (missing namespace): ${name}`,
-      );
+      throw new Error(`Invalid tool name (missing namespace): ${name}`);
     }
 
     const toolKey = `${parsed.source}__${parsed.toolName}`;
@@ -264,10 +270,7 @@ export class BridgeServer {
     throwIfDenied(decision);
     if (decision?.kind === "prompt") {
       if (!connection.client.supportsFormElicitation(ctx)) {
-        throw new ProtocolError(
-          ProtocolErrorCode.InvalidRequest,
-          `Tool ${toolKey} requires confirmation but the client does not support elicitation`,
-        );
+        throw new Error(`Tool ${toolKey} requires confirmation but the client does not support elicitation`);
       }
       const outcome = await this.approval.resolve(toolKey, args, decision.request, ctx);
       if (outcome !== "approved") return outcome;
@@ -275,19 +278,13 @@ export class BridgeServer {
 
     const getClient = this.options.getUpstreamClient;
     if (!getClient) {
-      throw new ProtocolError(
-        ProtocolErrorCode.InternalError,
-        `No upstream client resolver configured`,
-      );
+      throw new Error("No upstream client resolver configured");
     }
 
     const signal = ctx.mcpReq.signal;
     if (!getClient(parsed.source)) await this.awaitPendingRegistration(parsed.source, signal);
     if (!getClient(parsed.source)) {
-      throw new ProtocolError(
-        ProtocolErrorCode.InternalError,
-        `Upstream server not found: ${parsed.source}`,
-      );
+      throw new Error(`Upstream server not found: ${parsed.source}`);
     }
 
     const waitOptions = {
@@ -305,8 +302,7 @@ export class BridgeServer {
       } catch (err) {
         if (signal.aborted) throw cancelledError();
         if (err instanceof RateLimiterDisposedError) throw removedError(parsed.source);
-        const message = err instanceof Error ? err.message : String(err);
-        throw new ProtocolError(ProtocolErrorCode.InternalError, message);
+        throw err;
       }
     }
 
@@ -318,10 +314,7 @@ export class BridgeServer {
       if (signal.aborted) throw cancelledError();
       if (client.status === "auth_required") throw reauthorizationError(parsed.source, client.name);
       const message = err instanceof Error ? err.message : String(err);
-      throw new ProtocolError(
-        ProtocolErrorCode.InternalError,
-        `Upstream server "${parsed.source}" error: ${message}`,
-      );
+      throw new Error(`Upstream server "${parsed.source}" error: ${message}`);
     }
   }
 
@@ -341,10 +334,7 @@ export class BridgeServer {
     const decision = this.policyEngine?.evaluate(source, toolName, args);
     throwIfDenied(decision);
     if (decision?.kind === "prompt" && decisionBeforeWait?.kind !== "prompt") {
-      throw new ProtocolError(
-        ProtocolErrorCode.InvalidRequest,
-        `Tool ${source}__${toolName} now requires confirmation after a configuration change; please retry`,
-      );
+      throw new Error(`Tool ${source}__${toolName} now requires confirmation after a configuration change; please retry`);
     }
   }
 

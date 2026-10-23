@@ -14,6 +14,7 @@ import { ToolSearchService } from "../../src/search/index.js";
 import { makeTestStore } from "../_helpers/credential-store.js";
 import { createTestPair } from "../_helpers/bridge-test-pair.js";
 import { transportKeepingFirstMessageHandler } from "../_helpers/transports.js";
+import { errorResult } from "../_helpers/run-tool.js";
 
 let sessionsOpened = 0;
 
@@ -110,7 +111,7 @@ describe("upstream registration", () => {
     it("reports a server that is not configured as not found", async () => {
       const client = await startBridge({ alpha: { command: "node", args: ["server.js"] } });
 
-      await expect(runEcho(client, "ghost")).rejects.toThrow(/Upstream server not found: ghost/);
+      expect(await runEcho(client, "ghost")).toMatchObject(errorResult("Upstream server not found: ghost"));
     });
 
     it("reports a server whose credentials cannot be resolved as not found", async () => {
@@ -118,7 +119,7 @@ describe("upstream registration", () => {
         alpha: { command: "node", args: ["server.js"], env: { TOKEN: "${credential:missing}" } },
       });
 
-      await expect(runEcho(client, "alpha")).rejects.toThrow(/Upstream server not found: alpha/);
+      expect(await runEcho(client, "alpha")).toMatchObject(errorResult("Upstream server not found: alpha"));
     });
   });
 

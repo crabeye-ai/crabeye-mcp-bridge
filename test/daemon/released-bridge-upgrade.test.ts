@@ -5,7 +5,8 @@ import { isDeepStrictEqual } from "node:util";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { daemonPidsRunning } from "../_helpers/processes.js";
 import { until } from "../_helpers/daemon-fixtures.js";
-import { CALLED, STILL_RUNNING, callStubTool, cliAtVersion, scratchHome, type ScratchHome } from "../_helpers/bridge-process.js";
+import { CALLED, STILL_RUNNING, callStubTool, callStubToolResult, cliAtVersion, scratchHome, type ScratchHome } from "../_helpers/bridge-process.js";
+import { errorResult } from "../_helpers/run-tool.js";
 import { installReleasedBridge, releasedBridgeAt } from "../_helpers/released-bridge.js";
 import { processExists } from "../../src/process/process-utils.js";
 import { APP_VERSION } from "../../src/constants.js";
@@ -70,7 +71,9 @@ describe.skipIf(isWindows)("upgrading from the released crabeye 1.3.0", { timeou
 
     await callStubTool(newBridge, "stderr", { text: "seen by current bridges only" });
     expect(await callStubTool(releasedBridge)).toEqual(CALLED);
-    await callStubTool(newBridge, "crash", { lines: ["Error: upstream gone"], code: 1 }).catch(() => {});
+    expect(await callStubToolResult(newBridge, "crash", { lines: ["Error: upstream gone"], code: 1 })).toMatchObject(
+      errorResult('Upstream server "stub" error: child process exited'),
+    );
     await until(async () => isDeepStrictEqual(await callStubTool(releasedBridge).catch(() => null), CALLED), 20_000);
   });
 

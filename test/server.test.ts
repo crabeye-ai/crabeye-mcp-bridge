@@ -2,12 +2,12 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import { Client, InMemoryTransport, ProtocolErrorCode } from "@modelcontextprotocol/client";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
-import { APP_VERSION } from "../src/constants.js";
+import { APP_NAME, APP_VERSION } from "../src/constants.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
 import { createTestPair, makeMockUpstreamClient, makeTool } from "./_helpers/bridge-test-pair.js";
-import { viaRunTool } from "./_helpers/run-tool.js";
+import { errorResult, viaRunTool } from "./_helpers/run-tool.js";
 import { runToolDefinition, searchToolDefinition } from "../src/search/index.js";
 import { PolicyEngine } from "../src/policy/index.js";
 import {
@@ -17,6 +17,8 @@ import {
 } from "../src/server/tool-namespacing.js";
 
 const BRIDGE_TOOLS = [searchToolDefinition, runToolDefinition];
+const REAUTHORIZE_SRV =
+  `Upstream server "srv" needs re-authorization. Run: ${APP_NAME} auth srv (or update its configured credentials if it does not use OAuth).`;
 
 // --- ToolRegistry ---
 
@@ -120,7 +122,7 @@ describe("BridgeServer initialize", () => {
     const { client, cleanup } = await createTestPair({ modern });
 
     expect(client.getProtocolEra()).toBe(modern ? "modern" : "legacy");
-    expect(client.getServerCapabilities()?.tools).toEqual({});
+    expect(client.getServerCapabilities()?.tools).toEqual({ listChanged: false });
 
     await cleanup();
   });
@@ -270,6 +272,30 @@ describe("search_tools", () => {
 
     await cleanup();
   });
+
+  describe.each([false, true])("session stats (modern: %s)", (modern) => {
+    it.each([false, true])("reports them on a search, and puts them in the result only with --stats (stats: %s)", async (showStats) => {
+      const registry = new ToolRegistry();
+      registry.setToolsForSource("linear", [makeTool("linear__create_issue")]);
+      const onSearchStats = vi.fn();
+      const { client, cleanup } = await createTestPair({ registry, modern, showStats, onSearchStats });
+
+      const result = await client.callTool({ name: "search_tools", arguments: { queries: [{ provider: "linear" }] } });
+      const body = JSON.parse((result.content as Array<{ text: string }>)[0]!.text);
+
+      expect(onSearchStats).toHaveBeenCalledOnce();
+      const [snapshot] = onSearchStats.mock.calls[0]!;
+      expect(snapshot).toEqual({
+        tokens_saved: expect.any(Number),
+        baseline_tokens: expect.any(Number),
+        bridge_tokens: expect.any(Number),
+      });
+      expect(body.session_stats).toEqual(showStats ? snapshot : undefined);
+      expect(body.results).toHaveLength(1);
+
+      await cleanup();
+    });
+  });
 });
 
 // --- tools/call ---
@@ -277,25 +303,17 @@ describe("search_tools", () => {
 describe("tools/call", () => {
   describe.each([false, true])("direct calls (modern: %s)", (modern) => {
     it.each([
-      ["a registered upstream tool", "linear__create_issue", 'Call "linear__create_issue" through run_tool: { "name": "linear__create_issue", "arguments": { ... } }.'],
-      ["a policy-denied upstream tool", "linear__delete_issue", 'Call "linear__delete_issue" through run_tool: { "name": "linear__delete_issue", "arguments": { ... } }.'],
-      ["an unknown namespaced tool", "linear__nope", 'Call "linear__nope" through run_tool: { "name": "linear__nope", "arguments": { ... } }.'],
-      ["a name with quotes", 'linear__say"hi"', 'Call "linear__say\\"hi\\"" through run_tool: { "name": "linear__say\\"hi\\"", "arguments": { ... } }.'],
-      ["a name without a namespace", "nonexistent", 'Unknown tool "nonexistent"; call upstream tools through run_tool.'],
-    ])("refuses a direct call of %s without reaching any upstream", async (_case, name, advice) => {
+      ["a registered upstream tool", "linear__create_issue"],
+      ["a name without a namespace", "nonexistent"],
+    ])("refuses a direct call of %s as an unknown tool without reaching any upstream", async (_case, name) => {
       const registry = new ToolRegistry();
-      registry.setToolsForSource("linear", [makeTool("linear__create_issue"), makeTool("linear__delete_issue")]);
+      registry.setToolsForSource("linear", [makeTool("linear__create_issue")]);
       const upstream = makeMockUpstreamClient("linear");
-      const { client, cleanup } = await createTestPair({
-        registry,
-        modern,
-        getUpstreamClient: () => upstream,
-        policyEngine: new PolicyEngine("always", { linear: { toolPolicy: "always", tools: { delete_issue: "never" } } }),
-      });
+      const { client, cleanup } = await createTestPair({ registry, modern, getUpstreamClient: () => upstream });
 
       await expect(client.callTool({ name, arguments: { title: "Bug" } })).rejects.toMatchObject({
         code: ProtocolErrorCode.InvalidParams,
-        message: `${advice} This bridge's only tools are search_tools and run_tool.`,
+        message: `Tool ${name} not found`,
       });
       expect(upstream.callTool).not.toHaveBeenCalled();
 
@@ -325,6 +343,31 @@ describe("tools/call", () => {
       name: "create_issue",
       arguments: { title: "Bug" },
     }, { signal: expect.any(AbortSignal) });
+
+    await cleanup();
+  });
+
+  it.each([false, true])("returns an upstream result through the era's projection: object structured content unchanged, other structured content with a text copy and, in the 2025 era, wrapped as {result} (modern: %s)", async (modern) => {
+    const registry = new ToolRegistry();
+    registry.setToolsForSource("srv", [makeTool("srv__op")]);
+    const upstream = makeMockUpstreamClient("srv", {
+      callTool: vi.fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "kept" }], structuredContent: { n: 1 } })
+        .mockResolvedValueOnce({ content: [], structuredContent: [1, 2] }),
+    });
+    const { client, cleanup } = await createTestPair({ registry, modern, getUpstreamClient: () => upstream });
+    const serverInfo = modern ? { _meta: expect.any(Object) } : {};
+
+    expect(await client.callTool(viaRunTool("srv__op"))).toEqual({
+      ...serverInfo,
+      content: [{ type: "text", text: "kept" }],
+      structuredContent: { n: 1 },
+    });
+    expect(await client.callTool(viaRunTool("srv__op"))).toEqual({
+      ...serverInfo,
+      content: [{ type: "text", text: "[1,2]" }],
+      structuredContent: modern ? [1, 2] : { result: [1, 2] },
+    });
 
     await cleanup();
   });
@@ -360,35 +403,33 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("throws error when upstream server is not found", async () => {
+  it.each([false, true])("returns an error result when the upstream server is not found (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("gone", [makeTool("gone__my-tool")]);
 
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => undefined,
     });
 
-    await expect(
-      client.callTool(viaRunTool("gone__my-tool")),
-    ).rejects.toThrow(/Upstream server not found: gone/);
+    expect(await client.callTool(viaRunTool("gone__my-tool"))).toMatchObject(errorResult("Upstream server not found: gone"));
 
     await cleanup();
   });
 
-  it("tells the caller to re-authorize when the upstream is still paused for authorization", async () => {
+  it.each([false, true])("tells the caller to re-authorize when the upstream is still paused for authorization (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
     const mockClient = makeMockUpstreamClient("srv", { status: "auth_required" });
 
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => mockClient,
     });
 
-    await expect(
-      client.callTool(viaRunTool("srv__my-tool")),
-    ).rejects.toThrow(/needs re-authorization\. Run: crabeye-mcp-bridge auth srv/);
+    expect(await client.callTool(viaRunTool("srv__my-tool"))).toMatchObject(errorResult(REAUTHORIZE_SRV));
     expect(mockClient.retryNow).toHaveBeenCalledOnce();
     expect(mockClient.callTool).not.toHaveBeenCalled();
 
@@ -449,7 +490,7 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("returns the 'reconnecting' error after waiting 30s for an upstream that stays down", async () => {
+  it.each([false, true])("returns the 'reconnecting' error after waiting 30s for an upstream that stays down (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
     let retryRequested: () => void = () => {};
@@ -459,6 +500,7 @@ describe("tools/call", () => {
       retryNow: vi.fn(async () => retryRequested()),
     });
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => mockClient,
     });
@@ -469,8 +511,8 @@ describe("tools/call", () => {
       const callPromise = client
         .callTool(viaRunTool("srv__my-tool"), { timeout: 120_000 })
         .finally(() => (settled = true));
-      const assertion = expect(callPromise).rejects.toThrow(
-        /Upstream server "srv" is unavailable; reconnecting in the background/,
+      const assertion = expect(callPromise).resolves.toMatchObject(
+        errorResult('Upstream server "srv" is unavailable; reconnecting in the background. Please retry shortly.'),
       );
       await retried;
 
@@ -521,7 +563,7 @@ describe("tools/call", () => {
     await cleanup();
   });
 
-  it("stops waiting and asks for re-authorization when the reconnect needs it", async () => {
+  it.each([false, true])("stops waiting and asks for re-authorization when the reconnect needs it (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
 
@@ -535,6 +577,7 @@ describe("tools/call", () => {
     });
 
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => mockClient,
     });
@@ -547,12 +590,12 @@ describe("tools/call", () => {
       cb({ previous: "disconnected", current: "auth_required" });
     }
 
-    await expect(callPromise).rejects.toThrow(/needs re-authorization/);
+    expect(await callPromise).toMatchObject(errorResult(REAUTHORIZE_SRV));
 
     await cleanup();
   });
 
-  it("tells the caller to re-authorize when their tool call is what paused the upstream", async () => {
+  it.each([false, true])("tells the caller to re-authorize when their tool call is what paused the upstream (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__my-tool")]);
     const mockClient: UpstreamClient = makeMockUpstreamClient("srv", {
@@ -562,18 +605,17 @@ describe("tools/call", () => {
       }),
     });
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => mockClient,
     });
 
-    await expect(
-      client.callTool(viaRunTool("srv__my-tool")),
-    ).rejects.toThrow(/needs re-authorization\. Run: crabeye-mcp-bridge auth srv/);
+    expect(await client.callTool(viaRunTool("srv__my-tool"))).toMatchObject(errorResult(REAUTHORIZE_SRV));
 
     await cleanup();
   });
 
-  it("wraps upstream callTool errors with server name", async () => {
+  it.each([false, true])("returns upstream callTool errors as an error result naming the server (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("flaky", [makeTool("flaky__broken")]);
 
@@ -582,42 +624,38 @@ describe("tools/call", () => {
     });
 
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => mockClient,
     });
 
-    await expect(
-      client.callTool(viaRunTool("flaky__broken")),
-    ).rejects.toThrow(/Upstream server "flaky" error: connection reset/);
+    expect(await client.callTool(viaRunTool("flaky__broken"))).toMatchObject(errorResult('Upstream server "flaky" error: connection reset'));
 
     await cleanup();
   });
 
-  it("throws error when tool has no namespace separator", async () => {
+  it.each([false, true])("returns an error result when the tool has no namespace separator (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("server-a", [makeTool("no-namespace")]);
 
     const { client, cleanup } = await createTestPair({
+      modern,
       registry,
       getUpstreamClient: () => makeMockUpstreamClient("server-a"),
     });
 
-    await expect(
-      client.callTool(viaRunTool("no-namespace")),
-    ).rejects.toThrow(/missing namespace/);
+    expect(await client.callTool(viaRunTool("no-namespace"))).toMatchObject(errorResult("Invalid tool name (missing namespace): no-namespace"));
 
     await cleanup();
   });
 
-  it("throws error when no upstream client resolver is configured", async () => {
+  it.each([false, true])("returns an error result when no upstream client resolver is configured (modern: %s)", async (modern) => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__tool")]);
 
-    const { client, cleanup } = await createTestPair({ registry });
+    const { client, cleanup } = await createTestPair({ modern, registry });
 
-    await expect(
-      client.callTool(viaRunTool("srv__tool")),
-    ).rejects.toThrow(/No upstream client resolver/);
+    expect(await client.callTool(viaRunTool("srv__tool"))).toMatchObject(errorResult("No upstream client resolver configured"));
 
     await cleanup();
   });

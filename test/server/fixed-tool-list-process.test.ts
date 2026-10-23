@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
+import { ProtocolErrorCode } from "@modelcontextprotocol/client";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { until } from "../_helpers/daemon-fixtures.js";
-import { CALLED, callStubTool, occurrences, scratchHome, type BridgeLaunch, type BridgeProcess, type ScratchHome } from "../_helpers/bridge-process.js";
+import { CALLED, callStubTool, callStubToolResult, occurrences, scratchHome, type BridgeLaunch, type BridgeProcess, type ScratchHome } from "../_helpers/bridge-process.js";
+import { errorResult } from "../_helpers/run-tool.js";
 import { runToolDefinition, searchToolDefinition } from "../../src/search/index.js";
 
 const isWindows = process.platform === "win32";
@@ -62,29 +64,40 @@ describe.skipIf(isWindows)("the bridge's tool list from the built CLI", { timeou
     await search(connected, { provider: "stub", expand_tools: true });
     await callStubTool(connected, "add-tool", { name: "freshly-added" });
     await until(async () => (await search(connected, { tool: "freshly-added" })).includes("stub__freshly-added"), 10_000);
-    await expect(callStubTool(connected, "crash", { lines: ["Error: gone"], code: 1 })).rejects.toThrow(
-      'Upstream server "stub" error: child process exited',
+    expect(await callStubToolResult(connected, "crash", { lines: ["Error: gone"], code: 1 })).toMatchObject(
+      errorResult('Upstream server "stub" error: child process exited'),
     );
-    await until(async () => (await callStubTool(connected).catch(() => null)) !== null, 10_000);
+    await until(async () => isDeepStrictEqual(await callStubTool(connected).catch(() => null), CALLED), 10_000);
     expect(connected.stderr()).toContain("STDIO server exited with code 1");
     await addSecondServer(connected);
 
     expect(await toolList(connected)).toEqual([searchToolDefinition, runToolDefinition]);
     expect(connected.notifications()).toEqual([]);
-    expect(connected.client.getServerCapabilities()?.tools).toEqual({});
+    expect(connected.client.getServerCapabilities()?.tools).toEqual({ listChanged: false });
     if (subscription) {
       expect(subscription.honoredFilter).toEqual({});
       await subscription.close();
     }
   });
 
-  it("refuses a direct call of an upstream tool, pointing to run_tool, which still runs it", async () => {
+  it("refuses a direct call of an upstream tool as an unknown tool, while run_tool still runs it", async () => {
     const connected = await bridge();
 
-    await expect(connected.client.callTool({ name: "stub__plain", arguments: {} })).rejects.toThrow(
-      `Call "stub__plain" through run_tool: { "name": "stub__plain", "arguments": { ... } }. This bridge's only tools are search_tools and run_tool.`,
-    );
+    await expect(connected.client.callTool({ name: "stub__plain", arguments: {} })).rejects.toMatchObject({
+      code: ProtocolErrorCode.InvalidParams,
+      message: "Tool stub__plain not found",
+    });
     expect(await callStubTool(connected)).toEqual(CALLED);
+  });
+
+  it.each([false, true])("returns a policy denial and refused arguments as error results the assistant can read (modern: %s)", async (modern) => {
+    home = await scratchHome(() => [cliScript], { stubBridge: { tools: { "log-message": "never" } } });
+    const connected = await bridge({ modern });
+
+    expect(await callStubToolResult(connected, "log-message")).toMatchObject(errorResult("Tool stub__log-message is disabled by policy"));
+    expect(await connected.client.callTool({ name: "run_tool", arguments: {} })).toMatchObject(
+      errorResult("Input validation error: Invalid arguments for tool run_tool: data must have required property 'name'"),
+    );
   });
 
   it.each(["search", "tools_list", "both"])("starts with --discovery-mode %s, warns once, and behaves as without it", async (mode) => {

@@ -5,7 +5,8 @@ import { dirname, join } from "node:path";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { daemonPidsRunning } from "../_helpers/processes.js";
 import { until } from "../_helpers/daemon-fixtures.js";
-import { CALLED, STILL_RUNNING, callStubTool, cliAtVersion, occurrences, scratchHome, type ScratchHome } from "../_helpers/bridge-process.js";
+import { CALLED, STILL_RUNNING, callStubTool, callStubToolResult, cliAtVersion, occurrences, scratchHome, type ScratchHome } from "../_helpers/bridge-process.js";
+import { errorResult } from "../_helpers/run-tool.js";
 import { PROTOCOL_VERSION, type StatusResult } from "../../src/daemon/protocol.js";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
 import { AWAIT_PREDECESSOR_FLAG, successorReport } from "../../src/daemon/daemon-launch.js";
@@ -89,15 +90,12 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       expect(old.appVersion).toBe("0.9.0");
       const oldBridge = await connectBridge(oldCli);
       expect(await callStubTool(oldBridge)).toEqual(CALLED);
-      const inFlight = callStubTool(oldBridge, "slow", { ms: 10_000 }).then(
-        () => "finished",
-        (err: Error) => err.message,
-      );
+      const inFlight = callStubToolResult(oldBridge, "slow", { ms: 10_000 });
 
       const newBridge = await connectBridge();
 
       expect(await callStubTool(newBridge)).toEqual(CALLED);
-      expect(await inFlight).toBe('Upstream server "stub" error: daemon shutdown');
+      expect(await inFlight).toMatchObject(errorResult('Upstream server "stub" error: daemon shutdown'));
       const replaced = await home.status();
       expect(replaced).toMatchObject({ appVersion: APP_VERSION });
       expect(replaced!.pid).not.toBe(old.pid);

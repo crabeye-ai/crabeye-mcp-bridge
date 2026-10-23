@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import { Client, InMemoryTransport, ProtocolErrorCode } from "@modelcontextprotocol/client";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
@@ -13,6 +13,7 @@ import {
 } from "../src/search/index.js";
 import type { QueryResult } from "../src/search/index.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
+import { errorResult } from "./_helpers/run-tool.js";
 
 function makeTool(name: string, description?: string): Tool {
   return {
@@ -797,16 +798,17 @@ describe("BridgeServer search_tools and run_tool", () => {
     await cleanup();
   });
 
-  it.each([false, true])("refuses a direct call of a searched tool and runs it through run_tool (modern: %s)", async (modern) => {
+  it.each([false, true])("refuses a direct call of a searched tool as an unknown tool and runs it through run_tool (modern: %s)", async (modern) => {
     const { client, linearClient, cleanup } = await createSearchTestPair(
       [{ source: "linear", tools: [makeTool("linear__create_issue", "Create issue")] }],
       { modern },
     );
     await client.callTool({ name: SEARCH_TOOL_NAME, arguments: { queries: [{ tool: "create" }] } });
 
-    await expect(client.callTool({ name: "linear__create_issue", arguments: { title: "Test" } })).rejects.toThrow(
-      'Call "linear__create_issue" through run_tool',
-    );
+    await expect(client.callTool({ name: "linear__create_issue", arguments: { title: "Test" } })).rejects.toMatchObject({
+      code: ProtocolErrorCode.InvalidParams,
+      message: "Tool linear__create_issue not found",
+    });
     expect(linearClient.callTool).not.toHaveBeenCalled();
 
     const result = await client.callTool({ name: RUN_TOOL_NAME, arguments: { name: "linear__create_issue", arguments: { title: "Test" } } });
@@ -838,56 +840,43 @@ describe("BridgeServer search_tools and run_tool", () => {
     await cleanup();
   });
 
-  it("search_tools with no queries returns error", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__tool")] },
-    ]);
+  describe.each([false, true])("argument checks (modern: %s)", (modern) => {
+    it.each([
+      ["search_tools without queries", SEARCH_TOOL_NAME, {}, "data must have required property 'queries'"],
+      ["search_tools with queries that are not an array", SEARCH_TOOL_NAME, { queries: "linear" }, "data/queries must be array"],
+      ["search_tools with a limit that is not a number", SEARCH_TOOL_NAME, { queries: [{ tool: "create", limit: "10" }] }, "data/queries/0/limit must be number"],
+      ["run_tool without a name", RUN_TOOL_NAME, {}, "data must have required property 'name'"],
+      ["run_tool with a name that is not a string", RUN_TOOL_NAME, { name: 5 }, "data/name must be string"],
+      ["run_tool with arguments that are not an object", RUN_TOOL_NAME, { name: "linear__tool", arguments: '{"title":"Bug"}' }, "data/arguments must be object"],
+    ])("refuses %s with an error result before the tool runs", async (_case, tool, args, expected) => {
+      const { client, linearClient, cleanup } = await createSearchTestPair(
+        [{ source: "linear", tools: [makeTool("linear__tool")] }],
+        { modern },
+      );
 
-    const result = await client.callTool({
-      name: SEARCH_TOOL_NAME,
-      arguments: {},
+      expect(await client.callTool({ name: tool, arguments: args })).toMatchObject(
+        errorResult(`Input validation error: Invalid arguments for tool ${tool}: ${expected}`),
+      );
+      expect(linearClient.callTool).not.toHaveBeenCalled();
+
+      await cleanup();
     });
 
-    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toContain("Error");
-    expect(result.isError).toBe(true);
+    it.each([
+      ["search_tools with an empty queries array", SEARCH_TOOL_NAME, { queries: [] }, "Error: 'queries' must be a non-empty array of query objects."],
+      ["search_tools with a query missing all filters", SEARCH_TOOL_NAME, { queries: [{ tool: "create" }, {}] }, "Error: queries[1] must have at least one of 'tool', 'provider', or 'category'."],
+      ["run_tool with an empty name", RUN_TOOL_NAME, { name: "" }, "Error: 'name' is required — provide the full namespaced tool name (e.g. 'linear__create_issue')."],
+    ])("refuses %s with the bridge's own message", async (_case, tool, args, expected) => {
+      const { client, linearClient, cleanup } = await createSearchTestPair(
+        [{ source: "linear", tools: [makeTool("linear__tool")] }],
+        { modern },
+      );
 
-    await cleanup();
-  });
+      expect(await client.callTool({ name: tool, arguments: args })).toMatchObject(errorResult(expected));
+      expect(linearClient.callTool).not.toHaveBeenCalled();
 
-  it("search_tools with empty queries array returns error", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__tool")] },
-    ]);
-
-    const result = await client.callTool({
-      name: SEARCH_TOOL_NAME,
-      arguments: { queries: [] },
+      await cleanup();
     });
-
-    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toContain("Error");
-    expect(result.isError).toBe(true);
-
-    await cleanup();
-  });
-
-  it("search_tools with query missing all filters returns error", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__tool")] },
-    ]);
-
-    const result = await client.callTool({
-      name: SEARCH_TOOL_NAME,
-      arguments: { queries: [{}] },
-    });
-
-    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toContain("Error");
-    expect(text).toContain("queries[0]");
-    expect(result.isError).toBe(true);
-
-    await cleanup();
   });
 
   // --- run_tool ---
@@ -930,49 +919,26 @@ describe("BridgeServer search_tools and run_tool", () => {
     await cleanup();
   });
 
-  it("run_tool with missing name returns error", async () => {
+  it("run_tool with an invalid namespace returns an error result", async () => {
     const { client, cleanup } = await createSearchTestPair([
       { source: "linear", tools: [makeTool("linear__tool")] },
     ]);
 
-    const result = await client.callTool({
-      name: RUN_TOOL_NAME,
-      arguments: {},
-    });
-
-    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toContain("Error");
-    expect(result.isError).toBe(true);
+    expect(await client.callTool({ name: RUN_TOOL_NAME, arguments: { name: "no-namespace" } })).toMatchObject(
+      errorResult("Invalid tool name (missing namespace): no-namespace"),
+    );
 
     await cleanup();
   });
 
-  it("run_tool with invalid namespace throws error", async () => {
+  it("run_tool with an unknown upstream returns an error result", async () => {
     const { client, cleanup } = await createSearchTestPair([
       { source: "linear", tools: [makeTool("linear__tool")] },
     ]);
 
-    await expect(
-      client.callTool({
-        name: RUN_TOOL_NAME,
-        arguments: { name: "no-namespace" },
-      }),
-    ).rejects.toThrow(/missing namespace/);
-
-    await cleanup();
-  });
-
-  it("run_tool with unknown upstream throws error", async () => {
-    const { client, cleanup } = await createSearchTestPair([
-      { source: "linear", tools: [makeTool("linear__tool")] },
-    ]);
-
-    await expect(
-      client.callTool({
-        name: RUN_TOOL_NAME,
-        arguments: { name: "unknown__tool" },
-      }),
-    ).rejects.toThrow(/Upstream server not found/);
+    expect(await client.callTool({ name: RUN_TOOL_NAME, arguments: { name: "unknown__tool" } })).toMatchObject(
+      errorResult("Upstream server not found: unknown"),
+    );
 
     await cleanup();
   });

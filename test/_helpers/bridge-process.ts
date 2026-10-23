@@ -70,12 +70,22 @@ export async function connectBridgeProcess(
   return { client, stderr: () => stderr, notifications: () => [...notifications] };
 }
 
-export async function callStubTool(
+export function callStubToolResult(
   { client }: BridgeProcess,
   tool = "plain",
   args: Record<string, unknown> = {},
+): ReturnType<Client["callTool"]> {
+  return client.callTool(viaRunTool(`stub__${tool}`, args));
+}
+
+export async function callStubTool(
+  bridge: BridgeProcess,
+  tool = "plain",
+  args: Record<string, unknown> = {},
 ): Promise<unknown> {
-  return (await client.callTool(viaRunTool(`stub__${tool}`, args))).content;
+  const result = await callStubToolResult(bridge, tool, args);
+  if (result.isError) throw new Error(JSON.stringify(result.content));
+  return result.content;
 }
 
 export interface ScratchHome {

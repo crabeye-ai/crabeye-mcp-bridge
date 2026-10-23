@@ -3,8 +3,17 @@ import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { RateLimiter } from "../../src/server/rate-limiter.js";
 import { PolicyEngine } from "../../src/policy/policy-engine.js";
 import type { StatusChangeCallback, UpstreamClient } from "../../src/upstream/types.js";
-import { createTestPair, FakeUpstreams, makeMockUpstreamClient, makeTool } from "../_helpers/bridge-test-pair.js";
-import { viaRunTool } from "../_helpers/run-tool.js";
+import {
+  createTestPair,
+  FakeUpstreams,
+  makeMockUpstreamClient,
+  makeTool,
+  useUpRequestIdZero,
+} from "../_helpers/bridge-test-pair.js";
+import { errorResult, viaRunTool } from "../_helpers/run-tool.js";
+
+const REMOVED = errorResult('Upstream server "srv" was removed from the configuration');
+const DENIED = errorResult("Tool srv__op is disabled by policy");
 
 type Pair = Awaited<ReturnType<typeof createTestPair>>;
 
@@ -33,7 +42,7 @@ function queuedWaiters(limiter: RateLimiter): unknown[] {
   return (limiter as unknown as { queue: unknown[] }).queue;
 }
 
-describe("run_tool waits across reloads and cancellation", () => {
+describe.each([false, true])("run_tool waits across reloads and cancellation (modern: %s)", (modern) => {
   let pair: Pair | undefined;
   const upstreams = new FakeUpstreams();
 
@@ -50,6 +59,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     registry.setToolsForSource("srv", [makeTool("srv__op")]);
     pair = await createTestPair({
       registry,
+      modern,
       getUpstreamClient: upstreams.get,
       getRateLimiter: () => rateLimiter,
       policyEngine,
@@ -69,7 +79,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     upstreams.set("srv", undefined);
     release();
 
-    await expect(call).rejects.toThrow(/Upstream server "srv" was removed from the configuration/);
+    expect(await call).toMatchObject(REMOVED);
     expect(original.callTool).not.toHaveBeenCalled();
   });
 
@@ -86,7 +96,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     limiter.dispose();
     upstreams.set("srv", undefined);
 
-    await expect(call).rejects.toThrow(/Upstream server "srv" was removed from the configuration/);
+    expect(await call).toMatchObject(REMOVED);
     expect(upstream.callTool).not.toHaveBeenCalled();
   });
 
@@ -117,7 +127,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     await vi.waitFor(() => expect(listeners.size).toBe(1));
     upstreams.set("srv", undefined);
 
-    await expect(call).rejects.toThrow(/was removed from the configuration/);
+    expect(await call).toMatchObject(REMOVED);
     expect(listeners.size).toBe(0);
   });
 
@@ -133,7 +143,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     policy.update("always", { srv: { toolPolicy: "never" } });
     upstreams.set("srv", replacement);
 
-    await expect(call).rejects.toThrow(/Tool srv__op is disabled by policy/);
+    expect(await call).toMatchObject(DENIED);
     expect(replacement.callTool).not.toHaveBeenCalled();
   });
 
@@ -149,7 +159,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     policy.update("always", { srv: { toolPolicy: "never" } });
     release();
 
-    await expect(call).rejects.toThrow(/Tool srv__op is disabled by policy/);
+    expect(await call).toMatchObject(DENIED);
     expect(upstream.callTool).not.toHaveBeenCalled();
   });
 
@@ -170,7 +180,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     policy.update("always", { srv: { toolPolicy: "never" } });
     upstreams.set("srv", replacement);
 
-    await expect(call).rejects.toThrow(/Tool srv__op is disabled by policy/);
+    expect(await call).toMatchObject(DENIED);
     expect(original.callTool).not.toHaveBeenCalled();
     expect(replacement.callTool).not.toHaveBeenCalled();
   });
@@ -187,14 +197,29 @@ describe("run_tool waits across reloads and cancellation", () => {
     policy.update("always", { srv: { toolPolicy: "prompt" } });
     upstreams.set("srv", replacement);
 
-    await expect(call).rejects.toThrow(/Tool srv__op now requires confirmation after a configuration change; please retry/);
+    expect(await call).toMatchObject(
+      errorResult("Tool srv__op now requires confirmation after a configuration change; please retry"),
+    );
     expect(replacement.callTool).not.toHaveBeenCalled();
+  });
+
+  it("returns the rate limiter's message as an error result when its queue is full", async () => {
+    const upstream = makeMockUpstreamClient("srv");
+    upstreams.set("srv", upstream);
+    const limiter = new RateLimiter({ maxCalls: 1, windowSeconds: 60 }, { maxQueued: 0 });
+    await limiter.acquire();
+    const { client } = await connect(limiter);
+
+    expect(await client.callTool(viaRunTool("srv__op"))).toMatchObject(errorResult("Rate limit queue full"));
+    expect(upstream.callTool).not.toHaveBeenCalled();
+    limiter.drainAndDispose();
   });
 
   it("stops waiting for a reconnect when the client cancels", async () => {
     const { client: down, listeners } = disconnectedClient("srv");
     upstreams.set("srv", down);
     const { client } = await connect();
+    await useUpRequestIdZero(client);
     const controller = new AbortController();
 
     const call = client.callTool(viaRunTool("srv__op"), { signal: controller.signal });
@@ -213,6 +238,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     await limiter.acquire();
     const queue = queuedWaiters(limiter);
     const { client } = await connect(limiter);
+    await useUpRequestIdZero(client);
     const controller = new AbortController();
 
     const cancelled = client.callTool(viaRunTool("srv__op", { n: 1 }), { signal: controller.signal });
@@ -241,6 +267,7 @@ describe("run_tool waits across reloads and cancellation", () => {
     });
     upstreams.set("srv", upstream);
     const { client } = await connect();
+    await useUpRequestIdZero(client);
     const controller = new AbortController();
 
     const call = client.callTool(viaRunTool("srv__op"), { signal: controller.signal });

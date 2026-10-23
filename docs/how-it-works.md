@@ -7,7 +7,7 @@ The bridge exposes exactly two tools to the AI assistant, and that list never ch
 - **`search_tools`** — Fuzzy-search across all discovered tools by name, description, provider, or category.
 - **`run_tool`** — Run any discovered tool by its namespaced name (e.g. `linear__create_issue`).
 
-The AI assistant calls `search_tools` when it detects a relevant intent, then runs the tool it found with `run_tool`. When a search returns tools, each comes with its full input schema. Upstream tools can only be run through `run_tool`: calling one by its own name fails with an error that says to use `run_tool`.
+The AI assistant calls `search_tools` when it detects a relevant intent, then runs the tool it found with `run_tool`. When a search returns tools, each comes with its full input schema. Upstream tools can only be run through `run_tool`: calling one by its own name fails as an unknown tool.
 
 The bridge tracks how many tokens it saves compared to exposing all upstream tool definitions directly. Token savings are always logged to stderr after each search. To also include them in `search_tools` responses, pass `--stats`:
 

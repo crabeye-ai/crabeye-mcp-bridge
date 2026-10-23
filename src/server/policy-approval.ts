@@ -3,8 +3,6 @@ import {
   createRequestStateCodec,
   inputRequired,
   inputResponse,
-  ProtocolError,
-  ProtocolErrorCode,
   type RequestStateCodec,
 } from "@modelcontextprotocol/server";
 import type {
@@ -54,17 +52,11 @@ export class ApprovalFlow {
 
     if (state !== undefined && view.kind === "elicit") {
       if (state.toolKey !== toolKey || state.argsHash !== hashArgs(args)) {
-        throw new ProtocolError(
-          ProtocolErrorCode.InvalidRequest,
-          `Tool ${toolKey} approval does not match this call — request approval again`,
-        );
+        throw new Error(`Tool ${toolKey} approval does not match this call — request approval again`);
       }
       this.consume(state.jti, toolKey);
       if (view.action === "accept") return "approved";
-      throw new ProtocolError(
-        ProtocolErrorCode.InvalidRequest,
-        `Tool ${toolKey} was declined by user`,
-      );
+      throw new Error(`Tool ${toolKey} was declined by user`);
     }
 
     return inputRequired({
@@ -85,10 +77,7 @@ export class ApprovalFlow {
       if (expiresAt <= now) this.answered.delete(id);
     }
     if (this.answered.has(jti)) {
-      throw new ProtocolError(
-        ProtocolErrorCode.InvalidRequest,
-        `Tool ${toolKey} approval was already used — request approval again`,
-      );
+      throw new Error(`Tool ${toolKey} approval was already used — request approval again`);
     }
     this.answered.set(jti, now + (APPROVAL_TTL_SECONDS + 1) * 1000);
   }

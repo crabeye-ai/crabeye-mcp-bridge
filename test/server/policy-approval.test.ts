@@ -3,7 +3,6 @@ import {
   CLIENT_CAPABILITIES_META_KEY,
   Client,
   InMemoryTransport,
-  ProtocolErrorCode,
 } from "@modelcontextprotocol/client";
 import type { CallToolResult, ElicitResult, Tool } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
@@ -14,7 +13,9 @@ import {
   hashArgs,
 } from "../../src/server/policy-approval.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
-import { viaRunTool } from "../_helpers/run-tool.js";
+import { errorResult, viaRunTool } from "../_helpers/run-tool.js";
+
+const NO_ELICITATION = errorResult("Tool linear__create_issue requires confirmation but the client does not support elicitation");
 
 function makeTool(name: string): Tool {
   return {
@@ -173,33 +174,31 @@ describe.each(["legacy", "modern"] as const)(
       await cleanup();
     });
 
-    it("rejects with InvalidRequest and skips the upstream when the user declines", async () => {
+    it("returns an error result and skips the upstream when the user declines", async () => {
       const { client, upstream, cleanup } = await pairWithPolicy({
         era,
         policy: "prompt",
         elicit: "decline",
       });
 
-      const failure = await client
-        .callTool(viaRunTool("linear__create_issue"))
-        .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
-      expect(failure?.message).toMatch(/declined by user/);
-      expect(failure?.code).toBe(ProtocolErrorCode.InvalidRequest);
+      expect(await client.callTool(viaRunTool("linear__create_issue"))).toMatchObject(
+        errorResult("Tool linear__create_issue was declined by user"),
+      );
       expect(upstream.callTool).not.toHaveBeenCalled();
 
       await cleanup();
     });
 
-    it("rejects on cancel", async () => {
+    it("returns the declined error result on cancel", async () => {
       const { client, upstream, cleanup } = await pairWithPolicy({
         era,
         policy: "prompt",
         elicit: "cancel",
       });
 
-      await expect(
-        client.callTool(viaRunTool("linear__create_issue")),
-      ).rejects.toThrow(/declined by user/);
+      expect(await client.callTool(viaRunTool("linear__create_issue"))).toMatchObject(
+        errorResult("Tool linear__create_issue was declined by user"),
+      );
       expect(upstream.callTool).not.toHaveBeenCalled();
 
       await cleanup();
@@ -212,9 +211,9 @@ describe.each(["legacy", "modern"] as const)(
         elicit: "accept",
       });
 
-      await expect(
-        client.callTool(viaRunTool("linear__create_issue")),
-      ).rejects.toThrow(/disabled by policy/);
+      expect(await client.callTool(viaRunTool("linear__create_issue"))).toMatchObject(
+        errorResult("Tool linear__create_issue is disabled by policy"),
+      );
       expect(elicitHandler).not.toHaveBeenCalled();
       expect(upstream.callTool).not.toHaveBeenCalled();
 
@@ -224,18 +223,14 @@ describe.each(["legacy", "modern"] as const)(
 );
 
 describe.each(["legacy", "modern"] as const)("prompt policy with a url-only elicitation capability (%s era)", (era) => {
-  it("rejects with the v1 protocol error — the approval prompt is form-mode", async () => {
+  it("returns an error result — the approval prompt is form-mode", async () => {
     const { client, upstream, cleanup } = await pairWithPolicy({
       era,
       policy: "prompt",
       elicitationCapability: { url: {} },
     });
 
-    const failure = await client
-      .callTool(viaRunTool("linear__create_issue"))
-      .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
-    expect(failure?.message).toMatch(/does not support elicitation/);
-    expect(failure?.code).toBe(ProtocolErrorCode.InvalidRequest);
+    expect(await client.callTool(viaRunTool("linear__create_issue"))).toMatchObject(NO_ELICITATION);
     expect(upstream.callTool).not.toHaveBeenCalled();
 
     await cleanup();
@@ -243,17 +238,13 @@ describe.each(["legacy", "modern"] as const)("prompt policy with a url-only elic
 });
 
 describe("prompt policy without client elicitation support", () => {
-  it("rejects with the v1 protocol error before any approval round (legacy era)", async () => {
+  it("returns an error result before any approval round (legacy era)", async () => {
     const { client, upstream, cleanup } = await pairWithPolicy({
       era: "legacy",
       policy: "prompt",
     });
 
-    const failure = await client
-      .callTool(viaRunTool("linear__create_issue"))
-      .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
-    expect(failure?.message).toMatch(/does not support elicitation/);
-    expect(failure?.code).toBe(ProtocolErrorCode.InvalidRequest);
+    expect(await client.callTool(viaRunTool("linear__create_issue"))).toMatchObject(NO_ELICITATION);
     expect(upstream.callTool).not.toHaveBeenCalled();
 
     await cleanup();
@@ -265,10 +256,9 @@ describe("prompt policy without client elicitation support", () => {
       policy: "prompt",
     });
 
-    const failure = await client
-      .callTool(viaRunTool("linear__create_issue", {}, { _meta: { [CLIENT_CAPABILITIES_META_KEY]: { elicitation: { form: {} } } } }))
-      .then(() => undefined, (err: unknown) => err as { code?: number; message: string });
-    expect(failure?.message).toMatch(/does not support elicitation/);
+    expect(
+      await client.callTool(viaRunTool("linear__create_issue", {}, { _meta: { [CLIENT_CAPABILITIES_META_KEY]: { elicitation: { form: {} } } } })),
+    ).toMatchObject(NO_ELICITATION);
     expect(upstream.callTool).not.toHaveBeenCalled();
 
     await cleanup();
@@ -280,9 +270,7 @@ describe("prompt policy without client elicitation support", () => {
       policy: "prompt",
     });
 
-    await expect(
-      client.callTool(viaRunTool("linear__create_issue")),
-    ).rejects.toThrow(/capabilit|elicitation/i);
+    expect(await client.callTool(viaRunTool("linear__create_issue"))).toMatchObject(NO_ELICITATION);
     expect(upstream.callTool).not.toHaveBeenCalled();
 
     await cleanup();
@@ -316,13 +304,12 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     });
     const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
 
-    await expect(
-      redeem(client, "linear__create_issue", { title: "Other" }, { inputResponses: accept, requestState }),
-    ).rejects.toThrow(/does not match this call/);
-
-    await expect(
-      redeem(client, "linear__delete_issue", { title: "Bug" }, { inputResponses: accept, requestState }),
-    ).rejects.toThrow(/does not match this call/);
+    expect(await redeem(client, "linear__create_issue", { title: "Other" }, { inputResponses: accept, requestState })).toMatchObject(
+      errorResult("Tool linear__create_issue approval does not match this call — request approval again"),
+    );
+    expect(await redeem(client, "linear__delete_issue", { title: "Bug" }, { inputResponses: accept, requestState })).toMatchObject(
+      errorResult("Tool linear__delete_issue approval does not match this call — request approval again"),
+    );
 
     expect(upstream.callTool).not.toHaveBeenCalled();
 
@@ -345,9 +332,9 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState });
     expect(upstream.callTool).toHaveBeenCalledTimes(1);
 
-    await expect(
-      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState }),
-    ).rejects.toThrow(/already used/);
+    expect(await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState })).toMatchObject(
+      errorResult("Tool linear__create_issue approval was already used — request approval again"),
+    );
     expect(upstream.callTool).toHaveBeenCalledTimes(1);
 
     await cleanup();
@@ -363,12 +350,12 @@ describe("approval state binding (manual MRTR, modern era)", () => {
     const requestState = await firstRound(client, "linear__create_issue", { title: "Bug" });
     const decline = { approval: { action: "decline" } };
 
-    await expect(
-      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: decline, requestState }),
-    ).rejects.toThrow(/declined by user/);
-    await expect(
-      redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState }),
-    ).rejects.toThrow(/already used/);
+    expect(await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: decline, requestState })).toMatchObject(
+      errorResult("Tool linear__create_issue was declined by user"),
+    );
+    expect(await redeem(client, "linear__create_issue", { title: "Bug" }, { inputResponses: accept, requestState })).toMatchObject(
+      errorResult("Tool linear__create_issue approval was already used — request approval again"),
+    );
     expect(upstream.callTool).not.toHaveBeenCalled();
 
     await cleanup();

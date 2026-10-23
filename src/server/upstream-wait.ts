@@ -1,4 +1,3 @@
-import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import type { UpstreamClient } from "../upstream/types.js";
 import type { Logger } from "../logging/index.js";
 import { APP_NAME } from "../constants.js";
@@ -14,30 +13,23 @@ export interface UpstreamWaitOptions {
 
 type WaitOutcome = "changed" | "timeout" | "cancelled";
 
-export function reauthorizationError(source: string, serverName: string): ProtocolError {
-  return new ProtocolError(
-    ProtocolErrorCode.InternalError,
+export function reauthorizationError(source: string, serverName: string): Error {
+  return new Error(
     `Upstream server "${source}" needs re-authorization. Run: ${APP_NAME} auth ${serverName} ` +
       "(or update its configured credentials if it does not use OAuth).",
   );
 }
 
-export function cancelledError(): ProtocolError {
-  return new ProtocolError(ProtocolErrorCode.InternalError, "Request cancelled");
+export function cancelledError(): Error {
+  return new Error("Request cancelled");
 }
 
-export function removedError(source: string): ProtocolError {
-  return new ProtocolError(
-    ProtocolErrorCode.InternalError,
-    `Upstream server "${source}" was removed from the configuration`,
-  );
+export function removedError(source: string): Error {
+  return new Error(`Upstream server "${source}" was removed from the configuration`);
 }
 
-function unavailableError(source: string): ProtocolError {
-  return new ProtocolError(
-    ProtocolErrorCode.InternalError,
-    `Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`,
-  );
+function unavailableError(source: string): Error {
+  return new Error(`Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`);
 }
 
 export async function untilSettledOrCancelled(work: Promise<void>, signal: AbortSignal): Promise<void> {

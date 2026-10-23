@@ -46,6 +46,10 @@ export async function createTestPair(options?: Partial<BridgeServerOptions> & { 
   };
 }
 
+export async function useUpRequestIdZero(client: Client): Promise<void> {
+  await client.listTools();
+}
+
 export function makeMockUpstreamClient(
   name: string,
   overrides?: Partial<UpstreamClient>,

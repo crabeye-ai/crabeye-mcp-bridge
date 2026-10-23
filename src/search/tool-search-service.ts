@@ -17,6 +17,11 @@ export interface SearchToolsParams {
   queries: SearchQuery[];
 }
 
+export interface RunToolParams {
+  name: string;
+  arguments?: Record<string, unknown>;
+}
+
 export interface SearchToolResult {
   tool_name: string;
   source: string;

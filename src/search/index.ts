@@ -8,6 +8,7 @@ export {
 export type {
   SearchQuery,
   SearchToolsParams,
+  RunToolParams,
   SearchToolsResponse,
   SearchToolResult,
   ProviderResult,

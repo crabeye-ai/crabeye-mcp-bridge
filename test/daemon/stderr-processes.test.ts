@@ -2,7 +2,8 @@ import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { until } from "../_helpers/daemon-fixtures.js";
 import { STUB_STARTUP_ERROR_ENV } from "../_helpers/stub-stdio-server.js";
-import { CALLED, callStubTool, scratchHome, type BridgeProcess, type ScratchHome } from "../_helpers/bridge-process.js";
+import { CALLED, callStubTool, callStubToolResult, scratchHome, type BridgeProcess, type ScratchHome } from "../_helpers/bridge-process.js";
+import { errorResult } from "../_helpers/run-tool.js";
 
 const isWindows = process.platform === "win32";
 const BACKSLASH = String.fromCharCode(92);
@@ -46,7 +47,9 @@ describe.skipIf(isWindows)("STDIO server stderr in the bridge log", { timeout: 6
     const [a, b] = await bridges(2);
 
     await callStubTool(a!, "stderr", { text: "routine progress note" });
-    await callStubTool(a!, "crash", { lines: ["Error: upstream API returned 500"], code: 3 }).catch(() => {});
+    expect(await callStubToolResult(a!, "crash", { lines: ["Error: upstream API returned 500"], code: 3 })).toMatchObject(
+      errorResult('Upstream server "stub" error: child process exited'),
+    );
 
     const warning = `WARN  [upstream:stub] STDIO server exited with code 3 stderr=["routine progress note","Error: upstream API returned 500"]`;
     await logged(a!, warning);
