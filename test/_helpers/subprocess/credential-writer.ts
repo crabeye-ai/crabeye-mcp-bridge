@@ -47,7 +47,7 @@ input.once("line", async () => {
     for (let i = 0; i < Number(count); i++) await apply(i);
     process.stdout.write("done\n");
   } catch (err) {
-    process.stdout.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stdout.write(`error: ${JSON.stringify(err instanceof Error ? err.message : String(err))}\n`);
   }
   input.close();
 });

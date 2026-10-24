@@ -8,6 +8,7 @@ import { CredentialError } from "./errors.js";
 const SERVICE = APP_NAME;
 const ACCOUNT = "master-key";
 const EXEC_TIMEOUT = 10_000;
+const LOAD_DPAPI = "Add-Type -AssemblyName System.Security\n";
 
 export interface KeychainAdapter {
   /** Returns the key, or undefined if no key has been stored yet. */
@@ -250,6 +251,7 @@ export class WindowsKeychain implements KeychainAdapter {
   async getKey(): Promise<Buffer | undefined> {
     try {
       const script =
+        LOAD_DPAPI +
         `$bytes = [IO.File]::ReadAllBytes('${this.escapeSingleQuote(this.filePath)}')\n` +
         `$decrypted = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, 'CurrentUser')\n` +
         `[BitConverter]::ToString($decrypted).Replace('-','')`;
@@ -270,6 +272,7 @@ export class WindowsKeychain implements KeychainAdapter {
     const hex = key.toString("hex");
     const escapedPath = this.escapeSingleQuote(this.filePath);
     const script =
+      LOAD_DPAPI +
       `$hex = '${hex}'\n` +
       `$bytes = [byte[]]::new($hex.Length / 2)\n` +
       `for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i*2, 2), 16) }\n` +

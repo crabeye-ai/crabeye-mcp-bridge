@@ -1,5 +1,5 @@
 import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { access, open, readFile, rename, unlink } from "node:fs/promises";
+import { access, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { CREDENTIALS_DIR, CREDENTIALS_FILENAME } from "../constants.js";
@@ -7,7 +7,7 @@ import type { Logger } from "../logging/index.js";
 import { CredentialStoreFileSchema, type Credential, type CredentialStoreFile } from "./types.js";
 import { CredentialError } from "./errors.js";
 import type { KeychainAdapter } from "./keychain.js";
-import { storeTempPath, withStoreWriteLock } from "./store-write-lock.js";
+import { replaceStoreFile, storeTempPath, withStoreWriteLock } from "./store-write-lock.js";
 import { warnSafely } from "./warn-safely.js";
 
 const ALGORITHM = "aes-256-gcm";
@@ -422,8 +422,7 @@ export class CredentialStore {
       } finally {
         await tmp.close();
       }
-      giveUp.throwIfAborted();
-      await rename(tmpPath, this.filePath);
+      await replaceStoreFile(tmpPath, this.filePath, giveUp);
     } catch (err) {
       await unlink(tmpPath).catch(() => {});
       throw err;

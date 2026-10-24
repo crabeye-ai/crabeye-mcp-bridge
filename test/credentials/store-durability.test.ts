@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MockKeychain, secret, tempFiles } from "../_helpers/credential-store.js";
 
-const fsControl = vi.hoisted(() => ({ events: [] as string[], failSync: false, failRename: false, deniedPath: "" }));
+const fsControl = vi.hoisted(() => ({ events: [] as string[], failSync: false, renameFailures: 0, renameCode: "EBUSY", deniedPath: "" }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -31,7 +31,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     },
     rename: async (from: string, to: string) => {
       fsControl.events.push(`rename ${from} -> ${to}`);
-      if (fsControl.failRename && from.includes(".tmp.")) throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+      if (fsControl.renameFailures > 0 && from.includes(".tmp.")) {
+        fsControl.renameFailures--;
+        throw Object.assign(new Error(`${fsControl.renameCode}: rename refused`), { code: fsControl.renameCode });
+      }
       return actual.rename(from, to);
     },
   };
@@ -49,9 +52,18 @@ describe("credential store durability", () => {
     filePath = join(dir, "creds.enc");
     fsControl.events = [];
     fsControl.failSync = false;
-    fsControl.failRename = false;
+    fsControl.renameFailures = 0;
+    fsControl.renameCode = "EBUSY";
     fsControl.deniedPath = "";
   });
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: realPlatform });
+  });
+
+  const realPlatform = process.platform;
+  const onPlatform = (platform: NodeJS.Platform) => Object.defineProperty(process, "platform", { value: platform });
+  const renamesOf = (tmpPath: string) => fsControl.events.filter((event) => event.startsWith(`rename ${tmpPath}`)).length;
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
@@ -78,13 +90,15 @@ describe("credential store durability", () => {
   });
 
   it("keeps the previous store and leaves no temp file when the rename fails", async () => {
+    onPlatform("linux");
     const store = new CredentialStore({ keychain: new MockKeychain(), filePath });
     await store.set("before", secret("old"));
-    fsControl.failRename = true;
+    fsControl.renameFailures = Infinity;
 
     await expect(store.set("after", secret("new"))).rejects.toMatchObject({ code: "EBUSY" });
 
-    fsControl.failRename = false;
+    expect(renamesOf(storeTempPath(filePath))).toBe(2);
+    fsControl.renameFailures = 0;
     expect(await store.list()).toEqual(["before"]);
     expect(await tempFiles(dir)).toEqual([]);
   });
@@ -110,5 +124,48 @@ describe("credential store durability", () => {
     await expect(new CredentialStore({ keychain: emptied, filePath }).set("k", secret("1"))).rejects.toThrow(/No master key found/);
 
     expect(setKey).not.toHaveBeenCalled();
+  });
+
+  it.each(["EPERM", "EACCES", "EBUSY"])("retries a rename Windows refuses with %s while another process has the store open", async (code) => {
+    onPlatform("win32");
+    const store = new CredentialStore({ keychain: new MockKeychain(), filePath });
+    await store.set("before", secret("old"));
+    fsControl.events = [];
+    fsControl.renameCode = code;
+    fsControl.renameFailures = 3;
+
+    await store.set("after", secret("new"));
+
+    expect(renamesOf(storeTempPath(filePath))).toBe(4);
+    expect((await store.list()).sort()).toEqual(["after", "before"]);
+    expect(await tempFiles(dir)).toEqual([]);
+  });
+
+  it("stops retrying a refused rename on Windows once the caller gives up, keeping the previous store", async () => {
+    onPlatform("win32");
+    const store = new CredentialStore({ keychain: new MockKeychain(), filePath, lockTimeoutMs: 300 });
+    await store.set("before", secret("old"));
+    fsControl.renameCode = "EPERM";
+    fsControl.renameFailures = Infinity;
+
+    await expect(store.set("after", secret("new"))).rejects.toThrow(/exceeded 300ms/);
+    await store.delete("drain");
+
+    fsControl.renameFailures = 0;
+    expect(await store.list()).toEqual(["before"]);
+    expect(await tempFiles(dir)).toEqual([]);
+  });
+
+  it("doesn't retry other rename errors on Windows", async () => {
+    onPlatform("win32");
+    const store = new CredentialStore({ keychain: new MockKeychain(), filePath });
+    await store.set("before", secret("old"));
+    fsControl.events = [];
+    fsControl.renameCode = "EXDEV";
+    fsControl.renameFailures = Infinity;
+
+    await expect(store.set("after", secret("new"))).rejects.toMatchObject({ code: "EXDEV" });
+
+    expect(renamesOf(storeTempPath(filePath))).toBe(1);
   });
 });
