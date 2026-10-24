@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { readdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -12,6 +13,28 @@ export class MockKeychain implements KeychainAdapter {
   async getKey() { this.reads++; return this.key; }
   async setKey(k: Buffer) { this.key = k; }
   async deleteKey() { this.key = undefined; }
+}
+
+export const secret = (value: string) => ({ type: "secret" as const, value });
+
+export async function tempFiles(dir: string): Promise<string[]> {
+  return (await readdir(dir)).filter((name) => name.includes(".tmp."));
+}
+
+export async function writeThroughAliasedPaths(dir: string, count: number): Promise<CredentialStore> {
+  const alias = join(dir, "alias");
+  await symlink(dir, alias, "junction");
+  const keychain = new MockKeychain();
+  await keychain.setKey(randomBytes(32));
+  const direct = new CredentialStore({ keychain, filePath: join(dir, "creds.enc") });
+  const viaAlias = new CredentialStore({ keychain, filePath: join(alias, "creds.enc") });
+  await Promise.all(
+    Array.from({ length: count }, (_, i) => [
+      direct.set(`direct-${i}`, secret(String(i))),
+      viaAlias.set(`alias-${i}`, secret(String(i))),
+    ]).flat(),
+  );
+  return direct;
 }
 
 export interface TestStoreHandle {

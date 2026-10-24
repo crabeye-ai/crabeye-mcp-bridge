@@ -13,7 +13,7 @@ import {
   waitForExit,
   type DaemonProcess,
 } from "./daemon-process.js";
-import { acquireLock, holdsLock, isLockLive, LockBusyError, type LockHandle } from "./lockfile.js";
+import { acquireLock, holdsLock, isLockLive, LockBusyError, type LockHandle } from "../process/lockfile.js";
 import { daemonFit, daemonVersionLabel, isOutdatedDaemon, olderDaemonStillRunning, reportedDaemonPid } from "./daemon-version.js";
 import type { DaemonStatus } from "./protocol.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";

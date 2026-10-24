@@ -121,6 +121,8 @@ If you previously authenticated by stuffing a static `Authorization: Bearer ...`
 
 Credentials are encrypted with AES-256-GCM. The master key is stored in your OS keychain (macOS Keychain, Linux secret-tool, Windows Credential Manager). Set `MCP_BRIDGE_MASTER_KEY` (64 hex chars) to use a static key instead.
 
+Several AI clients, bridges and CLI commands can save credentials at the same time without losing each other's changes, and an interrupted save leaves the previously saved credentials readable. A bridge or CLI from crabeye 1.3.0 or earlier doesn't take part in this, so while one is still running, its saves can still overwrite another process's.
+
 ## CLI commands
 
 | Command | Description |

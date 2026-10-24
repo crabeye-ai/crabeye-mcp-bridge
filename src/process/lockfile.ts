@@ -1,10 +1,13 @@
 import { link, readdir, readFile, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { basename, dirname, join } from "node:path";
-import { parsePid, processExists } from "../process/process-utils.js";
+import { parsePid, processExists } from "./process-utils.js";
 
 export const LOCK_SETTLE_MS = 60_000;
 const ABANDONED_STAGING_AGE_MS = 5_000;
+const MIN_WAIT_BACKOFF_MS = 10;
+const MAX_WAIT_BACKOFF_MS = 200;
 
 const heldTokens = new Map<string, string>();
 const handleTokens = new WeakMap<LockHandle, string>();
@@ -100,6 +103,28 @@ async function acquireUntrackedLock(path: string, opts: AcquireOptions): Promise
     return await stealLock(path, body, pid, opts);
   }
   throw new LockBusyError(path, await readLockHolderPid(path));
+}
+
+export interface WaitForLockOptions extends AcquireOptions {
+  signal: AbortSignal;
+}
+
+export async function waitForLock(path: string, opts: WaitForLockOptions): Promise<LockHandle> {
+  for (let backoffMs = MIN_WAIT_BACKOFF_MS; ; backoffMs = Math.min(backoffMs * 2, MAX_WAIT_BACKOFF_MS)) {
+    opts.signal.throwIfAborted();
+    try {
+      return await keepUnlessAborted(await acquireLock(path, opts), opts.signal);
+    } catch (err) {
+      if (!(err instanceof LockBusyError)) throw err;
+    }
+    await delay(backoffMs / 2 + Math.random() * (backoffMs / 2), undefined, { signal: opts.signal }).catch(() => {});
+  }
+}
+
+async function keepUnlessAborted(handle: LockHandle, signal: AbortSignal): Promise<LockHandle> {
+  if (!signal.aborted) return handle;
+  await handle.release();
+  throw signal.reason;
 }
 
 export async function sweepAbandonedLockFiles(lockPath: string): Promise<void> {

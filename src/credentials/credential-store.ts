@@ -1,12 +1,14 @@
 import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { access, readFile, writeFile, rename, mkdir } from "node:fs/promises";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { access, open, readFile, rename, unlink } from "node:fs/promises";
+import { join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { CREDENTIALS_DIR, CREDENTIALS_FILENAME } from "../constants.js";
 import type { Logger } from "../logging/index.js";
 import { CredentialStoreFileSchema, type Credential, type CredentialStoreFile } from "./types.js";
 import { CredentialError } from "./errors.js";
 import type { KeychainAdapter } from "./keychain.js";
+import { storeTempPath, withStoreWriteLock } from "./store-write-lock.js";
+import { warnSafely } from "./warn-safely.js";
 
 const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12;
@@ -24,14 +26,11 @@ export interface CredentialStoreOptions {
    * the chain stays held until the wedged closure actually settles, so it
    * cannot race the next waiter on the file write.
    *
-   * Caveat: this is a caller-facing "give up waiting" signal, NOT a
-   * cancellation. The wedged closure (e.g. a keychain call the user is
-   * still ignoring) keeps running, and if it eventually completes it WILL
-   * write to disk — minutes or hours later than the caller expected. In a
-   * single-process scenario the next queued write supersedes that late
-   * write; the asymmetric case (cross-process writer between the timeout
-   * and the late completion) is the same cross-process gap discussed in
-   * the class-level comment.
+   * The same budget covers waiting for another process to release the
+   * store's lock file. On timeout the closure is told to give up: it stops
+   * waiting for that lock, and a wedged one (e.g. a keychain call the user
+   * is still ignoring) keeps running but doesn't write the store once it
+   * completes.
    *
    * Default 60_000 ms. Pass `0` to disable.
    */
@@ -50,16 +49,17 @@ interface RunOptions {
  * and resolves with its result; rejections in `fn` propagate to the caller
  * but do not poison the chain — the next `run()` proceeds normally.
  *
- * Liveness: pass `opts.timeoutMs` to reject the caller after the budget
- * expires. The chain is NOT released on timeout — it stays held until the
- * closure actually settles — because the wedged closure could still touch
- * the encrypted file via `_writeStore` and would race the next waiter if
- * we let one in early.
+ * Liveness: pass `opts.timeoutMs` to reject the caller and abort the
+ * signal passed to `fn` after the budget expires. The chain is NOT
+ * released on timeout — it stays held until the closure actually
+ * settles — because the wedged closure may still hold the store lock,
+ * still use this process's temp file, or still create the master key,
+ * and would race the next waiter if we let one in early.
  */
 class AsyncMutex {
   private chain: Promise<void> = Promise.resolve();
 
-  async run<T>(fn: () => Promise<T>, opts?: RunOptions): Promise<T> {
+  async run<T>(fn: (giveUp: AbortSignal) => Promise<T>, opts?: RunOptions): Promise<T> {
     const prev = this.chain;
     let release!: () => void;
     this.chain = new Promise<void>((r) => {
@@ -67,9 +67,10 @@ class AsyncMutex {
     });
     await prev;
 
+    const giveUp = new AbortController();
     const work = (async () => {
       try {
-        return await fn();
+        return await fn(giveUp.signal);
       } finally {
         release();
       }
@@ -83,17 +84,13 @@ class AsyncMutex {
       timer = setTimeout(() => {
         const op = opts?.label ?? "operation";
         const msg =
-          `Credential store ${op} exceeded ${timeoutMs}ms; the underlying ` +
-          `closure (likely a keychain call) is still running. Subsequent ` +
-          `writes remain queued until it settles.`;
-        // Defensive: a throwing user-supplied logger inside this callback
-        // would unwind without scheduling `reject`, hanging the caller.
-        try {
-          opts?.logger?.warn(msg, { component: "credential_store" });
-        } catch {
-          // swallow
-        }
-        reject(new CredentialError(msg));
+          `Credential store ${op} exceeded ${timeoutMs}ms waiting for a ` +
+          `keychain call or another process's store lock; a keychain call ` +
+          `still in progress keeps later writes queued until it settles.`;
+        const error = new CredentialError(msg);
+        giveUp.abort(error);
+        warnSafely(opts?.logger, msg);
+        reject(error);
       }, timeoutMs);
     });
     try {
@@ -109,20 +106,17 @@ class AsyncMutex {
 // `list`) skip the lock — atomic rename on write means readers always see a
 // self-consistent file (pre- or post-write, never a torn snapshot).
 //
-// Cross-process safety is *not* provided. The realistic race is a user
-// running `mcp-bridge credential set` (or `auth <server>`) while the daemon
-// is mid-refresh: both write through `_writeStore`, and `rename(2)` is atomic
-// per call but not against another process's concurrent `rename(2)`. The
-// loser's RMW silently overwrites the winner's data. Encryption is AEAD, so
-// a half-written file fails GCM auth (loud failure, forces re-auth) rather
-// than silently leaking — but a write *can* be lost. Revisit (e.g.
-// `proper-lockfile`) if cross-process writers become routine.
+// Across processes (bridges, CLI commands), each mutating op also holds the
+// store's lock file (`withStoreWriteLock`) for its whole read-modify-write,
+// including master-key creation, so a process that waited behind the key's
+// creator reuses that key. The lock is taken over only from a holder that
+// has died. The temp file is fsynced before the rename. Writers from 1.3.0
+// or earlier don't take the lock and can still race.
 //
 // Path keying: `getMutex()` canonicalizes via `path.resolve` and lowercases
-// on case-insensitive filesystems, but does NOT resolve symlinks. Callers
-// constructing a store must pass the same canonical path string to share a
-// lock — in this codebase that's enforced by computing the path once from
-// constants in the constructor.
+// on case-insensitive filesystems, but does NOT resolve symlinks. Stores
+// reaching one file through different path strings get separate in-process
+// queues and are serialized by the lock file alone.
 
 class DecryptError extends CredentialError {}
 
@@ -172,26 +166,25 @@ export class CredentialStore {
 
   async set(key: string, credential: Credential): Promise<void> {
     this._validateKey(key);
-    await this.getMutex().run(async () => {
+    await this._mutate("set", async (giveUp) => {
       await this._forgetMasterKeyIfStoreMissing();
       const { store, masterKey } = await this._openStore(await this._getOrCreateMasterKey());
       store.credentials[key] = credential;
-      await this._writeStore(store, masterKey);
-    }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "set" });
+      await this._writeStore(store, masterKey, giveUp);
+    });
   }
 
   async delete(key: string): Promise<boolean> {
     this._validateKey(key);
-    return this.getMutex().run(async () => {
-      if (!await this._storeFileExists()) return false;
+    return this._mutateExistingStore("delete", false, async (giveUp) => {
       const { store, masterKey } = await this._openStore(await this._getExistingMasterKey());
       if (!Object.hasOwn(store.credentials, key)) {
         return false;
       }
       delete store.credentials[key];
-      await this._writeStore(store, masterKey);
+      await this._writeStore(store, masterKey, giveUp);
       return true;
-    }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "delete" });
+    });
   }
 
   /**
@@ -202,8 +195,7 @@ export class CredentialStore {
    */
   async deleteMany(keys: string[]): Promise<string[]> {
     for (const key of keys) this._validateKey(key);
-    return this.getMutex().run(async () => {
-      if (!await this._storeFileExists()) return [];
+    return this._mutateExistingStore("deleteMany", [], async (giveUp) => {
       const { store, masterKey } = await this._openStore(await this._getExistingMasterKey());
       const removed: string[] = [];
       for (const key of keys) {
@@ -213,9 +205,9 @@ export class CredentialStore {
         }
       }
       if (removed.length === 0) return [];
-      await this._writeStore(store, masterKey);
+      await this._writeStore(store, masterKey, giveUp);
       return removed;
-    }, { timeoutMs: this.lockTimeoutMs, logger: this.logger, label: "deleteMany" });
+    });
   }
 
   async list(): Promise<string[]> {
@@ -225,6 +217,29 @@ export class CredentialStore {
   }
 
   // --- Internal ---
+
+  private _mutate<T>(label: string, body: (giveUp: AbortSignal) => Promise<T>): Promise<T> {
+    return this.getMutex().run((giveUp) => this._underStoreLock(giveUp, body), this._runOptions(label));
+  }
+
+  private _mutateExistingStore<T>(
+    label: string,
+    whenStoreMissing: T,
+    body: (giveUp: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    return this.getMutex().run(
+      async (giveUp) => (await this._storeFileExists() ? this._underStoreLock(giveUp, body) : whenStoreMissing),
+      this._runOptions(label),
+    );
+  }
+
+  private _underStoreLock<T>(giveUp: AbortSignal, body: (giveUp: AbortSignal) => Promise<T>): Promise<T> {
+    return withStoreWriteLock(this.filePath, { giveUp, logger: this.logger }, () => body(giveUp));
+  }
+
+  private _runOptions(label: string): RunOptions {
+    return { timeoutMs: this.lockTimeoutMs, logger: this.logger, label };
+  }
 
   private _validateKey(key: string): void {
     if (!key) {
@@ -252,6 +267,15 @@ export class CredentialStore {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private async _storeFileMayExist(): Promise<boolean> {
+    try {
+      await access(this.filePath);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
     }
   }
 
@@ -287,6 +311,7 @@ export class CredentialStore {
   private async _getOrCreateMasterKey(): Promise<Buffer> {
     const existing = await this._loadMasterKey();
     if (existing) return existing;
+    if (await this._storeFileMayExist()) this._noMasterKey();
     const key = randomBytes(32);
     await this.keychain.setKey(key);
     this.masterKey = Promise.resolve(key);
@@ -383,17 +408,25 @@ export class CredentialStore {
     return result.data;
   }
 
-  private async _writeStore(store: CredentialStoreFile, masterKey: Buffer): Promise<void> {
+  private async _writeStore(store: CredentialStoreFile, masterKey: Buffer, giveUp: AbortSignal): Promise<void> {
     const data = Buffer.from(JSON.stringify(store), "utf-8");
     const encrypted = this._encrypt(data, masterKey);
 
-    const dir = dirname(this.filePath);
-    // 0o700 so co-located users can't even list the directory contents and
-    // watch token-refresh mtimes. The file itself is already 0o600 below.
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-
-    const tmpPath = `${this.filePath}.tmp.${process.pid}`;
-    await writeFile(tmpPath, encrypted, { mode: 0o600 });
-    await rename(tmpPath, this.filePath);
+    const tmpPath = storeTempPath(this.filePath);
+    await unlink(tmpPath).catch(() => {});
+    try {
+      const tmp = await open(tmpPath, "wx", 0o600);
+      try {
+        await tmp.writeFile(encrypted);
+        await tmp.sync();
+      } finally {
+        await tmp.close();
+      }
+      giveUp.throwIfAborted();
+      await rename(tmpPath, this.filePath);
+    } catch (err) {
+      await unlink(tmpPath).catch(() => {});
+      throw err;
+    }
   }
 }

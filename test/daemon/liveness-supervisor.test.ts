@@ -283,7 +283,7 @@ describe.skipIf(isWindows)("DaemonLivenessSupervisor — force-respawn", () => {
 
   it("two-bridge race: after respawnLockWaitMs the loser still ensures a daemon instead of giving up", async () => {
     await fx.kill();
-    const { acquireLock } = await import("../../src/daemon/lockfile.js");
+    const { acquireLock } = await import("../../src/process/lockfile.js");
     const competingHolder = await acquireLock(fx.lockPath, {
       pid: process.pid,
       stealStale: true,

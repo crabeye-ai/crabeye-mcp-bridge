@@ -13,9 +13,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-const { acquireLock, LockBusyError } = await import("../../src/daemon/lockfile.js");
+const { acquireLock, LockBusyError } = await import("../../src/process/lockfile.js");
 
-describe("daemon lockfile on a filesystem without hard links", () => {
+describe("lockfile on a filesystem without hard links", () => {
   let dir: string;
 
   beforeEach(async () => {

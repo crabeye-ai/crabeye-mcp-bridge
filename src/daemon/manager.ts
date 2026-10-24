@@ -11,7 +11,7 @@ import {
   readLockHolderPid,
   sweepAbandonedLockFiles,
   type LockHandle,
-} from "./lockfile.js";
+} from "../process/lockfile.js";
 import { processExists } from "../process/process-utils.js";
 import { isForeignProcess } from "./daemon-identity.js";
 import { ChildHandle, BackpressureError } from "./child-handle.js";

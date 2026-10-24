@@ -32,9 +32,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-const { acquireLock } = await import("../../src/daemon/lockfile.js");
+const { acquireLock } = await import("../../src/process/lockfile.js");
 
-describe("daemon lockfile release racing a takeover", () => {
+describe("lockfile release racing a takeover", () => {
   let dir: string;
   let lockPath: string;
 

@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import { daemonStatus, ensureDaemonRunning, isDaemonReachable, type EnsureAttemptOptions } from "./bootstrap.js";
 import { daemonFit } from "./daemon-version.js";
 import { DaemonClient, DaemonRpcError } from "./client.js";
-import { acquireLock, LockBusyError, type LockHandle } from "./lockfile.js";
+import { acquireLock, LockBusyError, type LockHandle } from "../process/lockfile.js";
 import { readPidFile, terminateDaemon } from "./daemon-process.js";
 import { netTransport } from "./net-transport.js";
 import {

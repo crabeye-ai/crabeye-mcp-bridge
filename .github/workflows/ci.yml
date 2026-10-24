@@ -44,7 +44,7 @@ jobs:
       - run: npm ci
       - run: npm test
 
-  test-windows-daemon-launch:
+  test-windows-processes:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx vitest run test/daemon/daemon-launch.test.ts
+      - run: npx vitest run test/daemon/daemon-launch.test.ts test/credentials/store-processes.test.ts
 
   build:
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-import { execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync, spawnSync, type ChildProcess } from "node:child_process";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
@@ -11,6 +11,17 @@ export function exited(child: ChildProcess, withinMs: number): Promise<number | 
     new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code))),
     new Promise<"running">((resolve) => setTimeout(() => resolve("running"), withinMs)),
   ]);
+}
+
+export async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let settled = false;
+  void promise.then(() => (settled = true), () => (settled = true));
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  return settled;
+}
+
+export function deadPid(): number {
+  return spawnSync(process.execPath, ["-e", ""]).pid;
 }
 
 export async function waitUntil(condition: () => boolean, withinMs: number): Promise<void> {

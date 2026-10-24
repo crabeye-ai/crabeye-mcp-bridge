@@ -20,9 +20,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-const { acquireLock } = await import("../../src/daemon/lockfile.js");
+const { acquireLock } = await import("../../src/process/lockfile.js");
 
-describe("daemon lockfile when the holder releases mid-acquire", () => {
+describe("lockfile when the holder releases mid-acquire", () => {
   const dir = mkdtempSync(join(tmpdir(), "cbe-vanish-"));
 
   afterEach(() => {

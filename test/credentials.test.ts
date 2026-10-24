@@ -943,13 +943,16 @@ describe("lock-hold timeout", () => {
    * Persists the master key across calls so drain-pattern follow-up calls
    * can decrypt what the first wedged call wrote.
    */
-  function gatedKeychain(): { keychain: KeychainAdapter; release: () => void } {
+  function gatedKeychain(): { keychain: KeychainAdapter; release: () => void; reached: Promise<void> } {
     let resolveGate: () => void = () => {};
     const gate = new Promise<void>((r) => { resolveGate = r; });
+    let reachedGate: () => void = () => {};
+    const reached = new Promise<void>((r) => { reachedGate = r; });
     let stored: Buffer | undefined;
     return {
+      reached,
       keychain: {
-        async getKey() { await gate; return stored; },
+        async getKey() { reachedGate(); await gate; return stored; },
         async setKey(k) { stored = k; },
         async deleteKey() { stored = undefined; },
       },
@@ -1007,9 +1010,9 @@ describe("lock-hold timeout", () => {
     expect(warn).toHaveBeenCalledOnce();
     expect(warn.mock.calls[0]?.[0]).toMatch(/Credential store set exceeded 60000ms/);
 
-    // Drain the wedged closure's fs writes before afterEach removes the
-    // tmpdir. The follow-up `set` queues behind it, so awaiting it
-    // guarantees the chain has flushed.
+    // Settle the wedged closure before afterEach removes the tmpdir. The
+    // follow-up `set` queues behind it, so awaiting it guarantees the chain
+    // has flushed.
     release();
     await vi.runAllTimersAsync();
     await store.set("__drain", { type: "bearer", access_token: "_" });
@@ -1017,23 +1020,22 @@ describe("lock-hold timeout", () => {
 
   it("keeps the chain held until the wedged closure actually settles", async () => {
     const { logger } = makeLogger();
-    const { keychain, release } = gatedKeychain();
+    const { keychain, release, reached } = gatedKeychain();
     const store = makeStore(keychain, logger);
 
     const first = store.set("a", { type: "bearer", access_token: "1" });
     first.catch(() => {});
+    await reached;
     await vi.advanceTimersByTimeAsync(60_001);
 
     let secondSettled = false;
     const second = store.set("b", { type: "bearer", access_token: "2" })
       .finally(() => { secondSettled = true; });
-    await vi.advanceTimersByTimeAsync(0);
-    // Wedged closure still parked → second must NOT have started (it
-    // could otherwise race the first on `_writeStore`).
+    await vi.advanceTimersByTimeAsync(60_001);
+    // Wedged closure still parked → second must NOT have started.
     expect(secondSettled).toBe(false);
 
     release();
-    await vi.runAllTimersAsync();
     await second;
     expect(secondSettled).toBe(true);
   });
@@ -1058,7 +1060,6 @@ describe("lock-hold timeout", () => {
     expect(onSecondReject).not.toHaveBeenCalled();
 
     release();
-    await vi.runAllTimersAsync();
     await expect(second).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalledOnce();
   });

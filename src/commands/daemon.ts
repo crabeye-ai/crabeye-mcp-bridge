@@ -14,7 +14,6 @@ import {
   daemonFilesFor,
   getDaemonSocketPath,
   netTransport,
-  LockBusyError,
   DaemonAlreadyRunningError,
   readPidFile,
   recordedPids,
@@ -25,7 +24,7 @@ import {
   type DaemonStatus,
   type TerminateResult,
 } from "../daemon/index.js";
-import { processExists } from "../process/index.js";
+import { LockBusyError, processExists } from "../process/index.js";
 import { escapeLabel } from "../logging/index.js";
 import { loadDaemonConfig, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
 import { APP_NAME } from "../constants.js";

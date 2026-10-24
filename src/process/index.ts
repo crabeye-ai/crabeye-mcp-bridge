@@ -6,3 +6,4 @@ export {
   type KillProcessTreeOptions,
   type ProcessInfo,
 } from "./process-utils.js";
+export { LockBusyError } from "./lockfile.js";

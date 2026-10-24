@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { parsePid, processExists, readProcessInfo, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
 import { isDaemonCommandLine } from "./daemon-identity.js";
-import { readLockHolderPid } from "./lockfile.js";
+import { readLockHolderPid } from "../process/lockfile.js";
 import type { DaemonFiles } from "./paths.js";
 
 const EXIT_POLL_MS = 50;

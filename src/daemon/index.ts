@@ -74,8 +74,6 @@ export {
   type ProcessTrackerOptions,
   type ReapResult,
 } from "./process-tracker.js";
-export { acquireLock, LockBusyError } from "./lockfile.js";
-export type { LockHandle } from "./lockfile.js";
 export { netTransport } from "./net-transport.js";
 export { daemonFit, daemonVersionLabel, olderDaemonStillRunning, reportedDaemonPid, UNKNOWN_DAEMON_VERSION } from "./daemon-version.js";
 export {

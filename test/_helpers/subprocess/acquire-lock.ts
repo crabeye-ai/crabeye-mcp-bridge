@@ -1,4 +1,4 @@
-import { acquireLock, LockBusyError } from "../../../src/daemon/lockfile.js";
+import { acquireLock, LockBusyError } from "../../../src/process/lockfile.js";
 
 const [lockPath] = process.argv.slice(2);
 

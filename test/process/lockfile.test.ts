@@ -8,8 +8,11 @@ import {
   holdsLock,
   LockBusyError,
   LOCK_SETTLE_MS,
+  readLockHolderPid,
   sweepAbandonedLockFiles,
-} from "../../src/daemon/lockfile.js";
+  waitForLock,
+} from "../../src/process/lockfile.js";
+import { settledWithin } from "../_helpers/processes.js";
 
 function tempDir(): string {
   return join(
@@ -18,7 +21,7 @@ function tempDir(): string {
   );
 }
 
-describe("daemon lockfile", () => {
+describe("lockfile", () => {
   let dir: string;
   let lockPath: string;
 
@@ -266,5 +269,85 @@ describe("daemon lockfile", () => {
 
     await expect(stat(abandoned)).rejects.toThrow();
     await expect(stat(inFlight)).resolves.toBeDefined();
+  });
+});
+
+describe("waitForLock", () => {
+  let dir: string;
+  let lockPath: string;
+  const alive = () => true;
+
+  beforeEach(async () => {
+    dir = tempDir();
+    lockPath = join(dir, "store.lock");
+    await mkdir(dir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("acquires the lock once its live holder releases it", async () => {
+    const holder = await acquireLock(lockPath, { pid: 4242 });
+    const waiting = waitForLock(lockPath, { pid: 1, isProcessAlive: alive, signal: AbortSignal.timeout(10_000) });
+
+    expect(await settledWithin(waiting, 150)).toBe(false);
+    await holder.release();
+
+    const handle = await waiting;
+    expect(await readLockHolderPid(lockPath)).toBe(1);
+    await handle.release();
+  });
+
+  it("gives up with its signal's reason once the signal aborts", async () => {
+    const holder = await acquireLock(lockPath, { pid: 4242 });
+    const startedAt = Date.now();
+
+    const err = await waitForLock(lockPath, { isProcessAlive: alive, signal: AbortSignal.timeout(200) }).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ name: "TimeoutError" });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(190);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(await holder.isHeld()).toBe(true);
+    await holder.release();
+  });
+
+  it("doesn't take the lock when its signal has already aborted", async () => {
+    const giveUp = new AbortController();
+    giveUp.abort(new Error("caller gave up"));
+
+    await expect(waitForLock(lockPath, { signal: giveUp.signal })).rejects.toThrow("caller gave up");
+
+    expect((await readdir(dir)).filter((name) => name.startsWith("store.lock"))).toEqual([]);
+  });
+
+  it("releases rather than returns a lock it gets after its signal aborted", async () => {
+    const giveUp = new AbortController();
+    const waiting = waitForLock(lockPath, { signal: giveUp.signal });
+    giveUp.abort(new Error("caller gave up"));
+
+    await expect(waiting).rejects.toThrow("caller gave up");
+
+    await expect(stat(lockPath)).rejects.toThrow();
+  });
+
+  it("takes over the lock when its holder dies while waiting", async () => {
+    let holderAlive = true;
+    await writeFile(lockPath, "4242\nheld-token\n");
+    const waiting = waitForLock(lockPath, { pid: 1, isProcessAlive: (pid) => pid !== 4242 || holderAlive, signal: AbortSignal.timeout(10_000) });
+
+    expect(await settledWithin(waiting, 100)).toBe(false);
+    holderAlive = false;
+
+    const handle = await waiting;
+    expect(await handle.isHeld()).toBe(true);
+    await handle.release();
+  });
+
+  it("fails at once on errors other than a busy lock", async () => {
+    const startedAt = Date.now();
+
+    await expect(waitForLock(join(dir, "missing", "store.lock"), { signal: AbortSignal.timeout(10_000) })).rejects.toMatchObject({ code: "ENOENT" });
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 });
