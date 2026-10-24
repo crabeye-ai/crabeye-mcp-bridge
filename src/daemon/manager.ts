@@ -63,6 +63,7 @@ import { NotificationRouter } from "./notification-router.js";
 import { answerChildRequest, isChildRequest, type ChildRequest } from "./child-requests.js";
 import { Telemetry, type KilledReason } from "./telemetry.js";
 import { ChildPing } from "./child-ping.js";
+import { ChildEra } from "./child-era.js";
 import { StderrForwardLimit } from "./stderr-capture.js";
 import { SocketInUseError, type DaemonServer, type FrameChannel, type Transport } from "./transport.js";
 
@@ -168,6 +169,7 @@ export interface ChildGroup {
    * `childPingMs <= 0`.
    */
   childPing: ChildPing | null;
+  era: ChildEra;
   teardown: Promise<void> | null;
 }
 
@@ -737,7 +739,7 @@ export class ManagerDaemon {
       }
       if (isFirst) {
         try {
-          group.child.send({
+          this.writeToChild(group, {
             jsonrpc: "2.0",
             method: "resources/subscribe",
             params: { uri },
@@ -782,7 +784,7 @@ export class ManagerDaemon {
       }
       if (isLast) {
         try {
-          group.child.send({
+          this.writeToChild(group, {
             jsonrpc: "2.0",
             method: "resources/unsubscribe",
             params: { uri },
@@ -797,8 +799,20 @@ export class ManagerDaemon {
       return;
     }
 
+    const storedReply = group.era.answerFor(params.payload);
+    if (storedReply !== null) {
+      channel.send({ method: "RPC", params: { sessionId: params.sessionId, payload: storedReply } });
+      return;
+    }
+    const initializing = isInitializeRequest(params.payload);
+    if (initializing) {
+      for (const outerId of group.era.noteInitialize(params.sessionId)) {
+        group.rewriter.removeInflight(params.sessionId, outerId);
+      }
+    }
+
     // Daemon-side initialize short-circuit.
-    if (isInitializeRequest(params.payload) && group.child.cachedInit !== null) {
+    if (initializing && group.child.cachedInit !== null) {
       const reqId = pickInnerId(params.payload);
       if (reqId !== null) {
         const initResult = group.child.cachedInit;
@@ -843,10 +857,13 @@ export class ManagerDaemon {
       }
       throw err;
     }
-    if (rewritten === null) return;
+    if (rewritten === null || cancelsProbe(rewritten, group.era)) return;
     const allocatedOuterId = (rewritten as { id?: unknown })?.id;
     try {
-      group.child.send(rewritten);
+      this.writeToChild(group, rewritten);
+      if (typeof allocatedOuterId === "number") {
+        group.era.noteForwarded(params.sessionId, params.payload, allocatedOuterId);
+      }
     } catch (err) {
       if (err instanceof BackpressureError) {
         const innerId = pickInnerId(params.payload);
@@ -1011,6 +1028,7 @@ export class ManagerDaemon {
       internalRequests: new Map(),
       nextInternalId: -1,
       childPing: null,
+      era: new ChildEra({ answerModernFromStore: this.childPingMs > 0 }),
     };
     groupRef.value = group;
 
@@ -1040,7 +1058,7 @@ export class ManagerDaemon {
             group.internalRequests.delete(id);
           },
           sendPayload: (payload) => {
-            group.child.send(payload);
+            this.writeToChild(group, payload);
           },
           onWedged: (reason) => {
             if (!group.child.alive) return;
@@ -1118,13 +1136,14 @@ export class ManagerDaemon {
 
   /**
    * Route an inbound child→bridge message to the correct session(s).
-   * - "response" / "progress" / "cancelled": sessionIds from rewriter (originating session)
+   * - "response" / "progress" / "cancelled" / "subscription": sessionIds from rewriter (originating session)
    * - "internal": a reply to a request the daemon sent itself (its own pings), handed to its callback
    * - "drop": silently discard
    * - "other": a request from the child is answered by the daemon (child-requests.ts); a notification is
    *   fanned out by NotificationRouter
    */
   private routeChildMessage(group: ChildGroup, payload: unknown): void {
+    group.era.noteChildResponse(payload);
     const routing = group.rewriter.inboundFromChild(payload);
     if (routing.kind === "response" || routing.kind === "internal") group.childPing?.start();
     if (routing.kind === "drop") return;
@@ -1171,7 +1190,7 @@ export class ManagerDaemon {
       this.deliver(group, routing.sessionIds, routing.payload);
       return;
     }
-    if (routing.kind === "progress" || routing.kind === "cancelled") {
+    if (routing.kind === "progress" || routing.kind === "cancelled" || routing.kind === "subscription") {
       this.deliver(group, routing.sessionIds, routing.payload);
       return;
     }
@@ -1194,11 +1213,16 @@ export class ManagerDaemon {
     if (sessions.length > 0) this.deliver(group, sessions, routing.payload);
   }
 
+  private writeToChild(group: ChildGroup, payload: unknown): void {
+    group.child.send(payload);
+    group.era.noteWritten(payload);
+  }
+
   private replyToChildRequest(group: ChildGroup, request: ChildRequest): void {
     const label = methodLabel(request.method);
     if (request.method !== "ping") this.telemetry.recordRefusedUpstreamRequest(label);
     try {
-      group.child.send(answerChildRequest(request, label));
+      this.writeToChild(group, answerChildRequest(request, label));
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       this.logger.warn(`could not answer child request "${label}": ${reason}`, {
@@ -1335,18 +1359,20 @@ export class ManagerDaemon {
     // Drop subscriptions; collect URIs that lost their last subscriber.
     const droppedUris = group.subscriptions.removeSession(sessionId);
 
-    // Detach session from rewriter; collect outer ids to cancel on the child.
+    // Detach session from rewriter; collect outer ids to cancel on the child (never its probes).
     const { cancelledOuterIds } = group.rewriter.detachSession(sessionId);
+    const cancellable = cancelledOuterIds.filter((outerId) => !group.era.isProbe(outerId));
+    group.era.forgetSession(sessionId);
 
     // Send synthetic errors AFTER detach so rewriter state is clean.
     for (const innerId of originals) {
       this.sendInflightFailure(att.channel, sessionId, innerId, inflightFailure);
     }
 
-    // Forward `notifications/cancelled` to the child for each outstanding outer id.
-    for (const outerId of cancelledOuterIds) {
+    // Forward `notifications/cancelled` to the child for each outstanding request other than a probe.
+    for (const outerId of cancellable) {
       try {
-        group.child.send({
+        this.writeToChild(group, {
           jsonrpc: "2.0",
           method: "notifications/cancelled",
           params: { requestId: outerId, reason: "session detached" },
@@ -1359,7 +1385,7 @@ export class ManagerDaemon {
     // Forward `resources/unsubscribe` to the child for each URI that lost all subscribers.
     for (const uri of droppedUris) {
       try {
-        group.child.send({
+        this.writeToChild(group, {
           jsonrpc: "2.0",
           method: "resources/unsubscribe",
           params: { uri },
@@ -1457,6 +1483,8 @@ export class ManagerDaemon {
     return Array.from(this.groups.values()).map((g) => ({
       pid: g.child.pid ?? -1,
       upstreamHash: g.upstreamHash,
+      serverName: g.serverName,
+      era: g.era.label,
       startedAt: g.startedAt,
       refcount: g.sessions.size,
       sessions: Array.from(g.sessions),
@@ -1624,6 +1652,12 @@ function pickInnerId(payload: unknown): InnerId | null {
   const p = payload as { id?: unknown };
   if (typeof p.id === "string" || typeof p.id === "number") return p.id;
   return null;
+}
+
+function cancelsProbe(payload: unknown, era: ChildEra): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as { method?: unknown; params?: { requestId?: unknown } };
+  return p.method === "notifications/cancelled" && typeof p.params?.requestId === "number" && era.isProbe(p.params.requestId);
 }
 
 function isInitializeRequest(payload: unknown): boolean {

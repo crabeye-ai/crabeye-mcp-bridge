@@ -49,7 +49,7 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
   beforeEach(async () => { paths = await tempPaths(); await mkdir(paths.dir, { recursive: true }); manager = null; });
   afterEach(async () => { if (manager !== null) await manager.stop(0).catch(() => {}); await rm(paths.dir, { recursive: true, force: true }); });
 
-  it("returns per-child entries with exactly pid, upstreamHash, startedAt, refcount, sessions, subscriptionCount and cachedInit", async () => {
+  it("returns per-child entries with exactly pid, upstreamHash, serverName, era, startedAt, refcount, sessions, subscriptionCount and cachedInit", async () => {
     manager = new ManagerDaemon({
       socketPath: paths.sock, pidPath: paths.pid, lockPath: paths.lock,
       idleMs: 60_000, transport: netTransport, processTrackerPath: paths.proc,
@@ -87,8 +87,10 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       const ch = status.children[0]!;
       expect(Object.keys(ch).sort()).toEqual([
         "cachedInit",
+        "era",
         "pid",
         "refcount",
+        "serverName",
         "sessions",
         "startedAt",
         "subscriptionCount",
@@ -98,6 +100,8 @@ describe.skipIf(isWindows)("ManagerDaemon — STATUS shape", () => {
       expect(new Set(ch.sessions)).toEqual(new Set([A, B]));
       expect(ch.subscriptionCount).toBe(1);
       expect(ch.cachedInit).toBeNull();
+      expect(ch.serverName).toBe("x");
+      expect(ch.era).toBe("unknown");
       expect(typeof ch.upstreamHash).toBe("string");
       expect(typeof ch.startedAt).toBe("number");
 

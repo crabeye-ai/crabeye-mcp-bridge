@@ -4,8 +4,9 @@
  * Phase C: opaque-integer rewriting. Each bridge→child request gets a fresh
  * integer id allocated by the daemon. The original (sessionId, originalId)
  * is stored; the inbound response is reverse-mapped and the original id is
- * restored on the payload. Same scheme for `progressToken` and
- * `notifications/cancelled.requestId`.
+ * restored on the payload. Same scheme for `progressToken`,
+ * `notifications/cancelled.requestId`, and the subscription id the child
+ * stamps on a `subscriptions/listen` stream's notifications and final result.
  *
  * String tokens lose type fidelity (acceptable per AIT-247 scope).
  */
@@ -22,7 +23,16 @@ export class InflightOverflowError extends Error {
   }
 }
 
-export type InboundKind = "response" | "progress" | "cancelled" | "other" | "drop" | "internal";
+export type InboundKind = "response" | "progress" | "cancelled" | "subscription" | "other" | "drop" | "internal";
+
+const SUBSCRIPTION_ID_META_KEY = "io.modelcontextprotocol/subscriptionId";
+const SUBSCRIPTION_NOTIFICATIONS: ReadonlySet<string> = new Set([
+  "notifications/subscriptions/acknowledged",
+  "notifications/tools/list_changed",
+  "notifications/prompts/list_changed",
+  "notifications/resources/list_changed",
+  "notifications/resources/updated",
+]);
 
 export interface InboundRouting {
   /** Session(s) to deliver this payload to. Empty for "drop"; "other" leaves routing to caller. */
@@ -49,6 +59,7 @@ export class TokenRewriter {
   private inflightBySession = new Map<string, Set<number>>();
   private nextOuterProgress = 1;
   private outerProgressToOrigin = new Map<number, ProgressOriginEntry>();
+  private listenOuterIds = new Set<number>();
   private readonly maxInflight: number;
 
   constructor(opts: { maxInflightPerSession?: number } = {}) {
@@ -72,6 +83,7 @@ export class TokenRewriter {
     const cancelledOuterIds = Array.from(inflight);
     for (const outer of cancelledOuterIds) {
       this.outerIdToOrigin.delete(outer);
+      this.listenOuterIds.delete(outer);
     }
     // Drop progress mappings owned by this session.
     for (const [outer, entry] of this.outerProgressToOrigin) {
@@ -117,6 +129,7 @@ export class TokenRewriter {
     const outerId = this.nextOuterId++;
     this.outerIdToOrigin.set(outerId, { sessionId, originalId: p.id as InnerId });
     set.add(outerId);
+    if (p.method === "subscriptions/listen") this.listenOuterIds.add(outerId);
 
     const rewritten: Record<string, unknown> = { ...p, id: outerId };
     const params = isJsonObject(p.params) ? (p.params as Record<string, unknown>) : undefined;
@@ -141,6 +154,7 @@ export class TokenRewriter {
   removeInflight(sessionId: string, outerId: number): void {
     this.inflightBySession.get(sessionId)?.delete(outerId);
     this.outerIdToOrigin.delete(outerId);
+    this.listenOuterIds.delete(outerId);
   }
 
   /** Child → bridge route. Restores ids; returns routing decision. */
@@ -167,9 +181,10 @@ export class TokenRewriter {
       if (origin === undefined) return { sessionIds: [], payload, kind: "drop" };
       this.outerIdToOrigin.delete(p.id as number);
       this.inflightBySession.get(origin.sessionId)?.delete(p.id as number);
+      this.listenOuterIds.delete(p.id as number);
       return {
         sessionIds: [origin.sessionId],
-        payload: { ...p, id: origin.originalId },
+        payload: { ...p, id: origin.originalId, ...restoredResultSubscription(p.result, p.id, origin.originalId) },
         kind: "response",
       };
     }
@@ -188,7 +203,26 @@ export class TokenRewriter {
         };
       }
     }
+    if (typeof p.method === "string" && p.id === undefined && SUBSCRIPTION_NOTIFICATIONS.has(p.method)) {
+      const subscription = this.restoreSubscription(p);
+      if (subscription !== null) return subscription;
+    }
     return { sessionIds: [], payload, kind: "other" };
+  }
+
+  private restoreSubscription(notification: Record<string, unknown>): InboundRouting | null {
+    const params = isJsonObject(notification.params) ? (notification.params as Record<string, unknown>) : undefined;
+    const meta = isJsonObject(params?._meta) ? (params!._meta as Record<string, unknown>) : undefined;
+    if (meta === undefined || !(SUBSCRIPTION_ID_META_KEY in meta)) return null;
+    const outerId = meta[SUBSCRIPTION_ID_META_KEY];
+    const listening = typeof outerId === "number" && this.listenOuterIds.has(outerId);
+    const origin = listening ? this.outerIdToOrigin.get(outerId) : undefined;
+    if (origin === undefined) return { sessionIds: [], payload: notification, kind: "drop" };
+    return {
+      sessionIds: [origin.sessionId],
+      payload: { ...notification, params: { ...params, _meta: { ...meta, [SUBSCRIPTION_ID_META_KEY]: origin.originalId } } },
+      kind: "subscription",
+    };
   }
 
   /** Inner request ids the session has in flight (in insertion order). */
@@ -201,6 +235,13 @@ export class TokenRewriter {
   peekOrigin(outerId: number): OriginEntry | undefined {
     return this.outerIdToOrigin.get(outerId);
   }
+}
+
+function restoredResultSubscription(result: unknown, outerId: number, originalId: InnerId): { result?: unknown } {
+  if (!isJsonObject(result) || !isJsonObject(result._meta)) return {};
+  const meta = result._meta as Record<string, unknown>;
+  if (meta[SUBSCRIPTION_ID_META_KEY] !== outerId) return {};
+  return { result: { ...result, _meta: { ...meta, [SUBSCRIPTION_ID_META_KEY]: originalId } } };
 }
 
 function isJsonObject(v: unknown): v is Record<string, unknown> {

@@ -24,9 +24,13 @@ A shared child serves all of its bridges at once. A server that keeps state in m
 
 The bridge dedupes config entries by `upstreamHash` locally — duplicate identical entries collapse to one session before reaching the manager.
 
-## Initialize cache
+## Initialize and protocol-version cache
 
 The first bridge session against a child runs a real `initialize` round-trip. The manager caches the result and replays it on every subsequent session's `initialize` for the same child — the call never reaches the child a second time. The cache covers `protocolVersion`, `serverInfo`, `capabilities`, and (when the upstream advertises one) the `instructions` text used by the bridge's [`_bridge.passthrough`](configuration.md#context-passthrough) feature, so all sessions see the same instructions regardless of attach order.
+
+Servers on the 2026-07-28 protocol skip `initialize`, and bridges ask them which protocol versions they speak instead. The manager remembers each child's answer once a bridge has gone on to use the 2026-07-28 protocol with it, so only the checks made before then reach the child. Later bridges, reconnects and health checks get the remembered answer. The manager forgets the answer when the child stops, so a restarted or upgraded server is asked again. If the child ping is turned off (`_bridge.daemon.childPingMs: 0`), every check still reaches a 2026-07-28 server, so a stuck child is still noticed.
+
+A server settles on one protocol from the first message it gets other than this question. So when anything else reaches it first (an `initialize` from a bridge that gave up waiting on a slow first start or from crabeye 1.3.0 or earlier, the manager's own health check, or a cancelled request), the manager doesn't keep the server's answer to an earlier check, whether it has arrived yet or not: the next check asks the server again, and its reply decides. The manager never passes on the cancellation of a check, so a bridge that quits while its check is waiting doesn't change the protocol for the others. A server that answers the question with an error (other than one saying it doesn't support the version asked for) is remembered straight away. If a server ignores the question, as some older servers do, only the bridges that connect before the first check gives up (about 10 seconds) have to wait; later bridges are told straight away that the server doesn't speak the 2026-07-28 protocol.
 
 ## CLI
 
@@ -35,9 +39,11 @@ The manager is started automatically on first bridge connect. The `daemon` subco
 ```bash
 crabeye-mcp-bridge daemon start      # spawn the manager (no-op if one it doesn't need to replace is running)
 crabeye-mcp-bridge daemon stop       # graceful shutdown; stops an unresponsive manager too
-crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, and requests from upstreams it refused
+crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, refused upstream requests, and each server's protocol
 crabeye-mcp-bridge daemon restart    # stop + start
 ```
+
+`daemon status` lists the servers bridges are using under `children`, each with its protocol: `modern` (2026-07-28), `legacy` (an earlier version), or `unknown` (not known yet). It shows `null` when the manager can't be asked or doesn't report protocols (managers from crabeye 1.3.0 or earlier don't).
 
 `crabeye-mcp-bridge daemon --internal-launch` is a hidden, internal-only entrypoint used by the bridge to fork the manager process. Don't use it directly.
 
@@ -106,6 +112,7 @@ The manager broadcasts certain upstream notifications across every session shari
 | `notifications/resources/list_changed` | Broadcast to every attached session. | No — bridge does not implement this surface. |
 | `notifications/resources/updated` | Routed by per-session subscription tracker (only sessions that subscribed get the notification). | Yes. |
 | `notifications/progress`, `notifications/cancelled` | Routed to the originating session via rewritten progress/request tokens. | Yes. |
+| Notifications for a 2026-07-28 subscription (its confirmation, and the changes it asked for) | Routed only to the session that opened the subscription; dropped once it has ended. | No — the bridge handles them itself (a tool-list change re-indexes its search). |
 
 Log messages an upstream sends as notifications are dropped; what a server writes to stderr appears in the bridge log instead (see below).
 

@@ -4,6 +4,7 @@ import {
   CLIENT_INFO_META_KEY,
   PROTOCOL_VERSION_META_KEY,
   SERVER_INFO_META_KEY,
+  SUBSCRIPTION_ID_META_KEY,
 } from "@modelcontextprotocol/client";
 import { InflightOverflowError, TokenRewriter } from "../../src/daemon/token-rewriter.js";
 
@@ -216,5 +217,118 @@ describe("TokenRewriter — 2026-07-28 envelope _meta passthrough", () => {
       kind: "response",
       payload: { jsonrpc: "2.0", id: "req-a", result },
     });
+  });
+});
+
+describe("TokenRewriter — subscriptions/listen", () => {
+  const tagged = (method: string, subscriptionId: unknown, params: Record<string, unknown> = {}) => ({
+    jsonrpc: "2.0",
+    method,
+    params: { ...params, _meta: { [SUBSCRIPTION_ID_META_KEY]: subscriptionId, other: "kept" } },
+  });
+
+  function openListen(rw: TokenRewriter, sessionId: string, id: string): number {
+    rw.attachSession(sessionId);
+    const out = rw.outboundForChild({ jsonrpc: "2.0", id, method: "subscriptions/listen", params: {} }, sessionId) as { id: number };
+    return out.id;
+  }
+
+  it.each([
+    "notifications/subscriptions/acknowledged",
+    "notifications/tools/list_changed",
+    "notifications/prompts/list_changed",
+    "notifications/resources/list_changed",
+    "notifications/resources/updated",
+  ])(
+    "routes %s for a subscription back to the session that opened it, under its own id",
+    (method) => {
+      const rw = new TokenRewriter();
+      const outerA = openListen(rw, "a", "listen:0");
+      const outerB = openListen(rw, "b", "listen:0");
+
+      expect(rw.inboundFromChild(tagged(method, outerB, { notifications: { toolsListChanged: true } }))).toEqual({
+        kind: "subscription",
+        sessionIds: ["b"],
+        payload: tagged(method, "listen:0", { notifications: { toolsListChanged: true } }),
+      });
+      expect(rw.inboundFromChild(tagged(method, outerA)).sessionIds).toEqual(["a"]);
+    },
+  );
+
+  it("keeps the subscription routable across notifications until its request ends", () => {
+    const rw = new TokenRewriter();
+    const outer = openListen(rw, "a", "listen:0");
+
+    expect(rw.inboundFromChild(tagged("notifications/subscriptions/acknowledged", outer)).kind).toBe("subscription");
+    expect(rw.inboundFromChild(tagged("notifications/tools/list_changed", outer)).kind).toBe("subscription");
+    expect(rw.inboundFromChild({ jsonrpc: "2.0", id: outer, result: {} }).kind).toBe("response");
+    expect(rw.inboundFromChild(tagged("notifications/tools/list_changed", outer)).kind).toBe("drop");
+  });
+
+  it.each([
+    ["an unknown subscription id", 999],
+    ["a string subscription id", "listen:0"],
+    ["an undefined subscription id", undefined],
+  ])("drops a tagged notification with %s", (_case, subscriptionId) => {
+    const rw = new TokenRewriter();
+    openListen(rw, "a", "listen:0");
+
+    expect(rw.inboundFromChild(tagged("notifications/tools/list_changed", subscriptionId))).toMatchObject({ kind: "drop", sessionIds: [] });
+  });
+
+  it("drops a notification tagged with the id of a request that isn't a subscription", () => {
+    const rw = new TokenRewriter();
+    rw.attachSession("a");
+    const call = rw.outboundForChild({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} }, "a") as { id: number };
+
+    expect(rw.inboundFromChild(tagged("notifications/resources/updated", call.id, { uri: "file:///x" }))).toMatchObject({
+      kind: "drop",
+      sessionIds: [],
+    });
+  });
+
+  it("drops a detached session's subscription notifications", () => {
+    const rw = new TokenRewriter();
+    const outer = openListen(rw, "a", "listen:0");
+
+    rw.detachSession("a");
+
+    expect(rw.inboundFromChild(tagged("notifications/tools/list_changed", outer)).kind).toBe("drop");
+  });
+
+  it.each(["notifications/message", "notifications/initialized", "vendor/custom"])(
+    "leaves a %s notification carrying a subscription id to the caller's routing rules",
+    (method) => {
+      const rw = new TokenRewriter();
+      const outer = openListen(rw, "a", "listen:0");
+
+      expect(rw.inboundFromChild(tagged(method, outer))).toMatchObject({ kind: "other", sessionIds: [] });
+    },
+  );
+
+  it("restores the subscription id on the result that ends the subscription", () => {
+    const rw = new TokenRewriter();
+    const outer = openListen(rw, "a", "listen:0");
+
+    expect(rw.inboundFromChild({ jsonrpc: "2.0", id: outer, result: { resultType: "complete", _meta: { [SUBSCRIPTION_ID_META_KEY]: outer, other: 1 } } })).toEqual({
+      kind: "response",
+      sessionIds: ["a"],
+      payload: { jsonrpc: "2.0", id: "listen:0", result: { resultType: "complete", _meta: { [SUBSCRIPTION_ID_META_KEY]: "listen:0", other: 1 } } },
+    });
+  });
+
+  it("leaves a result's subscription id alone when it names a different request", () => {
+    const rw = new TokenRewriter();
+    const outer = openListen(rw, "a", "listen:0");
+    const result = { _meta: { [SUBSCRIPTION_ID_META_KEY]: 999 } };
+
+    expect(rw.inboundFromChild({ jsonrpc: "2.0", id: outer, result }).payload).toEqual({ jsonrpc: "2.0", id: "listen:0", result });
+  });
+
+  it("leaves untagged notifications to the caller", () => {
+    const rw = new TokenRewriter();
+    openListen(rw, "a", "listen:0");
+
+    expect(rw.inboundFromChild({ jsonrpc: "2.0", method: "notifications/tools/list_changed", params: {} }).kind).toBe("other");
   });
 });

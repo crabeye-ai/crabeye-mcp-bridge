@@ -1,5 +1,8 @@
 export const STUB_STARTUP_ERROR_ENV = "STUB_STARTUP_ERROR";
 export const STUB_EXIT_ON_TOOLS_LIST_ENV = "STUB_EXIT_ON_TOOLS_LIST";
+export const STUB_IGNORE_DISCOVER_ENV = "STUB_IGNORE_DISCOVER";
+export const MODERN_STUB_DISCOVER_LOG_ENV = "MODERN_STUB_DISCOVER_LOG";
+export const MODERN_STUB_START_DELAY_ENV = "MODERN_STUB_START_DELAY_MS";
 
 export const STUB_STDIO_SERVER = `
 const reply = (id, body) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, ...body }) + "\\n");
@@ -53,6 +56,8 @@ const serve = () => onNewlineOnlyLines((line) => {
   if (msg.id === undefined || msg.method === undefined) return;
   if (msg.method === "initialize") {
     reply(msg.id, { result: { protocolVersion: msg.params.protocolVersion, serverInfo: { name: "stub", version: "0" }, capabilities: { tools: { listChanged: true } } } });
+  } else if (msg.method === "server/discover" && process.env.${STUB_IGNORE_DISCOVER_ENV}) {
+    return;
   } else if (msg.method === "tools/list" && process.env.${STUB_EXIT_ON_TOOLS_LIST_ENV}) {
     process.stderr.write("Error: cannot list tools\\n", () => process.exit(4));
   } else if (msg.method === "tools/list") {

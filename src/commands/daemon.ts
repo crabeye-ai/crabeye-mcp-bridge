@@ -21,6 +21,7 @@ import {
   terminateDaemon,
   waitForExit,
   isSocketAddressError,
+  type ChildEraLabel,
   type DaemonStatus,
   type TerminateResult,
 } from "../daemon/index.js";
@@ -33,8 +34,11 @@ export type DaemonAction = "start" | "stop" | "status" | "restart";
 
 interface StatusReply extends DaemonStatus {
   uptime?: unknown;
+  children?: unknown;
   telemetry?: { upstreamRequests?: { refusedTotal?: unknown } };
 }
+
+const CHILD_ERAS: ReadonlySet<string> = new Set<ChildEraLabel>(["modern", "legacy", "unknown"]);
 
 export interface RestartUpstreamOpts {
   hash?: string;
@@ -225,6 +229,7 @@ async function runStatus(): Promise<number> {
       uptime: nonNegativeIntegerOrNull(status.uptime),
       appVersion: daemonVersionLabel(status),
       refusedUpstreamRequests: refusedRequestCounts(status.telemetry?.upstreamRequests?.refusedTotal),
+      children: childEras(status.children),
     });
     return 0;
   } catch (err) {
@@ -235,7 +240,14 @@ async function runStatus(): Promise<number> {
 
   const pid = await readPidFile(daemonFilesFor(getDaemonSocketPath()).pidPath);
   if (pid !== null && processExists(pid)) {
-    writeStatus({ running: true, pid, uptime: null, appVersion: UNKNOWN_DAEMON_VERSION, refusedUpstreamRequests: null });
+    writeStatus({
+      running: true,
+      pid,
+      uptime: null,
+      appVersion: UNKNOWN_DAEMON_VERSION,
+      refusedUpstreamRequests: null,
+      children: null,
+    });
     return 0;
   }
 
@@ -259,6 +271,18 @@ function refusedRequestCounts(value: unknown): Record<string, number> | null {
     counts.push([escapeLabel(method), count]);
   }
   return Object.fromEntries(counts);
+}
+
+function childEras(value: unknown): { server: string; era: ChildEraLabel }[] | null {
+  if (!Array.isArray(value)) return null;
+  const children: { server: string; era: ChildEraLabel }[] = [];
+  for (const child of value) {
+    if (typeof child !== "object" || child === null) return null;
+    const { serverName, era } = child as { serverName?: unknown; era?: unknown };
+    if (typeof serverName !== "string" || typeof era !== "string" || !CHILD_ERAS.has(era)) return null;
+    children.push({ server: escapeLabel(serverName), era: era as ChildEraLabel });
+  }
+  return children.sort((a, b) => a.server.localeCompare(b.server));
 }
 
 function writeStatus(status: Record<string, unknown>): void {

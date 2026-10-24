@@ -25,6 +25,7 @@ const statusUptime = jsonOption("--status-uptime-json", 1);
 const statusExtra = jsonOption("--status-extra-json", {}) as Record<string, unknown>;
 const statusVersion = option("--status-version");
 const statusRefused = jsonOption("--status-refused-json", undefined);
+const statusChildren = jsonOption("--status-children-json", []);
 const socketPath = getDaemonSocketPath();
 mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
 rmSync(socketPath, { force: true });
@@ -58,7 +59,7 @@ const server = createServer((socket) => {
         const appVersion = statusVersion === undefined ? {} : { appVersion: statusVersion };
         const telemetry = statusRefused === undefined ? {} : { telemetry: { upstreamRequests: { refusedTotal: statusRefused } } };
         socket.write(
-          encodeFrame({ id, result: { uptime: statusUptime, pid: statusPid, version: 1, ...appVersion, ...telemetry, ...statusExtra, children: [], sessions: [] } }),
+          encodeFrame({ id, result: { uptime: statusUptime, pid: statusPid, version: 1, ...appVersion, ...telemetry, ...statusExtra, children: statusChildren, sessions: [] } }),
         );
       } else if (method === "SHUTDOWN") {
         socket.write(encodeFrame({ id, result: { ok: true } }));

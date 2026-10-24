@@ -136,6 +136,8 @@ export interface StderrParams {
 export interface StatusChild {
   pid: number;
   upstreamHash: string;
+  serverName: string;
+  era: ChildEraLabel;
   startedAt: number;
   refcount: number;
   sessions: string[];
@@ -154,6 +156,7 @@ export type {
   TelemetrySnapshot,
 } from "./telemetry.js";
 import type { TelemetrySnapshot as _TelemetrySnapshot } from "./telemetry.js";
+import type { ChildEraLabel } from "./child-era.js";
 
 export interface StatusResult {
   uptime: number;

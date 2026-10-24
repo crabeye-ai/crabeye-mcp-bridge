@@ -290,7 +290,50 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         uptime: expect.any(Number),
         appVersion: APP_VERSION,
         refusedUpstreamRequests: {},
+        children: [],
       });
+    });
+
+    it("shows the protocol era of each server a bridge is using", async () => {
+      await workspace();
+      const bridge = await connectBridge();
+      expect(await callStubTool(bridge)).toEqual(CALLED);
+
+      const result = await runCli(cliScript, "daemon", "status");
+
+      expect(JSON.parse(result.stdout).children).toEqual([{ server: "stub", era: "legacy" }]);
+    });
+
+    it("shows each server's era sorted by name, with control and format characters in names escaped", async () => {
+      await workspace();
+      const hostile = `z${String.fromCodePoint(0x1b)}[2J${String.fromCodePoint(0x202e)}`;
+      const children = [
+        { serverName: hostile, era: "unknown" },
+        { serverName: "github", era: "modern" },
+        { serverName: "linear", era: "legacy" },
+      ];
+      await startOlderDaemon("--status-children-json", JSON.stringify(children));
+
+      const result = await runCli(cliScript, "daemon", "status");
+
+      expect(JSON.parse(result.stdout).children).toEqual([
+        { server: "github", era: "modern" },
+        { server: "linear", era: "legacy" },
+        { server: "z\\x1b[2J\\u202e", era: "unknown" },
+      ]);
+    });
+
+    it.each([
+      ["children without a name or era, as daemons before eras report them", [{ pid: 1, upstreamHash: "h" }]],
+      ["an era the bridge doesn't know", [{ serverName: "linear", era: "future" }]],
+      ["children that are not a list", { linear: "modern" }],
+    ])("shows no children for %s", async (_case, children) => {
+      await workspace();
+      await startOlderDaemon("--status-children-json", JSON.stringify(children));
+
+      const result = await runCli(cliScript, "daemon", "status");
+
+      expect(JSON.parse(result.stdout).children).toBeNull();
     });
 
     it("shows a refused-request count of 0 as it is", async () => {
@@ -314,6 +357,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         uptime: 1,
         appVersion: "0.8.0",
         refusedUpstreamRequests: { "roots/list": 1 },
+        children: [],
       });
     });
 
@@ -367,6 +411,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         uptime: 1,
         appVersion: "unknown",
         refusedUpstreamRequests: null,
+        children: [],
       });
     });
 
@@ -384,6 +429,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         uptime: null,
         appVersion: "unknown",
         refusedUpstreamRequests: null,
+        children: null,
       });
     });
   });
