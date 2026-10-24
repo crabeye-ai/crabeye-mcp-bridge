@@ -486,7 +486,7 @@ describe("file I/O", () => {
     expect(s.isDirectory()).toBe(true);
   });
 
-  it("file has 0o600 permissions", async () => {
+  it.skipIf(process.platform === "win32")("file has 0o600 permissions", async () => {
     const filePath = join(dir, "creds.enc");
     // Ensure dir exists for this test
     await mkdir(dir, { recursive: true });
