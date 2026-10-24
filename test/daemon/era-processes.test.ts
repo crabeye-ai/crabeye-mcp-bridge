@@ -42,6 +42,8 @@ describe.skipIf(isWindows)("protocol era of shared STDIO servers over the built 
     return { discovers: async () => (await readFile(log, "utf-8")).split("\n").filter(Boolean) };
   }
 
+  const upstreamEras = (bridge: BridgeProcess, server: string) =>
+    [...bridge.stderr().matchAll(new RegExp(`\\[upstream:${server}\\] connected era=(\\w+)`, "g"))].map((match) => match[1]);
   const echo = async (bridge: BridgeProcess) => (await bridge.client.callTool(viaRunTool("modern__echo"))).content;
   const eras = async () => (await home!.status())!.children.map(({ serverName, era }) => ({ serverName, era }));
 
@@ -55,8 +57,8 @@ describe.skipIf(isWindows)("protocol era of shared STDIO servers over the built 
     await new Promise((resolve) => setTimeout(resolve, 2_500));
 
     expect(await discovers()).toHaveLength(1);
-    expect(first.stderr()).toContain("connected era=modern");
-    expect(second.stderr()).toContain("connected era=modern");
+    expect(upstreamEras(first, "modern")).toEqual(["modern"]);
+    expect(upstreamEras(second, "modern")).toEqual(["modern"]);
     expect(await eras()).toEqual([{ serverName: "modern", era: "modern" }]);
   });
 
@@ -103,14 +105,14 @@ describe.skipIf(isWindows)("protocol era of shared STDIO servers over the built 
     await modernHome({}, { [MODERN_STUB_START_DELAY_ENV]: String(PROBE_TIMEOUT_MS + 1_000) });
     const first = await home!.connectBridge(cliScript);
     await until(async () => isDeepStrictEqual(await echo(first).catch(() => null), ECHOED), 30_000);
-    expect(first.stderr()).toContain("connected era=legacy");
+    expect(upstreamEras(first, "modern")).toEqual(["legacy"]);
 
     const secondStarted = Date.now();
     const second = await home!.connectBridge(cliScript);
     await until(async () => isDeepStrictEqual(await echo(second).catch(() => null), ECHOED), 10_000);
 
     expect(Date.now() - secondStarted).toBeLessThan(PROBE_TIMEOUT_MS / 2);
-    expect(second.stderr()).toContain("connected era=legacy");
+    expect(upstreamEras(second, "modern")).toEqual(["legacy"]);
     expect(await eras()).toEqual([{ serverName: "modern", era: "legacy" }]);
   });
 
@@ -129,7 +131,7 @@ describe.skipIf(isWindows)("protocol era of shared STDIO servers over the built 
 
     expect(firstTook).toBeGreaterThanOrEqual(PROBE_TIMEOUT_MS);
     expect(secondTook).toBeLessThan(PROBE_TIMEOUT_MS / 2);
-    expect(second.stderr()).toContain("connected era=legacy");
+    expect(upstreamEras(second, "stub")).toEqual(["legacy"]);
     expect(await eras()).toEqual([{ serverName: "stub", era: "legacy" }]);
   });
 });
