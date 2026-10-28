@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { ERROR_CODE_BACKPRESSURE, type ChildExit } from "./protocol.js";
 import { STDERR_DRAIN_MS, StderrCapture } from "./stderr-capture.js";
+import { RateLimitedReport } from "./rate-limited-report.js";
 import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
 
 /**
@@ -18,6 +19,7 @@ const DEFAULT_QUEUE_MAX_BYTES = 1 * 1024 * 1024;
  * of stderr) would otherwise grow the buffer until the daemon OOMs.
  */
 const DEFAULT_STDOUT_MAX_BYTES = 8 * 1024 * 1024;
+const NON_JSON_REPORT_INTERVAL_MS = 1_000;
 
 export type ProcessExit = ChildExit & { cause: Exclude<ChildExit["cause"], "unresponsive"> };
 
@@ -86,7 +88,17 @@ export class ChildHandle {
   private readonly opts: ChildHandleOptions;
   private _cachedInit: CachedInit | null = null;
   private readonly stderr: StderrCapture;
-  private exitStatus: Pick<ChildExit, "code" | "signal"> | null = null;
+  private _exitStatus: Pick<ChildExit, "code" | "signal"> | null = null;
+  private _lastSignalSent: NodeJS.Signals | null = null;
+  private readonly nonJsonLines = new RateLimitedReport<number>(NON_JSON_REPORT_INTERVAL_MS, (count, latestBytes) =>
+    this.opts.onError(
+      new Error(
+        count === 1
+          ? `child stdout produced a line that isn't JSON (${latestBytes} bytes)`
+          : `child stdout produced ${count} lines that aren't JSON since the last report (latest ${latestBytes} bytes)`,
+      ),
+    ),
+  );
   private failedToStart = false;
   private resolveExited!: () => void;
   private readonly exited = new Promise<void>((resolve) => (this.resolveExited = resolve));
@@ -120,7 +132,7 @@ export class ChildHandle {
     });
 
     this.child.once("exit", (code, signal) => {
-      this.exitStatus = { code, signal };
+      this._exitStatus = { code, signal };
       this.resolveExited();
       this.reportExitWhenDrained();
     });
@@ -145,6 +157,14 @@ export class ChildHandle {
   /** PID of the spawned child, or null if the spawn never produced one. */
   get pid(): number | null {
     return this.child.pid ?? null;
+  }
+
+  get exitStatus(): Pick<ChildExit, "code" | "signal"> | null {
+    return this._exitStatus;
+  }
+
+  get lastSignalSent(): NodeJS.Signals | null {
+    return this._lastSignalSent;
   }
 
   get alive(): boolean {
@@ -195,10 +215,12 @@ export class ChildHandle {
   }
 
   private async terminate(killGraceMs: number): Promise<void> {
+    this.nonJsonLines.flush();
     this.closed = true;
     if (hasExited(this.child)) return;
 
     try {
+      this._lastSignalSent = "SIGTERM";
       this.child.kill("SIGTERM");
     } catch {
       /* already gone */
@@ -208,6 +230,7 @@ export class ChildHandle {
     if (exited) return;
 
     try {
+      this._lastSignalSent = "SIGKILL";
       this.child.kill("SIGKILL");
     } catch {
       /* gone between checks */
@@ -226,6 +249,7 @@ export class ChildHandle {
   private reportExitWhenDrained(): void {
     if (this.closed) return;
     this.closed = true;
+    this.nonJsonLines.flush();
     void this.drained().then(() => {
       if (this.killing === null) this.opts.onClose(this.exitReport());
     });
@@ -234,8 +258,8 @@ export class ChildHandle {
   private exitReport(): ProcessExit {
     return {
       cause: this.failedToStart ? "failed_to_start" : "exited",
-      code: this.exitStatus?.code ?? null,
-      signal: this.exitStatus?.signal ?? null,
+      code: this._exitStatus?.code ?? null,
+      signal: this._exitStatus?.signal ?? null,
     };
   }
 
@@ -275,12 +299,8 @@ export class ChildHandle {
         let parsed: unknown;
         try {
           parsed = JSON.parse(trimmed);
-        } catch (err) {
-          this.opts.onError(
-            new Error(
-              `child stdout produced invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
-            ),
-          );
+        } catch {
+          this.nonJsonLines.offer(Buffer.byteLength(trimmed));
           nl = this.stdoutBuffer.indexOf("\n");
           continue;
         }

@@ -11,7 +11,8 @@ import { daemonStatus, ensureDaemonRunning, isDaemonReachable, type EnsureAttemp
 import { daemonFit } from "./daemon-version.js";
 import { DaemonClient, DaemonRpcError } from "./client.js";
 import { acquireLock, LockBusyError, type LockHandle } from "../process/lockfile.js";
-import { readPidFile, terminateDaemon } from "./daemon-process.js";
+import { terminateDaemon } from "./daemon-process.js";
+import { readPidFile } from "./pidfile.js";
 import { netTransport } from "./net-transport.js";
 import {
   ERROR_CODE_RPC_TIMEOUT,

@@ -39,7 +39,7 @@ The manager is started automatically on first bridge connect. The `daemon` subco
 ```bash
 crabeye-mcp-bridge daemon start      # spawn the manager (no-op if one it doesn't need to replace is running)
 crabeye-mcp-bridge daemon stop       # graceful shutdown; stops an unresponsive manager too
-crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, refused upstream requests, and each server's protocol
+crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, refused upstream requests, each server's protocol, and the log file
 crabeye-mcp-bridge daemon restart    # stop + start
 ```
 
@@ -92,6 +92,7 @@ Bridge has hot-reload: it reads the saved config and reconciles upstream session
 * **Unix:** UDS at `~/.crabeye/run/manager.sock` (mode `0600`), pidfile at `~/.crabeye/run/manager.pid`, lockfile at `~/.crabeye/run/manager.lock`.
 * **Long home directories:** socket paths are limited in length (100 bytes). When `~/.crabeye/run/manager.sock` is longer, the bridge and manager reach it through a short link named `crabeye-<hash>` in your private temporary directory (`$TMPDIR` on macOS, `$XDG_RUNTIME_DIR` or `/run/user/<uid>` on Linux); the socket, pidfile and lockfile stay in `~/.crabeye/run`. If no private temporary directory is available, the manager fails to start with an error giving the path and the limit.
 * **Windows:** named pipe restricted to the current user.
+* **Manager log:** see [Manager log](#manager-log).
 
 ## Failure handling
 
@@ -121,6 +122,31 @@ Log messages an upstream sends as notifications are dropped; what a server write
 Whatever a STDIO server writes to stderr shows up in the log of every bridge using it, at debug level, tagged with that bridge's name for the server. To see it, set `_bridge.logLevel` to `"debug"`. Control characters in these lines are escaped like any other log text. Very long lines are cut off, and when a server writes more than 100 lines a second, the extra lines are left out and the bridge logs how many.
 
 When a STDIO server stops (it can't be started, exits, crashes, stops answering, or is stopped for sending a message too large to read), every bridge using it logs a warning at the default log level with the server's last stderr lines. A server that fails at startup usually says why there, for example a missing token. If the command itself can't be started, the warning shows the error from starting it. While a server keeps failing the same way without connecting in between, later warnings are logged at debug level. A bridge from crabeye 1.3.0 or earlier doesn't receive any of this, and no bridge does while it uses a manager from crabeye 1.3.0 or earlier.
+
+## Manager log
+
+The manager writes what it does to a log file:
+
+* **macOS and Linux:** `~/.crabeye/logs/daemon.log`
+* **Windows:** `%LOCALAPPDATA%\crabeye\logs\daemon.log`
+
+`daemon status` prints the path as `logFile`, whether or not a manager is running. A manager from crabeye 1.3.0 or earlier writes no log, so while one is running the file may be missing or end at an earlier time. On macOS and Linux, the directory and the file are readable only by you. The log calls the manager "daemon".
+
+The log records:
+
+* the manager starting and stopping, and why it stopped (asked to, idle, a signal, another manager taking over, or a crash, with its error);
+* a start that fails, with the error, and a start that finds a manager already running and leaves it to serve;
+* waiting for a previous manager to exit, and taking over from one that is no longer running;
+* sessions opening, closing (and why), and being refused (and why);
+* STDIO servers starting, exiting on their own (with their exit code or signal), and being stopped (idle, not answering pings, restarted, or shutting down).
+
+At debug level it also records what servers write to stderr, tagged with the server name, with the same 100-lines-a-second limit as in bridge logs. Each line starts with the date, the time with its UTC offset, and the manager's process id, so the lines of two managers running at the same time (a new one waiting for the old one) can be told apart.
+
+The level comes from `_bridge.logLevel` in `~/.crabeye-mcp-bridge/config.json` and is read when the manager starts; run `crabeye-mcp-bridge daemon restart` after changing it. The log is always plain text, whatever `_bridge.logFormat` is set to. If that file can't be read or isn't valid, the manager logs a warning and uses the defaults.
+
+The manager doesn't record environment values or command-line arguments. It does record server names, session and process ids, the command of a server that can't be started, the names and locations of invalid settings and why they're invalid (for a URL that can include its host, never its credentials), and, after a crash, the error with its stack. When a server writes something other than protocol messages to its output, the log says how many such lines there were, not what they said. Because servers can echo secrets to stderr, check a debug-level log before sharing it.
+
+Before the file would grow past 10 MB, it is renamed to `daemon.log.1`, replacing the previous one, and a new `daemon.log` is started. If it can't be renamed (for example because another program has `daemon.log.1` open on Windows), it is emptied instead. If the log can't be written, the manager keeps running without it.
 
 ## Requests from upstream servers
 

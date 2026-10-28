@@ -2,14 +2,16 @@ import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
-import { BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR, DAEMON_SHUTDOWN_MARGIN_MS, DEFAULT_KILL_GRACE_MS } from "../constants.js";
+import { BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR, DAEMON_SHUTDOWN_MARGIN_MS } from "../constants.js";
 import {
   ServerConfigSchema,
   GlobalBridgeConfigSchema,
   DaemonConfigSchema,
+  DEFAULT_LOG_LEVEL,
   type DaemonConfig,
 } from "./schema.js";
 import { parseJsoncString } from "./jsonc.js";
+import type { LogLevel } from "../logging/index.js";
 
 export const BridgeOwnedConfigSchema = z.object({
   configPaths: z.array(z.string()).default([]),
@@ -41,17 +43,34 @@ export async function loadBridgeOwnedConfig(): Promise<BridgeOwnedConfig | null>
   return BridgeOwnedConfigSchema.parse(json);
 }
 
-export async function loadDaemonConfig(): Promise<DaemonConfig> {
-  const config = await loadBridgeOwnedConfig().catch(() => null);
-  return DaemonConfigSchema.parse(config?._bridge?.daemon ?? {});
+export interface DaemonSettings {
+  daemon: DaemonConfig;
+  logLevel: LogLevel;
+  loadError?: string;
+}
+
+export async function loadDaemonSettings(): Promise<DaemonSettings> {
+  let config: BridgeOwnedConfig | null = null;
+  let loadError: string | undefined;
+  try {
+    config = await loadBridgeOwnedConfig();
+  } catch (err) {
+    loadError = describeLoadError(err);
+  }
+  return {
+    daemon: DaemonConfigSchema.parse(config?._bridge?.daemon ?? {}),
+    logLevel: config?._bridge?.logLevel ?? DEFAULT_LOG_LEVEL,
+    ...(loadError !== undefined && { loadError }),
+  };
+}
+
+function describeLoadError(err: unknown): string {
+  if (err instanceof z.ZodError) return z.prettifyError(err);
+  return err instanceof Error ? err.message : String(err);
 }
 
 export async function loadDaemonShutdownWaitMs(): Promise<number> {
-  const killGraceMs = await loadDaemonConfig().then(
-    (config) => config.killGraceMs,
-    () => DEFAULT_KILL_GRACE_MS,
-  );
-  return killGraceMs + DAEMON_SHUTDOWN_MARGIN_MS;
+  return (await loadDaemonSettings()).daemon.killGraceMs + DAEMON_SHUTDOWN_MARGIN_MS;
 }
 
 export async function saveBridgeOwnedConfig(config: BridgeOwnedConfig): Promise<void> {

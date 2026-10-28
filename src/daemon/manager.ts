@@ -1,5 +1,4 @@
-import { open, lstat, mkdir, chmod, unlink } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { dirname, isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { APP_NAME, APP_VERSION, DEFAULT_KILL_GRACE_MS, UPSTREAM_MARKER_ENV } from "../constants.js";
@@ -13,7 +12,9 @@ import {
   type LockHandle,
 } from "../process/lockfile.js";
 import { processExists } from "../process/process-utils.js";
+import { ensurePrivateDir } from "../process/private-dir.js";
 import { isForeignProcess } from "./daemon-identity.js";
+import { readPidFile, writePidFile } from "./pidfile.js";
 import { ChildHandle, BackpressureError } from "./child-handle.js";
 import type { CachedInit, ProcessExit } from "./child-handle.js";
 import { ProcessTracker } from "./process-tracker.js";
@@ -65,12 +66,13 @@ import { Telemetry, type KilledReason } from "./telemetry.js";
 import { ChildPing } from "./child-ping.js";
 import { ChildEra } from "./child-era.js";
 import { StderrForwardLimit } from "./stderr-capture.js";
+import { RateLimitedReport } from "./rate-limited-report.js";
 import { SocketInUseError, type DaemonServer, type FrameChannel, type Transport } from "./transport.js";
 
-const isWindows = process.platform === "win32";
 const PUBLICATION_CHECK_MS = 5_000;
 const PREDECESSOR_POLL_MS = 25;
 const PREDECESSOR_RECHECK_MS = 1_000;
+const UNANSWERED_REQUEST_REPORT_INTERVAL_MS = 1_000;
 const MAX_EARLY_MESSAGES = 64;
 
 /** Bound on simultaneous IPC clients. Same-UID DoS hardening. */
@@ -133,6 +135,11 @@ const PROTOCOL_MISSING_FIELD: DaemonError = {
   message: "request missing required fields { id, method }",
 };
 
+interface UnansweredRequest {
+  label: string;
+  reason: string;
+}
+
 export interface ChildGroup {
   groupId: string;
   upstreamHash: string;
@@ -141,6 +148,7 @@ export interface ChildGroup {
   subscriptions: SubscriptionTracker;
   router: NotificationRouter;
   stderrLimit: StderrForwardLimit;
+  unansweredRequests: RateLimitedReport<UnansweredRequest>;
   /** Sessions attached to this child. */
   sessions: Set<string>;
   /** Metadata captured at first spawn. */
@@ -175,12 +183,38 @@ export interface ChildGroup {
 
 type TeardownReason = KilledReason | "shutdown";
 
+type ChildStopReason = "idle" | "not answering pings" | "restart" | "shutdown";
+
+const CHILD_STOP_REASONS: Record<Exclude<TeardownReason, "crash">, ChildStopReason> = {
+  grace: "idle",
+  wedged: "not answering pings",
+  restart: "restart",
+  shutdown: "shutdown",
+};
+
+type SessionCloseReason =
+  | "shutdown"
+  | "bridge disconnected"
+  | "closed by bridge"
+  | "child exited"
+  | "child restarted"
+  | "child not answering pings"
+  | "child stopped while idle";
+
+const EVICTION_CLOSE_REASONS: Record<KilledReason, SessionCloseReason> = {
+  crash: "child exited",
+  restart: "child restarted",
+  wedged: "child not answering pings",
+  grace: "child stopped while idle",
+};
+
 type InflightFailure = { kind: "closed"; message: string } | { kind: "restarted"; reason: UpstreamRestartedReason };
 
 type StopReport = Required<Pick<SessionEvictedParams, "exit" | "stderr">>;
 
 export interface SessionAttachment {
   sessionId: string;
+  bridgeProtocolVersion: number;
   channel: FrameChannel;
   group: ChildGroup;
   startedAt: number;
@@ -271,6 +305,8 @@ export class ManagerDaemon {
   private startedAt = 0;
   private stopping = false;
   private exited = false;
+  private exitCode = 0;
+  private starting: Promise<void> | null = null;
   private nextGroupCounter = 1;
   private readonly maxConnections: number;
   private readonly maxSessionsPerChannel: number;
@@ -311,6 +347,14 @@ export class ManagerDaemon {
     });
   }
 
+  get isStopping(): boolean {
+    return this.stopping;
+  }
+
+  private get pid(): number {
+    return this.opts.pid ?? process.pid;
+  }
+
   /** Resolves with the exit code once `stop()` finishes. */
   waitForExit(): Promise<number> {
     return this.exitedPromise;
@@ -323,25 +367,35 @@ export class ManagerDaemon {
    * another daemon holds the lock and `DaemonAlreadyRunningError` when
    * another daemon owns the socket; in both cases the pidfile, process
    * tracker and live socket are left alone. With `awaitPredecessorMs`,
-   * retries until that daemon is gone or the wait runs out.
+   * retries until that daemon is gone or the wait runs out. Throws
+   * `DaemonStoppedWhileStartingError` when `stop()` is called before it serves.
    */
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    this.starting = this.startUntilServing();
+    return this.starting;
+  }
+
+  private async startUntilServing(): Promise<void> {
     const deadline = Date.now() + (this.opts.awaitPredecessorMs ?? 0);
     for (;;) {
+      if (this.stopping) throw new DaemonStoppedWhileStartingError();
       try {
         return await this.startOnce();
       } catch (err) {
         const heldByPredecessor = err instanceof LockBusyError || err instanceof DaemonAlreadyRunningError;
+        if (this.stopping && heldByPredecessor) throw new DaemonStoppedWhileStartingError();
         if (!heldByPredecessor || Date.now() >= deadline) throw err;
-        this.reportWaitingForPredecessor();
-        await this.waitBeforeRetryingStart(err instanceof LockBusyError ? err.heldByPid : null, deadline);
+        const holderPid = err instanceof LockBusyError ? err.heldByPid : null;
+        this.reportWaitingForPredecessor(holderPid);
+        await this.waitBeforeRetryingStart(holderPid, deadline);
       }
     }
   }
 
-  private reportWaitingForPredecessor(): void {
+  private reportWaitingForPredecessor(holderPid: number | null): void {
     if (this.reportedWaitingForPredecessor) return;
     this.reportedWaitingForPredecessor = true;
+    this.logger.info("waiting for the previous daemon to exit", { component: "daemon", previousPid: holderPid ?? undefined });
     this.opts.onWaitingForPredecessor?.();
   }
 
@@ -350,6 +404,7 @@ export class ManagerDaemon {
     if (lockHolder === null) return;
     const recheckAt = Math.min(deadline, Date.now() + PREDECESSOR_RECHECK_MS);
     while (
+      !this.stopping &&
       Date.now() < recheckAt &&
       processExists(lockHolder) &&
       (await readLockHolderPid(this.opts.lockPath)) === lockHolder
@@ -362,7 +417,7 @@ export class ManagerDaemon {
     await this.prepRunDir();
 
     this.lock = await acquireLock(this.opts.lockPath, {
-      pid: this.opts.pid ?? process.pid,
+      pid: this.pid,
       isForeignProcess,
       track: true,
     });
@@ -370,10 +425,15 @@ export class ManagerDaemon {
     try {
       await this.claimSocket();
       await sweepAbandonedLockFiles(this.opts.lockPath);
+      await this.logPreviousDaemonGone(this.lock.takenOverFrom);
       await this.reapLeakedChildren();
-      await writePidfile(this.opts.pidPath, this.opts.pid ?? process.pid);
+      if (this.stopping) throw new DaemonStoppedWhileStartingError();
+      await writePidFile(this.opts.pidPath, this.pid);
       this.startedAt = Date.now();
       this.markReady();
+      if (!this.stopping) {
+        this.logger.info(this.reportedWaitingForPredecessor ? "previous daemon gone; serving" : "serving", { component: "daemon" });
+      }
       this.armIdleTimer();
       this.watchPublication();
     } catch (err) {
@@ -383,6 +443,18 @@ export class ManagerDaemon {
       await this.releaseLock();
       throw err;
     }
+  }
+
+  private async logPreviousDaemonGone(lockHolderPid: number | null): Promise<void> {
+    const previousPid = lockHolderPid ?? (await this.deadRecordedPid());
+    if (previousPid === null) return;
+    this.logger.info("took over from a previous daemon that is no longer running", { component: "daemon", previousPid });
+  }
+
+  private async deadRecordedPid(): Promise<number | null> {
+    const recorded = await readPidFile(this.opts.pidPath);
+    if (recorded === null || recorded === this.pid || processExists(recorded)) return null;
+    return recorded;
   }
 
   private async claimSocket(): Promise<void> {
@@ -401,7 +473,7 @@ export class ManagerDaemon {
 
   private async reapLeakedChildren(): Promise<void> {
     try {
-      const reaped = await this.tracker.reapStale();
+      const reaped = await this.tracker.reapStale(() => this.stopping);
       if (reaped.killed > 0 || reaped.skipped > 0) {
         this.logger.info(
           `reaped ${reaped.killed} leaked subprocess${reaped.killed === 1 ? "" : "es"} from previous daemon` +
@@ -423,6 +495,7 @@ export class ManagerDaemon {
       return;
     }
     if (this.pendingChannels.size >= this.maxConnections) {
+      this.logger.warn("connection refused", { component: "daemon", reason: "too many connections while starting" });
       channel.close();
       return;
     }
@@ -464,14 +537,16 @@ export class ManagerDaemon {
 
   private async stepDownIfOrphaned(): Promise<void> {
     if (this.stopping || this.server === null || (await this.server.isPublished())) return;
-    this.logger.warn("another daemon owns the socket now; shutting down", { component: "daemon" });
-    await this.stop(0);
+    await this.stop(0, "another daemon owns the socket");
   }
 
   /** Trigger graceful shutdown. Idempotent. */
-  async stop(exitCode = 0): Promise<void> {
+  async stop(exitCode = 0, reason = "stop requested"): Promise<void> {
+    this.exitCode = Math.max(this.exitCode, exitCode);
     if (this.stopping) return;
     this.stopping = true;
+    this.logger.info("daemon stopping", { component: "daemon", reason });
+    await this.starting?.catch(() => {});
 
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
@@ -486,7 +561,7 @@ export class ManagerDaemon {
     // a clean kill and the tracker is up-to-date.
     const sessionIds = Array.from(this.sessions.keys());
     for (const sid of sessionIds) {
-      await this.detachSession(sid, { kind: "closed", message: "daemon shutdown" }).catch(() => {});
+      await this.detachSession(sid, { kind: "closed", message: "daemon shutdown" }, "shutdown").catch(() => {});
     }
     await Promise.allSettled(Array.from(this.groups.values(), (g) => this.teardownGroup(g, "shutdown")));
     while (this.pendingTeardowns.size > 0) {
@@ -515,9 +590,12 @@ export class ManagerDaemon {
 
     try {
       if (await this.lock?.isHeld()) await unlink(this.opts.pidPath);
+      else if (this.lock !== null) this.logger.warn("lock was lost; leaving the pidfile in place", { component: "daemon" });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        process.stderr.write(`pidfile cleanup: ${(err as Error).message}\n`);
+        const failure = `pidfile cleanup: ${(err as Error).message}`;
+        process.stderr.write(`${failure}\n`);
+        this.logger.warn(failure, { component: "daemon" });
       }
     }
 
@@ -525,8 +603,9 @@ export class ManagerDaemon {
 
     if (!this.exited) {
       this.exited = true;
-      this.opts.onExit?.(exitCode);
-      this.exitedResolve(exitCode);
+      this.logger.info("daemon exited", { component: "daemon", exitCode: this.exitCode });
+      this.opts.onExit?.(this.exitCode);
+      this.exitedResolve(this.exitCode);
     }
   }
 
@@ -566,7 +645,7 @@ export class ManagerDaemon {
       case "STATUS": {
         const result: StatusResult = {
           uptime: this.uptimeMs(),
-          pid: this.opts.pid ?? process.pid,
+          pid: this.pid,
           version: PROTOCOL_VERSION,
           minBridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION,
           appVersion: APP_VERSION,
@@ -580,7 +659,7 @@ export class ManagerDaemon {
         // setImmediate gives the response a chance to drain to the kernel
         // before stop() destroys the connection.
         setImmediate(() => {
-          void this.stop(0);
+          void this.stop(0, "shutdown requested");
         });
         return { id: req.id, result: { ok: true } };
       case "OPEN": {
@@ -607,7 +686,7 @@ export class ManagerDaemon {
             "PING params must be { seq: non-negative integer }",
           );
         }
-        const result: PingResult = { seq: params.seq, pid: this.opts.pid ?? process.pid };
+        const result: PingResult = { seq: params.seq, pid: this.pid };
         return { id: req.id, result };
       }
       default:
@@ -621,6 +700,7 @@ export class ManagerDaemon {
       return;
     }
     if (this.connections.size >= this.maxConnections) {
+      this.logger.warn("connection refused", { component: "daemon", reason: "manager at connection cap" });
       channel.send({
         id: "",
         error: { code: ERROR_CODE_TOO_MANY_CONNECTIONS, message: "manager at connection cap" },
@@ -647,7 +727,7 @@ export class ManagerDaemon {
       if (ownedSessions) {
         for (const sid of ownedSessions) {
           // Channel died: emit synthetic errors and detach.
-          void this.detachSession(sid, { kind: "closed", message: "session closed" }).catch(() => {
+          void this.detachSession(sid, { kind: "closed", message: "session closed" }, "bridge disconnected").catch(() => {
             /* logged inside */
           });
         }
@@ -747,7 +827,7 @@ export class ManagerDaemon {
         } catch (err) {
           this.logger.debug(
             `subscribe forward failed: ${err instanceof Error ? err.message : String(err)}`,
-            { component: "daemon", upstreamHash: group.upstreamHash, uri },
+            { component: "daemon", server: group.serverName, uri },
           );
         }
       }
@@ -792,7 +872,7 @@ export class ManagerDaemon {
         } catch (err) {
           this.logger.debug(
             `unsubscribe forward failed: ${err instanceof Error ? err.message : String(err)}`,
-            { component: "daemon", upstreamHash: group.upstreamHash, uri },
+            { component: "daemon", server: group.serverName, uri },
           );
         }
       }
@@ -887,37 +967,42 @@ export class ManagerDaemon {
     rawParams: unknown,
     channel: FrameChannel,
   ): Promise<DaemonResponse> {
+    const refuseSession = (code: string, message: string, server?: string): DaemonResponse => {
+      this.logger.warn("session refused", { component: "daemon", server, reason: message, errorCode: code });
+      return errorResponse(requestId, code, message);
+    };
     if (this.stopping) {
-      return errorResponse(requestId, ERROR_CODE_DAEMON_STOPPING, "manager is shutting down");
+      return refuseSession(ERROR_CODE_DAEMON_STOPPING, "manager is shutting down");
     }
     const params = parseOpenParams(rawParams);
     if (params === null) {
-      return errorResponse(requestId, ERROR_CODE_INVALID_PARAMS, "OPEN params malformed");
+      return refuseSession(ERROR_CODE_INVALID_PARAMS, "OPEN params malformed");
     }
+    const serverName = params.spec.serverName;
     const bridgeProtocolVersion = params.bridgeProtocolVersion ?? UNREPORTED_BRIDGE_PROTOCOL_VERSION;
     if (bridgeProtocolVersion < MIN_BRIDGE_PROTOCOL_VERSION) {
-      return errorResponse(
-        requestId,
+      return refuseSession(
         ERROR_CODE_BRIDGE_UNSUPPORTED,
         `this daemon needs a bridge using protocol version ${MIN_BRIDGE_PROTOCOL_VERSION} or newer, not ${bridgeProtocolVersion}; restart the assistant to use the current ${APP_NAME}`,
+        serverName,
       );
     }
     if (this.sessions.has(params.sessionId)) {
-      return errorResponse(requestId, ERROR_CODE_SESSION_IN_USE, "sessionId already in use");
+      return refuseSession(ERROR_CODE_SESSION_IN_USE, "sessionId already in use", serverName);
     }
     if (this.sessions.size >= this.maxSessionsTotal) {
-      return errorResponse(
-        requestId,
+      return refuseSession(
         ERROR_CODE_TOO_MANY_SESSIONS,
         `manager session cap reached (${this.maxSessionsTotal})`,
+        serverName,
       );
     }
     const ownedNow = this.sessionsByChannel.get(channel)?.size ?? 0;
     if (ownedNow >= this.maxSessionsPerChannel) {
-      return errorResponse(
-        requestId,
+      return refuseSession(
         ERROR_CODE_TOO_MANY_SESSIONS,
         `channel session cap reached (${this.maxSessionsPerChannel})`,
+        serverName,
       );
     }
 
@@ -938,7 +1023,7 @@ export class ManagerDaemon {
     } else {
       const spawned = this.spawnGroup(hash, params.spec);
       if (spawned instanceof Error) {
-        return errorResponse(requestId, ERROR_CODE_SPAWN_FAILED, spawned.message);
+        return refuseSession(ERROR_CODE_SPAWN_FAILED, spawned.message, serverName);
       }
       group = spawned;
     }
@@ -949,6 +1034,7 @@ export class ManagerDaemon {
 
     const attachment: SessionAttachment = {
       sessionId: params.sessionId,
+      bridgeProtocolVersion,
       channel,
       group,
       startedAt: Date.now(),
@@ -960,6 +1046,13 @@ export class ManagerDaemon {
     owned.add(params.sessionId);
     this.sessionsByChannel.set(channel, owned);
     this.cancelIdleTimer();
+    this.logger.info("session opened", {
+      component: "daemon",
+      server: serverName,
+      sessionId: params.sessionId,
+      bridgeProtocolVersion,
+      reusedChild: existing !== undefined,
+    });
 
     return { id: requestId, result: { ok: true } };
   }
@@ -990,7 +1083,7 @@ export class ManagerDaemon {
         if (g !== null) void this.teardownGroup(g, "crash", exit);
       },
       onError: (err: Error): void => {
-        this.logger.warn(`child error: ${err.message}`, { component: "daemon", upstreamHash: hash });
+        this.logger.warn(`child error: ${err.message}`, { component: "daemon", server: spec.serverName });
       },
       onStderr: (line: string): void => stderrLimit.offer(line),
     };
@@ -1019,6 +1112,14 @@ export class ManagerDaemon {
       subscriptions,
       router,
       stderrLimit,
+      unansweredRequests: new RateLimitedReport<UnansweredRequest>(UNANSWERED_REQUEST_REPORT_INTERVAL_MS, (count, latest) =>
+        this.logger.warn(
+          count === 1
+            ? `could not answer child request "${latest.label}": ${latest.reason}`
+            : `could not answer ${count} child requests since the last report (latest "${latest.label}": ${latest.reason})`,
+          { component: "daemon", server: spec.serverName },
+        ),
+      ),
       sessions: new Set(),
       serverName: spec.serverName,
       startedAt: child.startedAt,
@@ -1039,7 +1140,6 @@ export class ManagerDaemon {
         maxConsecutiveFailures: this.childPingMaxConsecutiveFailures,
         logger: this.logger.child({
           component: "child-ping",
-          upstreamHash: hash,
           server: spec.serverName,
         }),
         deps: {
@@ -1066,7 +1166,6 @@ export class ManagerDaemon {
               `child wedged: ${reason} — killing`,
               {
                 component: "child-ping",
-                upstreamHash: hash,
                 server: spec.serverName,
                 pid: group.child.pid,
               },
@@ -1080,8 +1179,8 @@ export class ManagerDaemon {
     this.groupsByHash.set(hash, group);
 
     this.telemetry.recordSpawn();
-
     if (child.pid !== null) {
+      this.logger.info("child started", { component: "daemon", server: spec.serverName, pid: child.pid });
       void this.tracker
         .register({
           pid: child.pid,
@@ -1109,7 +1208,7 @@ export class ManagerDaemon {
     if (!this.sessions.has(params.sessionId)) {
       return errorResponse(requestId, ERROR_CODE_SESSION_NOT_FOUND, "no such session");
     }
-    await this.detachSession(params.sessionId, { kind: "closed", message: "session closed" });
+    await this.detachSession(params.sessionId, { kind: "closed", message: "session closed" }, "closed by bridge");
     return { id: requestId, result: { ok: true } };
   }
 
@@ -1224,11 +1323,7 @@ export class ManagerDaemon {
     try {
       this.writeToChild(group, answerChildRequest(request, label));
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`could not answer child request "${label}": ${reason}`, {
-        component: "daemon",
-        upstreamHash: group.upstreamHash,
-      });
+      group.unansweredRequests.offer({ label, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -1241,7 +1336,7 @@ export class ManagerDaemon {
         this.logger.debug("RPC notification not sent", {
           component: "daemon",
           sessionId: sid,
-          upstreamHash: group.upstreamHash,
+          server: group.serverName,
         });
       }
     }
@@ -1253,7 +1348,8 @@ export class ManagerDaemon {
       .then(() => this.runTeardown(group, reason, exit))
       .catch((err: unknown) => {
         this.logger.error(`child teardown failed: ${err instanceof Error ? err.message : String(err)}`, {
-          groupId: group.groupId,
+          component: "daemon",
+          server: group.serverName,
         });
       })
       .finally(() => {
@@ -1265,6 +1361,9 @@ export class ManagerDaemon {
   }
 
   private async runTeardown(group: ChildGroup, reason: TeardownReason, exit?: ChildExit): Promise<void> {
+    const logContext = { component: "daemon", server: group.serverName, pid: group.child.pid };
+    if (reason === "crash") this.logger.info("child exited", { ...logContext, ...exit });
+    else this.logger.info("child stopping", { ...logContext, reason: CHILD_STOP_REASONS[reason] });
     try {
       if (this.groups.get(group.groupId) === group) {
         this.groups.delete(group.groupId);
@@ -1274,10 +1373,12 @@ export class ManagerDaemon {
       this.cancelGraceTimer(group);
       group.childPing?.stop();
       group.stderrLimit.stop();
+      group.unansweredRequests.flush();
       if (reason !== "shutdown") this.evictSessionsOf(group, reason, exit);
     } finally {
       const pid = group.child.pid;
       await group.child.kill(this.killGraceMs()).catch(() => {});
+      if (reason !== "crash") this.logger.info("child stopped", { ...logContext, ...stopOutcome(group.child) });
       if (pid !== null) await this.tracker.unregister(pid).catch(() => {});
     }
     if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
@@ -1292,7 +1393,7 @@ export class ManagerDaemon {
         : ["child_exited", { kind: "closed", message: "child process exited" }];
     const stop: StopReport | undefined = exit && { exit, stderr: group.child.stderrTail() };
     for (const att of Array.from(this.sessions.values())) {
-      if (att.group === group) this.evictSession(att.sessionId, evictionReason, inflightFailure, stop);
+      if (att.group === group) this.evictSession(att.sessionId, evictionReason, inflightFailure, EVICTION_CLOSE_REASONS[reason], stop);
     }
   }
 
@@ -1313,16 +1414,18 @@ export class ManagerDaemon {
     sessionId: string,
     reason: SessionEvictedParams["reason"],
     inflightFailure: InflightFailure,
+    closeReason: SessionCloseReason,
     stop?: StopReport,
   ): void {
     const att = this.sessions.get(sessionId);
     if (att === undefined) return;
-    void this.detachSession(sessionId, inflightFailure).catch(() => {});
+    void this.detachSession(sessionId, inflightFailure, closeReason).catch(() => {});
     const params: SessionEvictedParams = { sessionId, reason, ...(att.receivesStderr && stop) };
     att.channel.send({ method: "SESSION_EVICTED", params });
   }
 
   private forwardStderr(group: ChildGroup, line: string): void {
+    this.logger.debug(line, { component: "stderr", server: group.serverName });
     for (const sessionId of group.sessions) {
       const att = this.sessions.get(sessionId);
       if (att?.receivesStderr) att.channel.send({ method: "STDERR", params: { sessionId, line } satisfies StderrParams });
@@ -1334,12 +1437,19 @@ export class ManagerDaemon {
    * `inflightFailure`, decrements refcount, arms the grace timer at 0. Does NOT kill
    * the child unless the grace timer expires.
    */
-  private async detachSession(sessionId: string, inflightFailure: InflightFailure): Promise<void> {
+  private async detachSession(sessionId: string, inflightFailure: InflightFailure, closeReason: SessionCloseReason): Promise<void> {
     const att = this.sessions.get(sessionId);
     if (att === undefined) return;
 
     this.sessions.delete(sessionId);
     this.telemetry.recordSessionClose();
+    this.logger.info("session closed", {
+      component: "daemon",
+      server: att.group.serverName,
+      sessionId,
+      bridgeProtocolVersion: att.bridgeProtocolVersion,
+      reason: closeReason,
+    });
 
     const owned = this.sessionsByChannel.get(att.channel);
     if (owned) owned.delete(sessionId);
@@ -1508,7 +1618,7 @@ export class ManagerDaemon {
     this.cancelIdleTimer();
     this.idleTimer = setTimeout(() => {
       if (!this.stopping && this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0) {
-        void this.stop(0);
+        void this.stop(0, "idle");
       }
     }, this.opts.idleMs);
     if (typeof this.idleTimer.unref === "function") {
@@ -1531,18 +1641,12 @@ export class ManagerDaemon {
   }
 
   private async prepRunDir(): Promise<void> {
-    const dir = dirname(this.opts.lockPath);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    if (isWindows) return;
-
-    // mkdir-recursive resolves intermediate symlinks. Refuse the run dir if
-    // it's been replaced with a symlink (same-UID redirection attempt).
-    const st = await lstat(dir);
-    if (st.isSymbolicLink()) {
-      throw new Error(`refusing to use symlinked daemon run dir: ${dir}`);
-    }
-    await chmod(dir, 0o700);
+    await ensurePrivateDir(dirname(this.opts.lockPath), "daemon run dir");
   }
+}
+
+function stopOutcome(child: ChildHandle): Pick<ChildExit, "code" | "signal"> | { lastSignalSent: NodeJS.Signals | null } {
+  return child.exitStatus ?? { lastSignalSent: child.lastSignalSent };
 }
 
 function errorResponse(id: string, code: string, message: string): DaemonResponse {
@@ -1564,10 +1668,10 @@ function parseOpenParams(raw: unknown): OpenParams | null {
   if (typeof spec !== "object" || spec === null) return null;
   const s = spec as Record<string, unknown>;
   if (typeof s.serverName !== "string" || s.serverName.length > MAX_SERVER_NAME_BYTES) return null;
-  if (typeof s.command !== "string" || s.command.length === 0 || s.command.length > MAX_COMMAND_BYTES) return null;
+  if (typeof s.command !== "string" || s.command.length === 0 || s.command.length > MAX_COMMAND_BYTES || s.command.includes("\0")) return null;
   if (!Array.isArray(s.args) || s.args.length > MAX_ARG_COUNT) return null;
   for (const a of s.args) {
-    if (typeof a !== "string" || a.length > MAX_ARG_BYTES) return null;
+    if (typeof a !== "string" || a.length > MAX_ARG_BYTES || a.includes("\0")) return null;
   }
   if (typeof s.resolvedEnv !== "object" || s.resolvedEnv === null || Array.isArray(s.resolvedEnv)) {
     return null;
@@ -1575,10 +1679,10 @@ function parseOpenParams(raw: unknown): OpenParams | null {
   const envEntries = Object.entries(s.resolvedEnv);
   if (envEntries.length > MAX_ENV_COUNT) return null;
   for (const [k, v] of envEntries) {
-    if (k.length > MAX_ENV_KEY_BYTES) return null;
-    if (typeof v !== "string" || v.length > MAX_ENV_VAL_BYTES) return null;
+    if (k.length > MAX_ENV_KEY_BYTES || k.includes("\0")) return null;
+    if (typeof v !== "string" || v.length > MAX_ENV_VAL_BYTES || v.includes("\0")) return null;
   }
-  if (typeof s.cwd !== "string" || s.cwd.length > MAX_CWD_BYTES) return null;
+  if (typeof s.cwd !== "string" || s.cwd.length > MAX_CWD_BYTES || s.cwd.includes("\0")) return null;
   // Reject relative cwd: it would resolve against the daemon's cwd (whatever
   // shell launched the daemon), almost never the bridge's intent.
   if (s.cwd !== "" && !isAbsolute(s.cwd)) return null;
@@ -1692,47 +1796,14 @@ function subscribeUri(payload: unknown): string | null {
   return typeof params.uri === "string" ? params.uri : null;
 }
 
-/**
- * Write the pidfile with `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` to refuse
- * pre-existing symlinks. The lockfile already pins our slot, so the file
- * shouldn't exist; if it does, fail loudly.
- */
-async function writePidfile(path: string, pid: number): Promise<void> {
-  const flags =
-    fsConstants.O_CREAT |
-    fsConstants.O_EXCL |
-    fsConstants.O_WRONLY |
-    (isWindows ? 0 : fsConstants.O_NOFOLLOW);
-  let fh;
-  try {
-    fh = await open(path, flags, 0o600);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") {
-      try {
-        const st = await lstat(path);
-        if (st.isSymbolicLink()) {
-          throw new Error(`refusing to write pidfile: ${path} is a symlink`);
-        }
-      } catch (lstatErr) {
-        if ((lstatErr as NodeJS.ErrnoException).code !== "ENOENT") throw lstatErr;
-      }
-      await unlink(path).catch(() => {
-        /* race tolerated; retry will surface it */
-      });
-      fh = await open(path, flags, 0o600);
-    } else {
-      throw err;
-    }
-  }
-  try {
-    await fh.writeFile(`${pid}\n`, "utf-8");
-  } finally {
-    await fh.close();
+export { LockBusyError };
+
+export class DaemonStoppedWhileStartingError extends Error {
+  constructor() {
+    super("daemon was stopped while starting");
+    this.name = "DaemonStoppedWhileStartingError";
   }
 }
-
-export { LockBusyError };
 
 export class DaemonAlreadyRunningError extends Error {
   constructor(public readonly socketPath: string) {

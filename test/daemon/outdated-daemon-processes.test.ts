@@ -40,6 +40,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
   }
 
   const cliAt = (version: string) => cliAtVersion(cliScript, home.dir, version);
+  const daemonLogPath = () => join(home.dir, ".crabeye", "logs", "daemon.log");
 
   async function startDaemon(script: string): Promise<StatusResult> {
     scripts.add(script);
@@ -286,6 +287,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual({
         running: true,
+        logFile: daemonLogPath(),
         pid: running.pid,
         uptime: expect.any(Number),
         appVersion: APP_VERSION,
@@ -353,6 +355,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
 
       expect(JSON.parse(result.stdout)).toEqual({
         running: true,
+        logFile: daemonLogPath(),
         pid: old.pid,
         uptime: 1,
         appVersion: "0.8.0",
@@ -407,6 +410,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
 
       expect(JSON.parse(result.stdout)).toEqual({
         running: true,
+        logFile: daemonLogPath(),
         pid: old.pid,
         uptime: 1,
         appVersion: "unknown",
@@ -425,6 +429,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
 
       expect(JSON.parse(result.stdout)).toEqual({
         running: true,
+        logFile: daemonLogPath(),
         pid: process.pid,
         uptime: null,
         appVersion: "unknown",

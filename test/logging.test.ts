@@ -388,6 +388,64 @@ describe("Logger", () => {
     });
   });
 
+  describe("custom sink", () => {
+    function capturing(options: Partial<Parameters<typeof createLogger>[0]> = {}) {
+      const lines: string[] = [];
+      const logger = createLogger({ level: "info", format: "text", write: (line) => lines.push(line), ...options });
+      return { logger, lines };
+    }
+
+    it("sends every line to the sink instead of stderr", () => {
+      const { logger, lines } = capturing();
+      logger.info("one");
+      logger.warn("two");
+      expect(lines).toHaveLength(2);
+      expect(lines[1]).toMatch(/WARN  two\n$/);
+      expect(stderrSpy).not.toHaveBeenCalled();
+    });
+
+    it("adds the date and the pid when asked", () => {
+      const { logger, lines } = capturing({ dated: true, pid: 4321 });
+      logger.info("started", { component: "daemon" });
+      expect(lines[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2} \[4321\] INFO  \[daemon\] started\n$/);
+    });
+
+    describe("UTC offset", () => {
+      const savedTz = process.env.TZ;
+
+      afterEach(() => {
+        if (savedTz === undefined) delete process.env.TZ;
+        else process.env.TZ = savedTz;
+      });
+
+      it.each([
+        ["UTC", /\+00:00$/],
+        ["Asia/Kolkata", /\+05:30$/],
+        ["America/St_Johns", /-0[23]:30$/],
+        ["Pacific/Chatham", /\+1[23]:45$/],
+      ])("matches the local time in %s", (tz, offset) => {
+        process.env.TZ = tz;
+        const { logger, lines } = capturing({ dated: true });
+        logger.info("now");
+        const stamp = lines[0].split(" ")[0];
+        expect(stamp).toMatch(offset);
+        expect(Math.abs(Date.parse(stamp) - Date.now())).toBeLessThan(5_000);
+      });
+    });
+
+    it("gives child loggers the same sink, style and level", () => {
+      const { logger, lines } = capturing({ dated: true, pid: 7 });
+      const child = logger.child({ component: "child" });
+      child.debug("hidden");
+      child.info("shown");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/ \[7\] INFO  \[child\] shown\n$/);
+      logger.setLevel("debug");
+      child.debug("now shown");
+      expect(lines).toHaveLength(2);
+    });
+  });
+
   describe("createNoopLogger", () => {
     it("does not write anything", () => {
       const logger = createNoopLogger();

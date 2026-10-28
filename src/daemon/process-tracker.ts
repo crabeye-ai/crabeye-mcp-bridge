@@ -92,12 +92,16 @@ export class ProcessTracker {
     await this._mutate(() => []);
   }
 
-  async reapStale(): Promise<ReapResult> {
+  async reapStale(shouldStop: () => boolean = () => false): Promise<ReapResult> {
     const entries = await this._read();
     let killed = 0;
     let skipped = 0;
 
-    for (const entry of entries) {
+    for (const [index, entry] of entries.entries()) {
+      if (shouldStop()) {
+        await this._mutate(() => entries.slice(index));
+        return { total: entries.length, killed, skipped };
+      }
       try {
         const outcome = await this._reapOne(entry);
         if (outcome === "killed") killed++;
@@ -145,7 +149,6 @@ export class ProcessTracker {
               recordedStartedAt: entry.startedAt,
               liveStartTime: info.startTime,
               skewMs: skew,
-              cmdline: info.cmdline,
             },
           );
           return "skipped";
@@ -157,8 +160,6 @@ export class ProcessTracker {
           {
             pid: entry.pid,
             server: entry.server,
-            recorded: `${entry.command} ${entry.args.join(" ")}`,
-            actual: info.cmdline,
           },
         );
         return "skipped";

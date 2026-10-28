@@ -6,6 +6,7 @@ import {
   ProcessTracker,
   type TrackedProcess,
 } from "../../src/daemon/process-tracker.js";
+import { spyLogger } from "../_helpers/spy-logger.js";
 import type {
   KillProcessTreeOptions,
   ProcessInfo,
@@ -356,6 +357,47 @@ describe("ProcessTracker", () => {
       expect(result.skipped).toBe(1);
       expect(fake.killCalls).toHaveLength(0);
       expect(fake.procs.get(100)!.alive).toBe(true);
+    });
+
+    it("names only the pid and server when it skips a reap, never the command lines", async () => {
+      const fake = new FakeProcessTable();
+      fake.spawn(100, "psql postgres://user:LIVE-MARKER@db", null);
+      fake.spawn(101, "curl -H LIVE-MARKER-2", 1_699_999_970_000);
+      const logger = spyLogger();
+      const tracker = new ProcessTracker({
+        filePath,
+        logger,
+        _isProcessAlive: fake.isAlive,
+        _killProcessTree: fake.killProcessTree,
+        _readProcessInfo: fake.readProcessInfo,
+        _waitMs: 0,
+      });
+      await tracker.register(makeEntry({ pid: 100, command: "npx", args: ["server-x", "--api-key=ARG-MARKER"] }));
+      await tracker.register(makeEntry({ pid: 101, command: "npx", args: ["server-y", "--api-key=ARG-MARKER"], startedAt: 1_700_000_000_000 }));
+
+      expect((await tracker.reapStale()).skipped).toBe(2);
+
+      const warnings = JSON.stringify(logger.warn.mock.calls);
+      expect(logger.warn).toHaveBeenCalledTimes(2);
+      expect(warnings).toContain('"pid":100');
+      expect(warnings).toContain('"pid":101');
+      expect(warnings).not.toMatch(/MARKER|server-x|server-y|psql|curl/);
+    });
+
+    it("stops reaping when asked to, keeping the entries it hasn't reached", async () => {
+      const fake = new FakeProcessTable();
+      fake.spawn(100, "node server-a.js", null);
+      fake.spawn(101, "node server-b.js", null);
+      const tracker = makeTracker(filePath, fake);
+      await tracker.register(makeEntry({ pid: 100, command: "node", args: ["server-a.js"] }));
+      await tracker.register(makeEntry({ pid: 101, command: "node", args: ["server-b.js"] }));
+      let checks = 0;
+
+      const result = await tracker.reapStale(() => checks++ > 0);
+
+      expect(result).toEqual({ total: 2, killed: 1, skipped: 0 });
+      expect(fake.procs.get(101)!.alive).toBe(true);
+      expect((await tracker.list()).map((entry) => entry.pid)).toEqual([101]);
     });
 
     it("cmdline fallback requires every recorded arg to be present", async () => {

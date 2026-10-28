@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { parsePid, processExists, readProcessInfo, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
+import { processExists, readProcessInfo, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
 import { isDaemonCommandLine } from "./daemon-identity.js";
 import { readLockHolderPid } from "../process/lockfile.js";
 import type { DaemonFiles } from "./paths.js";
+import { readPidFile } from "./pidfile.js";
 
 const EXIT_POLL_MS = 50;
 
@@ -34,14 +34,6 @@ export async function waitForExit(pid: number, timeoutMs: number): Promise<boole
     await delay(EXIT_POLL_MS);
   }
   return true;
-}
-
-export async function readPidFile(path: string): Promise<number | null> {
-  try {
-    return parsePid(await readFile(path, "utf-8"));
-  } catch {
-    return null;
-  }
 }
 
 export async function recordedPids(files: DaemonFiles): Promise<number[]> {

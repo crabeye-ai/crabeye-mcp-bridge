@@ -1,11 +1,17 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { rm } from "node:fs/promises";
-import { join } from "node:path";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   BridgeOwnedConfigSchema,
   getBridgeConfigPath,
+  loadDaemonSettings,
+  loadDaemonShutdownWaitMs,
 } from "../src/config/bridge-config.js";
+import { DAEMON_SHUTDOWN_MARGIN_MS } from "../src/constants.js";
+import { DaemonConfigSchema, DEFAULT_LOG_LEVEL } from "../src/config/schema.js";
+
+const DEFAULT_IDLE_MS = DaemonConfigSchema.parse({}).idleMs;
 
 describe("BridgeOwnedConfigSchema", () => {
   it("parses a valid config", () => {
@@ -80,5 +86,69 @@ describe("saveBridgeOwnedConfig round-trip", () => {
     const updated = { ...config, configPaths: ["/path/a", "/path/b"] };
     expect(updated._bridge).toMatchObject({ logLevel: "debug" });
     expect(updated.modifiedConfigs).toEqual(["/path/a"]);
+  });
+});
+
+describe("loadDaemonSettings", () => {
+  const HOME_VARS = ["HOME", "USERPROFILE"] as const;
+  const saved: Partial<Record<(typeof HOME_VARS)[number], string>> = {};
+  let home: string;
+
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "cbe-daemon-settings-"));
+    for (const name of HOME_VARS) {
+      saved[name] = process.env[name];
+      process.env[name] = home;
+    }
+  });
+
+  afterEach(async () => {
+    for (const name of HOME_VARS) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+    await rm(home, { recursive: true, force: true });
+  });
+
+  async function writeConfig(text: string): Promise<void> {
+    await mkdir(dirname(getBridgeConfigPath()), { recursive: true });
+    await writeFile(getBridgeConfigPath(), text);
+  }
+
+  it("uses the defaults without an error when there is no config file", async () => {
+    expect(await loadDaemonSettings()).toEqual({
+      daemon: expect.objectContaining({ idleMs: DEFAULT_IDLE_MS }),
+      logLevel: DEFAULT_LOG_LEVEL,
+    });
+  });
+
+  it("reads the log level and the daemon settings from the file", async () => {
+    await writeConfig(JSON.stringify({ _bridge: { logLevel: "debug", daemon: { idleMs: 5_000 } } }));
+    expect(await loadDaemonSettings()).toEqual({
+      daemon: expect.objectContaining({ idleMs: 5_000 }),
+      logLevel: "debug",
+    });
+  });
+
+  it("falls back to the defaults and reports why when the file is not valid JSONC", async () => {
+    await writeConfig("{ not json");
+    expect(await loadDaemonSettings()).toEqual({
+      daemon: expect.objectContaining({ idleMs: DEFAULT_IDLE_MS }),
+      logLevel: DEFAULT_LOG_LEVEL,
+      loadError: expect.any(String),
+    });
+  });
+
+  it("falls back to the defaults and reports why when an entry is invalid", async () => {
+    await writeConfig(JSON.stringify({ _bridge: { logLevel: "loud", daemon: { idleMs: 5_000 } } }));
+    const settings = await loadDaemonSettings();
+    expect(settings.logLevel).toBe(DEFAULT_LOG_LEVEL);
+    expect(settings.daemon.idleMs).toBe(DEFAULT_IDLE_MS);
+    expect(settings.loadError).toMatch(/^✖ .*\n {2}→ at _bridge\.logLevel$/);
+  });
+
+  it("derives the shutdown wait from the configured kill grace", async () => {
+    await writeConfig(JSON.stringify({ _bridge: { daemon: { killGraceMs: 250 } } }));
+    expect(await loadDaemonShutdownWaitMs()).toBe(250 + DAEMON_SHUTDOWN_MARGIN_MS);
   });
 });

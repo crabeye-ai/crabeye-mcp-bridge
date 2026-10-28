@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChildHandle } from "../../src/daemon/child-handle.js";
 import { STDERR_DRAIN_MS } from "../../src/daemon/stderr-capture.js";
 import type { ChildExit } from "../../src/daemon/protocol.js";
@@ -21,6 +21,10 @@ const WRITES_ONCE_PARENT_IS_GONE = `const parent = Number(process.argv[1]); setT
 const EXITS_BEFORE_A_SHARER_WRITES_STDERR = spawnSharingStderrThenOnceReady(WRITES_ONCE_PARENT_IS_GONE, "process.exit(2)");
 const LEAVES_GRANDCHILD_ON_STDERR = `const g = ${spawnSharingStderr("setTimeout(() => {}, 30_000)")}; process.stderr.write('grandchild ' + g.pid + '\\n', () => process.exit(0))`;
 const WRITES_A_LINE_THEN_EXITS = "process.stderr.write('bye\\n', () => process.exit(3))";
+const PRINTS_MORE_ON_REQUEST = "process.stdout.write('first\\n' + 'noise\\n'.repeat(50) + '{\"ready\":true}\\n'); process.stdin.on('data', () => process.stdout.write('last\\n{\"ready\":true}\\n')); setInterval(() => {}, 1e6)";
+const PRINTS_NOISE_THEN_EXITS = "process.stdout.write('first\\n' + 'noise\\n'.repeat(5)); setTimeout(() => process.exit(3), 100)";
+const PRINTS_NOISE_THEN_WAITS = "process.stdout.write('first\\n' + 'noise\\n'.repeat(5) + '{\"ready\":true}\\n'); setInterval(() => {}, 1e6)";
+const PRINTS_SECRETS_ON_STDOUT = "process.stdout.write('ghp_SECRETTOKEN1\\n' + 'Using API key sk-live-SECRET\\n'.repeat(50) + '{\"ready\":true}\\n'); setInterval(() => {}, 1e6)";
 
 describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }, () => {
   const handles: ChildHandle[] = [];
@@ -34,7 +38,7 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
   });
 
   function spawnChild(script: string, stdoutMaxBytes?: number) {
-    const events = { closes: 0, messages: 0, exits: [] as ChildExit[], stderr: [] as string[], stderrAtClose: [] as string[] };
+    const events = { closes: 0, messages: 0, exits: [] as ChildExit[], stderr: [] as string[], stderrAtClose: [] as string[], errors: [] as string[], errorsAtClose: [] as string[] };
     const handle = new ChildHandle({
       command: process.execPath,
       args: ["-e", script],
@@ -45,8 +49,9 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
         events.closes++;
         events.exits.push(exit);
         events.stderrAtClose = [...events.stderr];
+        events.errorsAtClose = [...events.errors];
       },
-      onError: () => {},
+      onError: (err) => events.errors.push(err.message),
       onStderr: (line) => events.stderr.push(line),
     });
     handles.push(handle);
@@ -63,6 +68,55 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
     expect(second).toBe(first);
     await first;
     expect(processExists(handle.pid!)).toBe(false);
+    expect(handle.lastSignalSent).toBe("SIGKILL");
+    await until(() => handle.exitStatus !== null);
+    expect(handle.exitStatus).toEqual({ code: null, signal: "SIGKILL" });
+  });
+
+  it("reports output that isn't JSON by its size only, and at most once a second", async () => {
+    const { events } = spawnChild(PRINTS_SECRETS_ON_STDOUT);
+
+    await until(() => events.messages > 0);
+
+    expect(events.errors).toEqual(["child stdout produced a line that isn't JSON (16 bytes)"]);
+  });
+
+  it("reports the lines it held back once a second has passed", async () => {
+    vi.useFakeTimers({ toFake: ["performance"] });
+    try {
+      const { handle, events } = spawnChild(PRINTS_MORE_ON_REQUEST);
+      await until(() => events.messages > 0);
+
+      vi.advanceTimersByTime(1_000);
+      handle.send({ jsonrpc: "2.0", method: "more" });
+      await until(() => events.messages > 1);
+
+      expect(events.errors).toEqual([
+        "child stdout produced a line that isn't JSON (5 bytes)",
+        "child stdout produced 51 lines that aren't JSON since the last report (latest 4 bytes)",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports held-back non-JSON lines before reporting the child's exit", async () => {
+    const { events } = spawnChild(PRINTS_NOISE_THEN_EXITS);
+    await until(() => events.closes > 0);
+    expect(events.errorsAtClose).toEqual([
+      "child stdout produced a line that isn't JSON (5 bytes)",
+      "child stdout produced 5 lines that aren't JSON since the last report (latest 5 bytes)",
+    ]);
+  });
+
+  it("reports held-back non-JSON lines when killed", async () => {
+    const { handle, events } = spawnChild(PRINTS_NOISE_THEN_WAITS);
+    await until(() => events.messages > 0);
+    await handle.kill(300);
+    expect(events.errors).toEqual([
+      "child stdout produced a line that isn't JSON (5 bytes)",
+      "child stdout produced 5 lines that aren't JSON since the last report (latest 5 bytes)",
+    ]);
   });
 
   it("reports a child it killed for flooding stdout through onClose, once", async () => {

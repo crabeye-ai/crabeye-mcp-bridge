@@ -25,6 +25,7 @@ export class LockHandle {
   constructor(
     public readonly path: string,
     private readonly token: string,
+    public readonly takenOverFrom: number | null = null,
   ) {
     handleTokens.set(this, token);
   }
@@ -138,7 +139,7 @@ export async function sweepAbandonedLockFiles(lockPath: string): Promise<void> {
   }
 }
 
-async function createLock(path: string, pid: number): Promise<LockHandle> {
+async function createLock(path: string, pid: number, takenOverFrom: number | null = null): Promise<LockHandle> {
   const token = randomUUID();
   const body = `${pid}\n${token}\n`;
   const staging = `${path}.${token}.tmp`;
@@ -151,7 +152,7 @@ async function createLock(path: string, pid: number): Promise<LockHandle> {
   } finally {
     await unlink(staging).catch(() => {});
   }
-  return new LockHandle(path, token);
+  return new LockHandle(path, token, takenOverFrom);
 }
 
 async function restoreLock(claimed: string, path: string, body: string): Promise<void> {
@@ -166,9 +167,15 @@ async function restoreLock(claimed: string, path: string, body: string): Promise
   }
 }
 
-async function createLockOrBusy(path: string, pid: number, reportedPath = path): Promise<LockHandle> {
+interface CreateLockOptions {
+  reportedPath?: string;
+  takenOverFrom?: number | null;
+}
+
+async function createLockOrBusy(path: string, pid: number, opts: CreateLockOptions = {}): Promise<LockHandle> {
+  const reportedPath = opts.reportedPath ?? path;
   try {
-    return await createLock(path, pid);
+    return await createLock(path, pid, opts.takenOverFrom);
   } catch (err) {
     if (isEexist(err)) throw new LockBusyError(reportedPath, await readLockHolderPid(reportedPath));
     throw err;
@@ -210,7 +217,7 @@ async function stealLock(
       throw new LockBusyError(path, parsePid(current));
     }
     await unlink(path).catch(ignoreEnoent);
-    return await createLockOrBusy(path, pid);
+    return await createLockOrBusy(path, pid, { takenOverFrom: parsePid(staleBody) });
   } finally {
     await guard.release();
   }
@@ -228,12 +235,12 @@ async function acquireStealGuard(
     if (!isEexist(err)) throw err;
   }
   const guardBody = await readBodySafe(guardPath);
-  if (guardBody === null) return createLockOrBusy(guardPath, pid, path);
+  if (guardBody === null) return createLockOrBusy(guardPath, pid, { reportedPath: path });
   if (!(await isAbandonedGuard(guardPath, guardBody, opts))) {
     throw new LockBusyError(path, await readLockHolderPid(path));
   }
   if ((await readBodySafe(guardPath)) === guardBody) await unlink(guardPath).catch(ignoreEnoent);
-  return createLockOrBusy(guardPath, pid, path);
+  return createLockOrBusy(guardPath, pid, { reportedPath: path });
 }
 
 async function isAbandonedGuard(

@@ -7,7 +7,8 @@ import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { isDaemonReachable } from "../../src/daemon/bootstrap.js";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
-import { readPidFile, waitForExit } from "../../src/daemon/daemon-process.js";
+import { waitForExit } from "../../src/daemon/daemon-process.js";
+import { readPidFile } from "../../src/daemon/pidfile.js";
 import { processExists } from "../../src/process/process-utils.js";
 
 const RECOVERY_WAIT_MS = 1_500;

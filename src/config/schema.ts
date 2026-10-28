@@ -231,12 +231,14 @@ export const DaemonConfigSchema = z
   })
   .strict();
 
+export const DEFAULT_LOG_LEVEL = "info";
+
 export const GlobalBridgeConfigSchema = z
   .object({
     port: z.number().int().min(1).max(65535).default(19875),
     logLevel: z
       .enum(["debug", "info", "warn", "error"])
-      .default("info"),
+      .default(DEFAULT_LOG_LEVEL),
     logFormat: z.enum(["text", "json"]).default("text"),
     maxUpstreamConnections: z.number().int().positive().default(1000),
     connectionTimeout: z.number().int().positive().default(30),

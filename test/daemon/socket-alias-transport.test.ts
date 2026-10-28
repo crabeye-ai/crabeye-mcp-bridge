@@ -242,7 +242,7 @@ describe.skipIf(process.platform === "win32")("daemon sockets beyond the path li
     const stdout = capture(process.stdout);
 
     expect(await runDaemonCommand("status")).toBe(0);
-    expect(JSON.parse(stdout())).toEqual({ running: false });
+    expect(JSON.parse(stdout())).toEqual({ running: false, logFile: join(root, "short-home", ".crabeye", "logs", "daemon.log") });
     expect(stderr()).toBe("");
   });
 

@@ -1,10 +1,13 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   daemonFilesFor,
   getDaemonRunDir,
   getDaemonSocketPath,
   getDaemonPidPath,
   getDaemonLockPath,
+  getDaemonLogPath,
 } from "../../src/daemon/paths.js";
 
 describe("daemon paths", () => {
@@ -52,6 +55,36 @@ describe("daemon paths", () => {
         lockPath: getDaemonLockPath(),
         pidPath: getDaemonPidPath(),
       });
+    });
+  });
+
+  describe("log file", () => {
+    const platform = process.platform;
+    const localAppData = process.env.LOCALAPPDATA;
+
+    afterEach(() => {
+      Object.defineProperty(process, "platform", { value: platform });
+      if (localAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = localAppData;
+    });
+
+    it("is ~/.crabeye/logs/daemon.log on macOS and Linux", () => {
+      Object.defineProperty(process, "platform", { value: "darwin" });
+      expect(getDaemonLogPath()).toBe(join(homedir(), ".crabeye", "logs", "daemon.log"));
+      Object.defineProperty(process, "platform", { value: "linux" });
+      expect(getDaemonLogPath()).toBe(join(homedir(), ".crabeye", "logs", "daemon.log"));
+    });
+
+    it("is under %LOCALAPPDATA%\\crabeye\\logs on Windows", () => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      process.env.LOCALAPPDATA = join("X", "AppData", "Local");
+      expect(getDaemonLogPath()).toBe(join("X", "AppData", "Local", "crabeye", "logs", "daemon.log"));
+    });
+
+    it("falls back to the home directory's AppData on Windows without LOCALAPPDATA", () => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      delete process.env.LOCALAPPDATA;
+      expect(getDaemonLogPath()).toBe(join(homedir(), "AppData", "Local", "crabeye", "logs", "daemon.log"));
     });
   });
 });

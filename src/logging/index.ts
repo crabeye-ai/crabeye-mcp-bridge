@@ -24,15 +24,36 @@ const LEVEL_VALUE: Record<LogLevel, number> = {
 export interface CreateLoggerOptions {
   level: LogLevel;
   format: "text" | "json";
+  write?: (line: string) => void;
+  dated?: boolean;
+  pid?: number;
+}
+
+interface LineOutput {
+  format: "text" | "json";
+  write: (line: string) => void;
+  dated: boolean;
+  pid: number | undefined;
+}
+
+interface SharedLoggerState {
+  threshold: number;
+  output: LineOutput;
 }
 
 function pad(n: number, width: number): string {
   return String(n).padStart(width, "0");
 }
 
-function formatTime(): string {
-  const d = new Date();
+function formatTime(d: Date): string {
   return `${pad(d.getHours(), 2)}:${pad(d.getMinutes(), 2)}:${pad(d.getSeconds(), 2)}.${pad(d.getMilliseconds(), 3)}`;
+}
+
+function formatDateTime(d: Date): string {
+  const offsetMinutes = -d.getTimezoneOffset();
+  const sign = offsetMinutes < 0 ? "-" : "+";
+  const offset = `${sign}${pad(Math.floor(Math.abs(offsetMinutes) / 60), 2)}:${pad(Math.abs(offsetMinutes) % 60, 2)}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)}T${formatTime(d)}${offset}`;
 }
 
 function renderValue(value: unknown): string {
@@ -44,6 +65,7 @@ function formatText(
   level: LogLevel,
   message: string,
   context: Record<string, unknown>,
+  output: Pick<LineOutput, "dated" | "pid">,
 ): string {
   const tag = level.toUpperCase().padEnd(5);
   const component = context.component ? escapeControlCharacters(String(context.component)) : undefined;
@@ -68,7 +90,10 @@ function formatText(
     ? " " + Object.entries(extra).map(([k, v]) => `${k}=${renderValue(v)}`).join(" ")
     : "";
 
-  return `${formatTime()} ${tag} ${prefix}${escapeControlCharacters(message)}${suffix}\n`;
+  const now = new Date();
+  const stamp = output.dated ? formatDateTime(now) : formatTime(now);
+  const pid = output.pid === undefined ? "" : `[${output.pid}] `;
+  return `${stamp} ${pid}${tag} ${prefix}${escapeControlCharacters(message)}${suffix}\n`;
 }
 
 function formatJson(
@@ -85,17 +110,11 @@ function formatJson(
 }
 
 class LoggerImpl implements Logger {
-  private _shared: { threshold: number };
-  private _format: "text" | "json";
+  private _shared: SharedLoggerState;
   private _defaultContext: Record<string, unknown>;
 
-  constructor(
-    options: CreateLoggerOptions,
-    defaultContext: Record<string, unknown> = {},
-    shared?: { threshold: number },
-  ) {
-    this._shared = shared ?? { threshold: LEVEL_VALUE[options.level] };
-    this._format = options.format;
+  constructor(shared: SharedLoggerState, defaultContext: Record<string, unknown> = {}) {
+    this._shared = shared;
     this._defaultContext = defaultContext;
   }
 
@@ -120,11 +139,7 @@ class LoggerImpl implements Logger {
   }
 
   child(defaultContext: Record<string, unknown>): Logger {
-    return new LoggerImpl(
-      { level: "debug", format: this._format },
-      { ...this._defaultContext, ...defaultContext },
-      this._shared,
-    );
+    return new LoggerImpl(this._shared, { ...this._defaultContext, ...defaultContext });
   }
 
   private _log(
@@ -136,16 +151,25 @@ class LoggerImpl implements Logger {
     const merged = context
       ? { ...this._defaultContext, ...context }
       : this._defaultContext;
+    const output = this._shared.output;
     const line =
-      this._format === "json"
+      output.format === "json"
         ? formatJson(level, message, merged)
-        : formatText(level, message, merged);
-    process.stderr.write(line);
+        : formatText(level, message, merged, output);
+    output.write(line);
   }
 }
 
 export function createLogger(options: CreateLoggerOptions): Logger {
-  return new LoggerImpl(options);
+  return new LoggerImpl({
+    threshold: LEVEL_VALUE[options.level],
+    output: {
+      format: options.format,
+      write: options.write ?? ((line) => process.stderr.write(line)),
+      dated: options.dated ?? false,
+      pid: options.pid,
+    },
+  });
 }
 
 /** A logger that discards all output. Useful in tests. */

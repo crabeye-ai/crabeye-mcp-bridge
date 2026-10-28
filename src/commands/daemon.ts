@@ -15,19 +15,25 @@ import {
   getDaemonSocketPath,
   netTransport,
   DaemonAlreadyRunningError,
+  DaemonStoppedWhileStartingError,
   readPidFile,
   recordedPids,
   terminateDaemon,
   waitForExit,
   isSocketAddressError,
+  createDaemonLogger,
+  getDaemonLogPath,
+  daemonStopBudgetMs,
+  installCrashHandlers,
+  installSignalHandlers,
   type ChildEraLabel,
   type DaemonStatus,
   type TerminateResult,
 } from "../daemon/index.js";
 import { LockBusyError, processExists } from "../process/index.js";
-import { escapeLabel } from "../logging/index.js";
-import { loadDaemonConfig, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
-import { APP_NAME } from "../constants.js";
+import { escapeLabel, type Logger } from "../logging/index.js";
+import { getBridgeConfigPath, loadDaemonSettings, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
+import { APP_NAME, APP_VERSION } from "../constants.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
 
@@ -80,53 +86,63 @@ function dispatch(action: DaemonAction): Promise<number> {
  * `--internal-launch`. Resolves when the manager exits.
  */
 export async function runDaemonInternal(awaitPredecessorMs = 0): Promise<number> {
-  const cfg = await loadDaemonConfig();
+  const settings = await loadDaemonSettings();
+  const cfg = settings.daemon;
+  const logger = createDaemonLogger({ level: settings.logLevel });
+  const log = logger.child({ component: "daemon" });
 
   const socketPath = getDaemonSocketPath();
+  log.info("daemon starting", { version: APP_VERSION, socket: socketPath });
+  if (settings.loadError !== undefined) {
+    log.warn(`could not load ${getBridgeConfigPath()}; using defaults: ${settings.loadError}`);
+  }
   let waitedForPredecessor = false;
-  const manager = new ManagerDaemon({
-    socketPath,
-    ...daemonFilesFor(socketPath),
-    idleMs: cfg.idleMs,
-    graceMs: cfg.graceMs,
-    killGraceMs: cfg.killGraceMs,
-    childPingMs: cfg.childPingMs,
-    childPingTimeoutMs: cfg.childPingTimeoutMs,
-    childPingMaxConsecutiveFailures: cfg.childPingMaxConsecutiveFailures,
-    transport: netTransport,
-    awaitPredecessorMs,
-    onWaitingForPredecessor: () => {
-      waitedForPredecessor = true;
-      reportToLauncher("waiting");
-    },
-  });
+  let manager: ManagerDaemon;
+  try {
+    manager = new ManagerDaemon({
+      socketPath,
+      ...daemonFilesFor(socketPath),
+      idleMs: cfg.idleMs,
+      graceMs: cfg.graceMs,
+      killGraceMs: cfg.killGraceMs,
+      childPingMs: cfg.childPingMs,
+      childPingTimeoutMs: cfg.childPingTimeoutMs,
+      childPingMaxConsecutiveFailures: cfg.childPingMaxConsecutiveFailures,
+      transport: netTransport,
+      awaitPredecessorMs,
+      logger,
+      onWaitingForPredecessor: () => {
+        waitedForPredecessor = true;
+        reportToLauncher("waiting");
+      },
+    });
+  } catch (err) {
+    return failedToStart(log, err);
+  }
+  installCrashHandlers({ logger, target: manager, watchdogMs: daemonStopBudgetMs(cfg.killGraceMs) });
+  installSignalHandlers(manager);
 
   try {
     await manager.start();
-    if (!waitedForPredecessor) reportToLauncher("serving");
   } catch (err) {
+    if (err instanceof DaemonStoppedWhileStartingError) return manager.waitForExit();
     if (err instanceof LockBusyError || err instanceof DaemonAlreadyRunningError) {
-      process.stderr.write(`daemon: ${err.message}; deferring to existing daemon\n`);
+      const deferral = `${err.message}; deferring to existing daemon`;
+      log.info(deferral);
+      process.stderr.write(`daemon: ${deferral}\n`);
       return 0;
     }
-    process.stderr.write(`daemon failed to start: ${errMsg(err)}\n`);
-    return 1;
+    return failedToStart(log, err);
   }
-
-  let signaled = false;
-  const onSignal = (): void => {
-    if (signaled) return;
-    signaled = true;
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGHUP", onSignal);
-    void manager.stop(0);
-  };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
-  process.on("SIGHUP", onSignal);
-
+  if (!waitedForPredecessor && !manager.isStopping) reportToLauncher("serving");
   return manager.waitForExit();
+}
+
+function failedToStart(log: Logger, err: unknown): number {
+  const failure = `daemon failed to start: ${errMsg(err)}`;
+  log.error(failure);
+  process.stderr.write(`${failure}\n`);
+  return 1;
 }
 
 async function runStart(): Promise<number> {
@@ -285,7 +301,7 @@ function childEras(value: unknown): { server: string; era: ChildEraLabel }[] | n
 }
 
 function writeStatus(status: Record<string, unknown>): void {
-  process.stdout.write(JSON.stringify(status, null, 2) + "\n");
+  process.stdout.write(JSON.stringify({ ...status, logFile: getDaemonLogPath() }, null, 2) + "\n");
 }
 
 async function runRestart(): Promise<number> {

@@ -1,4 +1,4 @@
-export { ManagerDaemon, DaemonAlreadyRunningError } from "./manager.js";
+export { ManagerDaemon, DaemonAlreadyRunningError, DaemonStoppedWhileStartingError } from "./manager.js";
 export type { ManagerOptions, ChildGroup, SessionAttachment } from "./manager.js";
 export { DaemonClient, DaemonRpcError, DAEMON_CONNECTION_CLOSED, DAEMON_REJECTED } from "./client.js";
 export type { DaemonClientOpts } from "./client.js";
@@ -66,8 +66,11 @@ export {
   getDaemonSocketPath,
   getDaemonPidPath,
   getDaemonLockPath,
+  getDaemonLogPath,
   processTrackerPathFor,
 } from "./paths.js";
+export { createDaemonLogger } from "./daemon-log.js";
+export { daemonStopBudgetMs, installCrashHandlers, installSignalHandlers } from "./process-handlers.js";
 export {
   ProcessTracker,
   type TrackedProcess,
@@ -102,8 +105,8 @@ export type {
   DaemonClientOptions,
   FrameChannel,
 } from "./transport.js";
+export { readPidFile } from "./pidfile.js";
 export {
-  readPidFile,
   recordedPids,
   terminateDaemon,
   waitForExit,

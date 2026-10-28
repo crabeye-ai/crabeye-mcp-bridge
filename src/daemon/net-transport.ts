@@ -1,5 +1,5 @@
 import { createServer as createNetServer, createConnection, type Server, type Socket } from "node:net";
-import { chmod, link, lstat, mkdir, readdir, unlink } from "node:fs/promises";
+import { chmod, link, lstat, readdir, unlink } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
   type Transport,
 } from "./transport.js";
 import { socketAddress } from "./socket-address.js";
+import { ensurePrivateDir } from "../process/private-dir.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const SERVING_PROBE_TIMEOUT_MS = 1_000;
@@ -126,16 +127,7 @@ class NetDaemonServer implements DaemonServer {
 async function prepUnixSocketPath(socketPath: string): Promise<void> {
   const dir = dirname(socketPath);
 
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-
-  // mkdir-recursive doesn't follow the final component as a symlink for the
-  // create itself, but it does for intermediate path resolution, and it
-  // doesn't reset the mode on a pre-existing dir. Verify both explicitly.
-  const dirSt = await lstat(dir);
-  if (dirSt.isSymbolicLink()) {
-    throw new Error(`refusing to use symlinked daemon run dir: ${dir}`);
-  }
-  await chmod(dir, 0o700);
+  await ensurePrivateDir(dir, "daemon run dir");
   await sweepOrphanedStagingSockets(dir);
 
   // Only a socket nobody answers on is stale. Refuse to unlink a regular

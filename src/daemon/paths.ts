@@ -5,24 +5,25 @@ import {
   DAEMON_BASE,
   DAEMON_DIR,
   DAEMON_LOCK_FILENAME,
+  DAEMON_LOG_FILENAME,
+  DAEMON_LOG_SUBDIR,
   DAEMON_PID_FILENAME,
   DAEMON_RUN_SUBDIR,
   DAEMON_SOCKET_FILENAME,
   PROCESS_TRACKER_FILENAME,
 } from "../constants.js";
 
-function windowsRunDir(): string {
-  const base =
-    process.env.LOCALAPPDATA ??
-    join(homedir(), "AppData", "Local");
-  return join(base, DAEMON_BASE, DAEMON_RUN_SUBDIR);
+function daemonBaseDir(): string {
+  if (process.platform !== "win32") return join(homedir(), DAEMON_DIR);
+  return join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), DAEMON_BASE);
 }
 
 export function getDaemonRunDir(): string {
-  if (process.platform === "win32") {
-    return windowsRunDir();
-  }
-  return join(homedir(), DAEMON_DIR, DAEMON_RUN_SUBDIR);
+  return join(daemonBaseDir(), DAEMON_RUN_SUBDIR);
+}
+
+export function getDaemonLogPath(): string {
+  return join(daemonBaseDir(), DAEMON_LOG_SUBDIR, DAEMON_LOG_FILENAME);
 }
 
 export function getDaemonSocketPath(): string {
