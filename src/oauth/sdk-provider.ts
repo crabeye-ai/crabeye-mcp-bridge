@@ -9,12 +9,15 @@ import type {
   StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
-import type { CredentialStore } from "../credentials/credential-store.js";
+import type { ConditionalChange, CredentialStore } from "../credentials/credential-store.js";
+import type { OAuth2Credential } from "../credentials/types.js";
 import type { Logger } from "../logging/index.js";
 import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "./client-secret.js";
 import { OAuthError, ReauthorizationRequiredError } from "./errors.js";
+import { RefreshTracker, type FetchLike } from "./refresh-tracker.js";
 import {
   isIssuerStampOnly,
+  issuerAllows,
   issuersMatch,
   parseStoredClientInfo,
 } from "./issuer-binding.js";
@@ -63,33 +66,15 @@ export interface BridgeOAuthProviderOptions {
 const REFRESH_WINDOW_MS = 60_000;
 const REFRESH_BURST_LIMIT = 6;
 
-type FetchLike = typeof fetch;
+const RECENT_READS_KEPT = 16;
 
-function isTransientStatus(status: number): boolean {
-  return status >= 500 || status === 429 || status === 408;
+interface TokenPair {
+  access_token: string;
+  refresh_token?: string;
 }
 
-/**
- * True when `init` describes an OAuth 2.0 refresh-token request: a POST whose
- * URL-encoded body carries `grant_type=refresh_token`. Used by
- * `BridgeOAuthClientProvider.wrapFetch` to coalesce parallel refresh attempts.
- *
- * The SDK's `refreshAuthorization` constructs the body with `URLSearchParams`;
- * `addClientAuthentication` hooks may serialize the body to a string before it
- * reaches `fetch`, so we accept both shapes.
- */
-function isRefreshTokenRequest(init: RequestInit | undefined): boolean {
-  if (!init) return false;
-  const method = init.method?.toUpperCase();
-  if (method !== "POST") return false;
-  const body = init.body;
-  if (body instanceof URLSearchParams) {
-    return body.get("grant_type") === "refresh_token";
-  }
-  if (typeof body === "string") {
-    return /(^|&)grant_type=refresh_token(&|$)/.test(body);
-  }
-  return false;
+function sameTokens(a: TokenPair, b: TokenPair): boolean {
+  return a.access_token === b.access_token && a.refresh_token === b.refresh_token;
 }
 
 /**
@@ -112,10 +97,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   private _state: string | undefined;
   private _recentSaves: number[] = [];
   private _refreshExhausted = false;
-  private _refreshFailedTransiently = false;
-  // In-flight token-endpoint refresh, used by `wrapFetch` to coalesce
-  // parallel refresh attempts. See `wrapFetch` for the lifecycle.
-  private _refreshFetchPromise: Promise<Response> | undefined;
+  private readonly _refreshes = new RefreshTracker();
   // Sync mirror of the stored credential's refresh_token. Lets `saveTokens`
   // preserve it on non-rotating IdPs without an async re-read, closing the
   // saveTokens-vs-invalidateCredentials TOCTOU.
@@ -125,10 +107,11 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   // refuses to write the cache from a stale read whose result predates a
   // concurrent invalidate.
   private _invalidateEpoch = 0;
+  private readonly _recentReads: TokenPair[] = [];
   private _discoveryState: OAuthDiscoveryState | undefined;
 
   get refreshFailedTransiently(): boolean {
-    return this._refreshFailedTransiently && !this._refreshExhausted;
+    return this._refreshes.lastRefreshFailedTransiently && !this._refreshExhausted;
   }
 
   constructor(opts: BridgeOAuthProviderOptions) {
@@ -275,6 +258,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     const cred = await this._opts.store.get(oauthCredentialKey(this._opts.serverName));
     if (!cred || cred.type !== "oauth2") return undefined;
 
+    this._rememberRead({ access_token: cred.access_token, refresh_token: cred.refresh_token });
     if (this._invalidateEpoch === epoch) {
       this._lastRefreshToken = cred.refresh_token;
     }
@@ -308,7 +292,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     tokens: StoredOAuthTokens,
     ctx?: OAuthClientInformationContext,
   ): Promise<void> {
-    this._refreshFailedTransiently = false;
+    this._refreshes.clearTransientFailure();
     const issuer = tokens.issuer ?? ctx?.issuer;
     const expiresAt =
       typeof tokens.expires_in === "number"
@@ -318,14 +302,14 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     // Preserve refresh_token when the SDK's refresh response omits it.
     // Most IdPs (Google, Slack, …) don't rotate by default and return only
     // `access_token` on refresh. Fallback reads the cache as a sync field
-    // access, so no await can interleave with the store.set below.
+    // access, so no await can interleave with the write below.
     const refreshToken = tokens.refresh_token ?? this._lastRefreshToken;
     // Update the cache BEFORE the await. invalidateCredentials also mutates
     // synchronously, so whichever ran first wins consistently — and the
     // file-level mutex serialises this write against any racing delete.
     if (refreshToken) this._lastRefreshToken = refreshToken;
 
-    await this._opts.store.set(oauthCredentialKey(this._opts.serverName), {
+    const credential: OAuth2Credential = {
       type: "oauth2",
       access_token: tokens.access_token,
       ...(tokens.token_type ? { token_type: tokens.token_type } : {}),
@@ -333,10 +317,22 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
       ...(this._opts.clientId ? { client_id: this._opts.clientId } : {}),
       ...(issuer ? { issuer } : {}),
-    });
+    };
+    const key = oauthCredentialKey(this._opts.serverName);
+    const written = { access_token: tokens.access_token, refresh_token: refreshToken };
+    if (this._recentReads.some((read) => sameTokens(read, written))) {
+      await this._opts.store.replaceIf(
+        key,
+        credential,
+        (stored) => stored.type === "oauth2" && sameTokens(stored, written) && issuerAllows(stored.issuer, issuer),
+      );
+    } else {
+      await this._opts.store.set(key, credential);
+    }
 
-    // Refresh-loop circuit breaker — only meaningful for the runtime provider
-    // where unsupervised refreshes could otherwise spin forever.
+    // Refresh-loop circuit breaker, counting every save — only meaningful for
+    // the runtime provider where unsupervised refreshes could otherwise spin
+    // forever.
     if (this._opts.runtime) {
       const now = Date.now();
       this._recentSaves.push(now);
@@ -361,10 +357,10 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
         );
       }
       // Runtime: no interactive user. Reached when the stored refresh_token
-      // is permanently invalid (the SDK wiped the tokens after
-      // InvalidGrantError), when there are no usable tokens, when the
-      // upstream demands a wider scope, or when the refresh-loop circuit
-      // breaker tripped.
+      // is permanently invalid (the tokens were deleted after the
+      // authorization server rejected it), when there are no usable tokens,
+      // when the upstream demands a wider scope, or when the refresh-loop
+      // circuit breaker tripped.
       throw new ReauthorizationRequiredError(
         `Authentication for "${this._opts.serverName}" expired. ` +
         `Run: ${APP_NAME} auth ${this._opts.serverName}`,
@@ -374,48 +370,13 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
-   * Wrap a `fetch` implementation so concurrent OAuth refresh-token requests
-   * coalesce to a single HTTP call. The SDK's transport calls `auth()` once
-   * per 401, so N parallel tool calls hitting an expired access token spawn
-   * N parallel `refreshAuthorization` POSTs. With IdPs that rotate refresh
-   * tokens (Linear, GitHub, …), only one of those wins and the others
-   * either fail or invalidate the just-minted token. Coalescing avoids that
-   * race entirely while preserving the SDK's reactive 401 flow.
-   *
-   * Scope: per-provider instance. Each upstream HTTP server owns its own
-   * provider, so dedup is naturally per-server.
+   * Wrap a `fetch` implementation so concurrent refreshes of the same refresh
+   * token coalesce to one token-endpoint call, and so the provider learns
+   * which refresh tokens the authorization server rejected. Every fetch the
+   * SDK uses for this provider's token endpoint must go through it.
    */
   wrapFetch(baseFetch: FetchLike): FetchLike {
-    return async (input, init) => {
-      if (!isRefreshTokenRequest(init)) return baseFetch(input, init);
-      let p = this._refreshFetchPromise;
-      if (!p) {
-        p = baseFetch(input, init);
-        this._refreshFetchPromise = p;
-        p.then(
-          (response) => {
-            this._refreshFailedTransiently = isTransientStatus(response.status);
-          },
-          () => {
-            this._refreshFailedTransiently = true;
-          },
-        );
-        // Clear the slot once the in-flight call settles. Both branches
-        // (resolve, reject) drain awaiters; the catch on the cleanup chain
-        // is purely to silence the otherwise-unhandled rejection warning
-        // that node emits for the bookkeeping chain — every real awaiter
-        // still observes the rejection via its own `await p`.
-        p.finally(() => {
-          if (this._refreshFetchPromise === p) {
-            this._refreshFetchPromise = undefined;
-          }
-        }).catch(() => {});
-      }
-      // Each awaiter gets its own clone — Response bodies are single-use
-      // streams, so we cannot hand the same Response to multiple callers.
-      const response = await p;
-      return response.clone();
-    };
+    return this._refreshes.wrap(baseFetch);
   }
 
   saveCodeVerifier(verifier: string): void {
@@ -448,6 +409,42 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     return this._state;
   }
 
+  private _rememberRead(read: TokenPair): void {
+    if (this._recentReads.some((known) => sameTokens(known, read))) return;
+    this._recentReads.push(read);
+    if (this._recentReads.length > RECENT_READS_KEPT) this._recentReads.shift();
+  }
+
+  private async _deleteTokens({
+    keepTokensRefreshedElsewhere,
+  }: {
+    keepTokensRefreshedElsewhere: boolean;
+  }): Promise<ConditionalChange<"deleted">> {
+    const key = oauthCredentialKey(this._opts.serverName);
+    if (!keepTokensRefreshedElsewhere || !this._refreshes.hasRejections()) {
+      return (await this._opts.store.delete(key)) ? "deleted" : "missing";
+    }
+    let outcome: ConditionalChange<"deleted">;
+    try {
+      outcome = await this._opts.store.deleteIf(
+        key,
+        (stored) => stored.type !== "oauth2" || this._refreshes.wasRejected(stored.refresh_token),
+      );
+    } catch (err) {
+      this._opts.logger?.warn(`could not check the stored tokens for "${this._opts.serverName}"; keeping them`, {
+        component: "oauth",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+    if (outcome === "kept") {
+      this._opts.logger?.info(`kept the tokens for "${this._opts.serverName}" that were refreshed elsewhere`, {
+        component: "oauth",
+      });
+    }
+    return outcome;
+  }
+
   async invalidateCredentials(
     scope: "all" | "client" | "tokens" | "verifier" | "discovery",
   ): Promise<void> {
@@ -464,15 +461,17 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     if (scope === "tokens" || scope === "all") {
       // Sync mutations before the await so a concurrent saveTokens sees the
       // cleared cache (and doesn't fall back to a stale refresh_token that
-      // we're about to delete). Bumping `_invalidateEpoch` also fences any
-      // in-flight `tokens()` whose `store.get` resolves after this point
+      // may be about to be deleted). Bumping `_invalidateEpoch` also fences
+      // any in-flight `tokens()` whose `store.get` resolves after this point
       // from writing the stale read back into the just-cleared cache.
       this._invalidateEpoch++;
       this._lastRefreshToken = undefined;
-      this._recentSaves = [];
-      this._refreshExhausted = false;
-      this._refreshFailedTransiently = false;
-      await this._opts.store.delete(oauthCredentialKey(this._opts.serverName));
+      this._refreshes.clearTransientFailure();
+      const outcome = await this._deleteTokens({ keepTokensRefreshedElsewhere: scope === "tokens" });
+      if (outcome !== "kept") {
+        this._recentSaves = [];
+        this._refreshExhausted = false;
+      }
     }
     if (scope === "client" || scope === "all") {
       if (this._opts.clientId) {

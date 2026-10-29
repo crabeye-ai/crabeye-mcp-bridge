@@ -53,7 +53,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx vitest run test/daemon/daemon-launch.test.ts test/daemon/daemon-log-processes.test.ts test/logging/log-file.test.ts test/logging/log-file-processes.test.ts test/credentials test/process/
+      - run: npx vitest run test/daemon/daemon-launch.test.ts test/daemon/daemon-log-processes.test.ts test/logging/log-file.test.ts test/logging/log-file-processes.test.ts test/oauth/rotating-refresh-processes.test.ts test/credentials test/process/
 
   build:
     runs-on: ubuntu-latest

@@ -1,4 +1,5 @@
-import { execFileSync, spawnSync, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createInterface } from "node:readline";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
@@ -44,4 +45,40 @@ export function daemonPidsRunning(script: string): number[] {
     .split("\n")
     .filter((line) => line.includes(script) && line.includes(DAEMON_LAUNCH_ARGS.join(" ")))
     .map((line) => Number(line.trim().split(/\s+/)[0]));
+}
+
+export interface LineProcess {
+  child: ChildProcessWithoutNullStreams;
+  line: () => Promise<string>;
+}
+
+export function startLineProcess(
+  children: ChildProcessWithoutNullStreams[],
+  script: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): LineProcess {
+  const child = spawn(process.execPath, [script, ...args], { stdio: "pipe", env });
+  children.push(child);
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf-8")));
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  const line = async () => {
+    const next = await lines.next();
+    if (next.done) throw new Error(`process ${child.pid} exited without output; stderr: ${stderr}`);
+    return next.value;
+  };
+  return { child, line };
+}
+
+export async function awaitHeld(holder: LineProcess): Promise<LineProcess> {
+  const first = await holder.line();
+  if (first !== "held") throw new Error(`lock holder said "${first}" instead of "held"`);
+  return holder;
+}
+
+export async function killAll(children: ChildProcessWithoutNullStreams[]): Promise<void> {
+  const leftovers = children.splice(0);
+  for (const child of leftovers) child.kill("SIGKILL");
+  await Promise.all(leftovers.map((child) => exited(child, 5_000)));
 }

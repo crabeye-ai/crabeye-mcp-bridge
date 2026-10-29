@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
-import { createInterface } from "node:readline";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +8,7 @@ import { CredentialStore } from "../../src/credentials/credential-store.js";
 import { EnvKeychain } from "../../src/credentials/keychain.js";
 import { readLockHolderPid } from "../../src/process/lockfile.js";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
-import { deadPid, exited, settledWithin } from "../_helpers/processes.js";
+import { awaitHeld, deadPid, exited, killAll, settledWithin, startLineProcess, type LineProcess } from "../_helpers/processes.js";
 import { FileKeychain, keyWrites } from "../_helpers/file-keychain.js";
 import { secret, tempFiles } from "../_helpers/credential-store.js";
 
@@ -17,11 +16,6 @@ const MASTER_KEY = randomBytes(32).toString("hex");
 const isWindows = process.platform === "win32";
 
 type KeySource = "env" | "dpapi" | { file: string; readDelayMs: number };
-
-interface Started {
-  child: ChildProcessWithoutNullStreams;
-  line: () => Promise<string>;
-}
 
 describe("credential store shared by several processes (#219)", { timeout: 60_000 }, () => {
   let writerScript: string;
@@ -43,45 +37,26 @@ describe("credential store shared by several processes (#219)", { timeout: 60_00
   });
 
   afterEach(async () => {
-    const leftovers = children.splice(0);
-    for (const child of leftovers) child.kill("SIGKILL");
-    await Promise.all(leftovers.map((child) => exited(child, 5_000)));
+    await killAll(children);
     await rm(dir, { recursive: true, force: true, maxRetries: 5 });
   });
 
-  function start(script: string, args: string[]): Started {
-    const child = spawn(process.execPath, [script, ...args], {
-      stdio: "pipe",
-      env: { ...process.env, MCP_BRIDGE_MASTER_KEY: MASTER_KEY, USERPROFILE: dir },
-    });
-    children.push(child);
-    let stderr = "";
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf-8")));
-    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
-    const line = async () => {
-      const next = await lines.next();
-      if (next.done) throw new Error(`process ${child.pid} exited without output; stderr: ${stderr}`);
-      return next.value;
-    };
-    return { child, line };
+  function start(script: string, args: string[]): LineProcess {
+    return startLineProcess(children, script, args, { ...process.env, MCP_BRIDGE_MASTER_KEY: MASTER_KEY, USERPROFILE: dir });
   }
 
-  function writer(op: "set" | "delete" | "deleteMany" | "list", prefix: string, count: number, key: KeySource = "env"): Started {
+  function writer(op: "set" | "delete" | "deleteMany" | "list", prefix: string, count: number, key: KeySource = "env"): LineProcess {
     const keyArgs = typeof key === "string" ? [key] : ["file", key.file, String(key.readDelayMs)];
     return start(writerScript, [storePath, op, prefix, String(count), ...keyArgs]);
   }
 
-  async function runTogether(writers: Started[]): Promise<string[]> {
+  async function runTogether(writers: LineProcess[]): Promise<string[]> {
     for (const w of writers) expect(await w.line()).toBe("ready");
     for (const w of writers) w.child.stdin.write("go\n");
     return Promise.all(writers.map((w) => w.line()));
   }
 
-  async function holdLock(): Promise<Started> {
-    const holder = start(lockScript, [`${storePath}.lock`]);
-    expect(await holder.line()).toBe("held");
-    return holder;
-  }
+  const holdLock = (): Promise<LineProcess> => awaitHeld(start(lockScript, [`${storePath}.lock`]));
 
   const envStore = (options: { lockTimeoutMs?: number } = {}) =>
     new CredentialStore({ keychain: new EnvKeychain(MASTER_KEY), filePath: storePath, ...options });

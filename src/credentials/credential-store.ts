@@ -120,6 +120,8 @@ class AsyncMutex {
 
 class DecryptError extends CredentialError {}
 
+export type ConditionalChange<Changed extends string> = Changed | "kept" | "missing";
+
 const CASE_INSENSITIVE_FS =
   process.platform === "darwin" || process.platform === "win32";
 
@@ -188,6 +190,34 @@ export class CredentialStore {
   }
 
   /**
+   * Delete `key` only if `shouldDelete` approves what is stored, checking and
+   * deleting in one read-modify-write under the store lock so no other write
+   * can land in between.
+   */
+  async deleteIf(
+    key: string,
+    shouldDelete: (stored: Credential) => boolean,
+  ): Promise<ConditionalChange<"deleted">> {
+    return this._changeIfStored("deleteIf", key, shouldDelete, "deleted", (credentials) => {
+      delete credentials[key];
+    });
+  }
+
+  /**
+   * Replace `key` with `credential` only if `shouldReplace` approves what is
+   * stored, under the store lock. A missing entry is left missing.
+   */
+  async replaceIf(
+    key: string,
+    credential: Credential,
+    shouldReplace: (stored: Credential) => boolean,
+  ): Promise<ConditionalChange<"replaced">> {
+    return this._changeIfStored("replaceIf", key, shouldReplace, "replaced", (credentials) => {
+      credentials[key] = credential;
+    });
+  }
+
+  /**
    * Delete multiple credentials in a single read-modify-write cycle so two
    * related entries (e.g. `oauth:<srv>` + `oauth-client-secret:<srv>`) can't
    * land out-of-sync if a concurrent writer interleaves between two `delete()`
@@ -217,6 +247,24 @@ export class CredentialStore {
   }
 
   // --- Internal ---
+
+  private _changeIfStored<Changed extends string>(
+    label: string,
+    key: string,
+    shouldChange: (stored: Credential) => boolean,
+    changed: Changed,
+    change: (credentials: Record<string, Credential>) => void,
+  ): Promise<ConditionalChange<Changed>> {
+    this._validateKey(key);
+    return this._mutateExistingStore<ConditionalChange<Changed>>(label, "missing", async (giveUp) => {
+      const { store, masterKey } = await this._openStore(await this._getExistingMasterKey());
+      if (!Object.hasOwn(store.credentials, key)) return "missing";
+      if (!shouldChange(store.credentials[key])) return "kept";
+      change(store.credentials);
+      await this._writeStore(store, masterKey, giveUp);
+      return changed;
+    });
+  }
 
   private _mutate<T>(label: string, body: (giveUp: AbortSignal) => Promise<T>): Promise<T> {
     return this.getMutex().run((giveUp) => this._underStoreLock(giveUp, body), this._runOptions(label));

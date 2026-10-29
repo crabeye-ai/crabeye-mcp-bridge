@@ -463,12 +463,13 @@ export async function runAuthLogin(
     // Pin token-endpoint origin to the authorization-endpoint origin via
     // the SDK's fetchFn hook. A tampered AS metadata response would
     // otherwise let the SDK POST the authorization code + PKCE verifier +
-    // client_secret to an attacker-controlled origin.
-    const pinningFetch = makeOriginPinningFetch();
+    // client_secret to an attacker-controlled origin. The provider's wrapper
+    // lets it see which refresh tokens the authorization server rejected.
+    const tokenEndpointFetch = provider.wrapFetch(makeOriginPinningFetch());
 
     const first = await authFn(provider, {
       serverUrl: upstream.server.url,
-      fetchFn: pinningFetch,
+      fetchFn: tokenEndpointFetch,
     });
     if (first === "AUTHORIZED") {
       // Already authorized via cached tokens — nothing more to do.
@@ -507,7 +508,7 @@ export async function runAuthLogin(
       serverUrl: upstream.server.url,
       authorizationCode: callback.code,
       ...(callback.iss ? { iss: callback.iss } : {}),
-      fetchFn: pinningFetch,
+      fetchFn: tokenEndpointFetch,
     });
 
     if (result !== "AUTHORIZED") {

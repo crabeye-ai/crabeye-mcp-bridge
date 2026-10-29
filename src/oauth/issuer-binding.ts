@@ -30,6 +30,15 @@ export function issuersMatch(a: string, b: string): boolean {
   return false;
 }
 
+/**
+ * Whether tokens stamped with `storedIssuer` may be overwritten by tokens
+ * stamped with `newIssuer`: an unstamped entry accepts any issuer, a stamped
+ * one only the same issuer.
+ */
+export function issuerAllows(storedIssuer: string | undefined, newIssuer: string | undefined): boolean {
+  return storedIssuer === undefined || (newIssuer !== undefined && issuersMatch(storedIssuer, newIssuer));
+}
+
 export function assertCallbackIssuerWithoutMetadata(
   discovery: OAuthDiscoveryState | undefined,
   iss: string | undefined,

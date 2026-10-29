@@ -17,6 +17,13 @@ export class MockKeychain implements KeychainAdapter {
 
 export const secret = (value: string) => ({ type: "secret" as const, value });
 
+export const oauthTokens = (refreshToken: string) => ({
+  type: "oauth2" as const,
+  access_token: `at-${refreshToken}`,
+  token_type: "Bearer",
+  refresh_token: refreshToken,
+});
+
 export async function tempFiles(dir: string): Promise<string[]> {
   return (await readdir(dir)).filter((name) => name.includes(".tmp."));
 }
