@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BridgeConfigSchema, type BridgeConfig } from "../../../src/config/schema.js";
+import { BridgeConfigSchema, type BridgeConfig, type HttpServerConfig } from "../../../src/config/schema.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
 import { HttpUpstreamPool } from "../../../src/daemon/instances/http-upstream-pool.js";
 import { Instance, type InstanceDeps, type InstanceNotification } from "../../../src/daemon/instances/instance.js";
@@ -56,6 +56,7 @@ describe("Instance", () => {
   let log: SpyLogger;
   let clients: ScriptedUpstreamClient[];
   let clientLogs: Map<string, Logger>;
+  let created: Array<{ name: string; config: HttpServerConfig; env: Record<string, string> }>;
   let pool: HttpUpstreamPool;
   let stores: Array<Record<string, string>>;
   let deps: InstanceDeps;
@@ -79,13 +80,15 @@ describe("Instance", () => {
     log = spyLogger();
     clients = [];
     clientLogs = new Map();
+    created = [];
     stores = [];
     pool = new HttpUpstreamPool({
       logger: log,
-      createClient: (name, _config, { logger }) => {
+      createClient: (name, config, { logger, env }) => {
         const client = new ScriptedUpstreamClient(name);
         clients.push(client);
         clientLogs.set(name, logger);
+        created.push({ name, config, env });
         return client;
       },
     });
@@ -104,20 +107,24 @@ describe("Instance", () => {
 
   afterEach(async () => {
     await Promise.all(instances.splice(0).map((instance) => instance.close()));
-    await pool.close();
+    await pool.close(0);
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("hosts the HTTP and SSE servers without _bridge.auth, and nothing else", async () => {
+  it("hosts every HTTP and SSE server, with or without _bridge.auth, and no STDIO one", async () => {
     const instance = await open();
 
-    expect(instance.status()).toEqual({ source, bridges: 0, upstreams: ["events", "plain"] });
-    expect(clients.map((c) => c.name).sort()).toEqual(["events", "plain"]);
+    expect(instance.status()).toEqual({ source, bridges: 0, upstreams: ["events", "oauth", "plain"] });
+    expect(clients.map((c) => c.name).sort()).toEqual(["events", "oauth", "plain"]);
   });
 
-  it("opens its credential store with the instance's environment", async () => {
-    await open({ MCP_BRIDGE_MASTER_KEY: "k" });
-    expect(stores).toEqual([{ MCP_BRIDGE_MASTER_KEY: "k" }]);
+  it("opens its credential store with the instance's environment, and gives a connection only the client secret variable it names", async () => {
+    current = { mcpServers: { ...MIXED.mcpServers, oauth: { ...MIXED.mcpServers.oauth, _bridge: { auth: { type: "oauth2", clientSecret: "${NOTION_OAUTH_SECRET}" } } } } };
+
+    await open({ MCP_BRIDGE_MASTER_KEY: "k", NOTION_OAUTH_SECRET: "s", OTHER_OAUTH: "o" });
+
+    expect(stores).toEqual([{ MCP_BRIDGE_MASTER_KEY: "k", NOTION_OAUTH_SECRET: "s", OTHER_OAUTH: "o" }]);
+    expect(Object.fromEntries(created.map((c) => [c.name, c.env]))).toEqual({ plain: {}, events: {}, oauth: { NOTION_OAUTH_SECRET: "s" } });
   });
 
   it("rejects when the config can't be loaded", async () => {
@@ -130,15 +137,15 @@ describe("Instance", () => {
     const bridge = recorder();
 
     instance.attach(bridge);
-    expect(instance.upstreamNames().sort()).toEqual(["events", "plain"]);
-    expect(bridge.notifications.map((n) => n.method)).toEqual(["UPSTREAM", "UPSTREAM"]);
+    expect(instance.upstreamNames().sort()).toEqual(["events", "oauth", "plain"]);
+    expect(bridge.notifications.map((n) => n.method)).toEqual(["UPSTREAM", "UPSTREAM", "UPSTREAM"]);
     const plain = clients.find((c) => c.name === "plain")!;
     plain.setStatus("disconnected", new Error("reset"));
     expect(bridge.notifications.at(-1)).toEqual({ method: "UPSTREAM", params: { name: "plain", status: "disconnected", error: "reset", tools: [] } });
 
     instance.detach(bridge);
     plain.setStatus("connected");
-    expect(bridge.notifications).toHaveLength(3);
+    expect(bridge.notifications).toHaveLength(4);
     expect(instance.attachmentCount).toBe(0);
   });
 
@@ -159,11 +166,11 @@ describe("Instance", () => {
     await open({ MCP_BRIDGE_MASTER_KEY: "k" });
     source = { kind: "file", path: join(dir, "other.json") };
     await open({ MCP_BRIDGE_MASTER_KEY: "k" });
-    expect(clients).toHaveLength(2);
-    expect(pool.upstreams().map((u) => u.ownerCount)).toEqual([2, 2]);
+    expect(clients).toHaveLength(3);
+    expect(pool.upstreams().map((u) => u.ownerCount)).toEqual([2, 2, 2]);
 
     await open({ MCP_BRIDGE_MASTER_KEY: "other" });
-    expect(clients).toHaveLength(4);
+    expect(clients).toHaveLength(6);
   });
 
   describe("when its config file changes", { timeout: 30_000 }, () => {
@@ -196,18 +203,22 @@ describe("Instance", () => {
       expect(sentAfterEdit).toEqual(new Set(["plain", "fresh"]));
     });
 
-    it("lets a server go to each bridge when it gains _bridge.auth, and takes it back when it loses it", async () => {
+    it("connects a server again with its new settings when its _bridge.auth changes", async () => {
       const instance = await open();
       const bridge = recorder();
       instance.attach(bridge);
+      const greeting = bridge.notifications.length;
+      const oauth = clients.find((c) => c.name === "oauth")!;
       const plain = clients.find((c) => c.name === "plain")!;
-      const withAuth = { mcpServers: { plain: { url: "https://plain.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } } };
-      await rewriteUntil(() => writeConfig(withAuth), () => expect(instance.status().upstreams).toEqual([]));
-      await vi.waitFor(() => expect(plain.closed).toBe(true), WATCHED);
-      expect(bridge.notifications).toContainEqual({ method: "UPSTREAM_REMOVED", params: { upstream: "plain" } });
+      const scoped = { mcpServers: { ...MIXED.mcpServers, oauth: { ...MIXED.mcpServers.oauth, _bridge: { auth: { type: "oauth2", scopes: ["read"] } } } } };
 
-      const withoutAuth = { mcpServers: { plain: { url: "https://plain.example.com/mcp" } } };
-      await rewriteUntil(() => writeConfig(withoutAuth), () => expect(instance.status().upstreams).toEqual(["plain"]));
+      await rewriteUntil(() => writeConfig(scoped), () => expect(created.filter((c) => c.name === "oauth")).toHaveLength(2));
+
+      await vi.waitFor(() => expect(oauth.closed).toBe(true), WATCHED);
+      expect(created.at(-1)!.config._bridge?.auth).toEqual({ type: "oauth2", scopes: ["read"] });
+      expect(plain.closed).toBe(false);
+      expect(bridge.notifications.slice(greeting)).toContainEqual(expect.objectContaining({ method: "UPSTREAM", params: expect.objectContaining({ name: "oauth" }) }));
+      expect(bridge.notifications).not.toContainEqual({ method: "UPSTREAM_REMOVED", params: { upstream: "oauth" } });
     });
 
     it("keeps the last good config when the new one doesn't load", async () => {
@@ -218,7 +229,7 @@ describe("Instance", () => {
         () => writeFile(configPath, "{ not json"),
         () => expect(log.warn).toHaveBeenCalledWith("failed to reload config", expect.objectContaining({ error: "Invalid JSON in config file" })),
       );
-      expect(instance.status().upstreams).toEqual(["events", "plain"]);
+      expect(instance.status().upstreams).toEqual(["events", "oauth", "plain"]);
     });
 
     it("retries a server paused for authorization", async () => {
@@ -284,7 +295,7 @@ describe("Instance", () => {
     await instance.reload();
     expect(instance.status().upstreams).toEqual(["plain"]);
 
-    await rewriteUntil(() => writeConfig(MIXED), () => expect(instance.status().upstreams).toEqual(["events", "plain"]));
+    await rewriteUntil(() => writeConfig(MIXED), () => expect(instance.status().upstreams).toEqual(["events", "oauth", "plain"]));
   });
 
   it("watches the files a reload names, such as a client file added to the bridge-owned config", { timeout: 30_000 }, async () => {

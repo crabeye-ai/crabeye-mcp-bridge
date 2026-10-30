@@ -9,7 +9,6 @@ export {
   BridgeConfigSchema,
   isHttpServer,
   isStdioServer,
-  isDaemonHosted,
 } from "./schema.js";
 export type {
   ToolPolicy,

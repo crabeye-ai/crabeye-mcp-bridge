@@ -14,11 +14,11 @@ export function exited(child: ChildProcess, withinMs: number): Promise<number | 
   ]);
 }
 
-export async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
-  let settled = false;
-  void promise.then(() => (settled = true), () => (settled = true));
-  await new Promise((resolve) => setTimeout(resolve, ms));
-  return settled;
+export function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  return Promise.race([
+    promise.then(() => true, () => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
+  ]);
 }
 
 export function deadPid(): number {

@@ -2,10 +2,12 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { HttpServerConfig } from "../../config/schema.js";
 import type { CredentialStore } from "../../credentials/credential-store.js";
 import type { Logger, LogLevel } from "../../logging/index.js";
+import { PendingSaves } from "../../oauth/pending-saves.js";
+import { SharedRefreshes } from "../../oauth/shared-refreshes.js";
 import { HealthChecks } from "../../upstream/health-checks.js";
 import { HttpUpstreamClient } from "../../upstream/http-client.js";
 import { canonicalize, type UpstreamReconnectInputs } from "../../upstream/upstream-hash.js";
-import { authorizationPausedMessage, type ConnectionStatus, type StatusChangeEvent, type UpstreamClient } from "../../upstream/types.js";
+import { authorizationPausedMessage, ConnectionSupersededError, type ConnectionStatus, type StatusChangeEvent, type UpstreamClient } from "../../upstream/types.js";
 import type { NetworkSettings } from "../instance-env.js";
 import { capStderrLine, STDERR_LINE_MAX_CHARS, type UpstreamLogContext, type UpstreamLogLevel, type UpstreamSnapshot } from "../protocol.js";
 import { networkFetch, type NetworkFetch } from "./network.js";
@@ -18,6 +20,8 @@ export interface PooledUpstreamSpec {
   reconnect: UpstreamReconnectInputs;
   healthCheckIntervalSec: number;
   network: NetworkSettings;
+  /** The client variables the connection reads, all of them part of `key`. */
+  env: Record<string, string>;
 }
 
 export interface PooledUpstreamListener {
@@ -25,11 +29,25 @@ export interface PooledUpstreamListener {
   onLog(level: UpstreamLogLevel, message: string, context: UpstreamLogContext): void;
 }
 
+/** A pooled connection's client, which can be told its OAuth provider must stop changing what is stored. */
+export type PoolClient = UpstreamClient & { retireAuth(): void };
+
+/** At most how long a closing connection's refreshes may delay a stopping manager while they save their tokens. */
+export const STOP_SAVE_WAIT_MS = 2_000;
+
 export type CreateHttpClient = (
   name: string,
   config: HttpServerConfig,
-  deps: { logger: Logger; credentialStore: CredentialStore; reconnect: UpstreamReconnectInputs; fetch: typeof fetch },
-) => UpstreamClient;
+  deps: {
+    logger: Logger;
+    credentialStore: CredentialStore;
+    reconnect: UpstreamReconnectInputs;
+    fetch: typeof fetch;
+    env: Record<string, string>;
+    refreshes: SharedRefreshes;
+    pendingSaves: PendingSaves;
+  },
+) => PoolClient;
 
 /** What an owner may do with a connection it holds a lease on. */
 export type SharedUpstream = Pick<PooledUpstream, "name" | "status" | "snapshot" | "callTool" | "retry" | "retryIfPaused" | "subscribe">;
@@ -48,12 +66,23 @@ export interface HttpUpstreamPoolOptions {
 }
 
 const defaultCreateClient: CreateHttpClient = (name, config, deps) =>
-  new HttpUpstreamClient({ name, config, logger: deps.logger, credentialStore: deps.credentialStore, fetch: deps.fetch, ...deps.reconnect });
+  new HttpUpstreamClient({
+    name,
+    config,
+    logger: deps.logger,
+    credentialStore: deps.credentialStore,
+    fetch: deps.fetch,
+    env: deps.env,
+    refreshes: deps.refreshes,
+    pendingSaves: deps.pendingSaves,
+    ...deps.reconnect,
+  });
 
-/** One connection per upstream key across every instance in the daemon. */
+/** One connection per upstream key across every instance in the daemon, refreshing tokens once among them. */
 export class HttpUpstreamPool {
   private readonly _upstreams = new Map<string, PooledUpstream>();
-  private readonly _closing = new Set<Promise<void>>();
+  private readonly _closing = new Map<PooledUpstream, Promise<void>>();
+  private readonly _refreshes = new SharedRefreshes();
   private readonly _logger: Logger;
   private readonly _createClient: CreateHttpClient;
 
@@ -76,7 +105,7 @@ export class HttpUpstreamPool {
         released = true;
         if (upstream.removeOwner(owner) > 0) return;
         if (this._upstreams.get(upstream.key) === upstream) this._upstreams.delete(upstream.key);
-        this._track(upstream.close());
+        this._track(upstream);
       },
     };
   }
@@ -85,23 +114,39 @@ export class HttpUpstreamPool {
     return [...this._upstreams.values()];
   }
 
-  async close(): Promise<void> {
-    for (const upstream of this._upstreams.values()) this._track(upstream.close());
+  /**
+   * Connects every connection to an upstream named `name` again after its
+   * stored credentials changed, and keeps the ones still closing from changing
+   * them; resolves with how many tried to connect again, once they have.
+   */
+  async credentialsChanged(name: string): Promise<number> {
+    for (const closing of this._closing.keys()) if (closing.name === name) closing.retireAuth();
+    const named = this.upstreams().filter((upstream) => upstream.name === name);
+    await Promise.all(named.map((upstream) => upstream.credentialsChanged()));
+    return named.length;
+  }
+
+  /** Closes every connection, waiting for their refreshes to save their tokens up to `STOP_SAVE_WAIT_MS`, and never longer than `maxSaveWaitMs`. */
+  async close(maxSaveWaitMs: number): Promise<void> {
+    for (const upstream of this._upstreams.values()) this._track(upstream);
     this._upstreams.clear();
-    while (this._closing.size > 0) await Promise.allSettled([...this._closing]);
+    const saveWaitMs = Math.min(STOP_SAVE_WAIT_MS, maxSaveWaitMs);
+    for (const closing of this._closing.keys()) closing.limitSaveWait(saveWaitMs);
+    while (this._closing.size > 0) await Promise.allSettled([...this._closing.values()]);
   }
 
   private _upstreamFor(spec: PooledUpstreamSpec): PooledUpstream {
     const existing = this._upstreams.get(spec.key);
     if (existing !== undefined) return existing;
-    const created = new PooledUpstream(spec, this._logger, this._createClient);
+    const created = new PooledUpstream(spec, this._logger, this._createClient, this._refreshes);
     this._upstreams.set(spec.key, created);
     return created;
   }
 
-  private _track(closing: Promise<void>): void {
-    this._closing.add(closing);
-    void closing.finally(() => this._closing.delete(closing));
+  private _track(upstream: PooledUpstream): void {
+    const closing = upstream.close();
+    this._closing.set(upstream, closing);
+    void closing.finally(() => this._closing.delete(upstream));
   }
 }
 
@@ -114,8 +159,10 @@ interface Owner {
 export class PooledUpstream {
   readonly key: string;
   readonly name: string;
-  private readonly _client: UpstreamClient;
+  private readonly _client: PoolClient;
   private readonly _network: NetworkFetch;
+  private readonly _pendingSaves = new PendingSaves();
+  private readonly _stopWaiting = new AbortController();
   private readonly _log: Logger;
   private readonly _health: HealthChecks;
   private readonly _owners: Owner[] = [];
@@ -125,7 +172,7 @@ export class PooledUpstream {
   private _published: { snapshot: UpstreamSnapshot; toolsRef: unknown; toolsText: string } | undefined;
   private _pauseLogged = false;
 
-  constructor(spec: PooledUpstreamSpec, daemonLogger: Logger, createClient: CreateHttpClient) {
+  constructor(spec: PooledUpstreamSpec, daemonLogger: Logger, createClient: CreateHttpClient, refreshes: SharedRefreshes) {
     this.key = spec.key;
     this.name = spec.name;
     this._log = daemonLogger.child({ component: "upstream", server: spec.name });
@@ -136,6 +183,9 @@ export class PooledUpstream {
       credentialStore: spec.credentialStore,
       reconnect: spec.reconnect,
       fetch: this._network.fetch,
+      env: spec.env,
+      refreshes,
+      pendingSaves: this._pendingSaves,
     });
     this._health = new HealthChecks({ intervalSec: spec.healthCheckIntervalSec, logger: reporting });
     this._health.add(this._client, spec.name);
@@ -144,7 +194,9 @@ export class PooledUpstream {
       this._client.onToolsChanged(() => this._publish()),
     ];
     this._log.info(`connecting (${spec.config.type})`);
-    this._client.connect().catch((err: unknown) => this._log.warn(`failed to connect: ${err instanceof Error ? err.message : String(err)}`));
+    this._client.connect().catch((err: unknown) => {
+      if (!(err instanceof ConnectionSupersededError)) this._log.warn(`failed to connect: ${err instanceof Error ? err.message : String(err)}`);
+    });
     this._health.start();
   }
 
@@ -183,6 +235,22 @@ export class PooledUpstream {
     if (this._client.status === "auth_required") void this._client.retryNow();
   }
 
+  /** Connects again, even when connected, so stored credentials that changed apply at once; settles once it has tried. */
+  credentialsChanged(): Promise<void> {
+    this.retireAuth();
+    return this._client.reconnect().catch(() => {});
+  }
+
+  /** Stops waiting for refreshes to save after `ms`, if the connection is still closing. */
+  limitSaveWait(ms: number): void {
+    setTimeout(() => this._stopWaiting.abort(), ms).unref();
+  }
+
+  /** Keeps the connection's OAuth provider from changing stored credentials any more. */
+  retireAuth(): void {
+    this._client.retireAuth();
+  }
+
   subscribe(listener: PooledUpstreamListener): () => void {
     this._listeners.add(listener);
     return () => this._listeners.delete(listener);
@@ -211,11 +279,21 @@ export class PooledUpstream {
     if (entry === this._owners[0]) this._health.restart(intervalSec);
   }
 
+  /**
+   * Closes the client at once, then keeps the network open until its
+   * refreshes have saved their tokens, for as long as a refresh may take or
+   * until `limitSaveWait` cuts the wait: the authorization server may already
+   * have redeemed the refresh token, and closing the network would lose the
+   * new one. Its OAuth providers are then retired, so a refresh one of them
+   * joins afterwards can't put back credentials removed since.
+   */
   async close(): Promise<void> {
     this._health.stop();
     for (const unsubscribe of this._unsubscribers) unsubscribe();
     this._listeners.clear();
     await this._client.close().catch(() => {});
+    await this._pendingSaves.settled(this._stopWaiting.signal);
+    this._client.retireAuth();
     await this._network.close();
   }
 

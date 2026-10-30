@@ -1,5 +1,5 @@
 import type { BridgeConfig, ServerConfig, ToolPolicy } from "./schema.js";
-import { resolveUpstreams, isDaemonHosted, isStdioServer } from "./schema.js";
+import { resolveUpstreams, isStdioServer } from "./schema.js";
 import type { LogLevel } from "../logging/index.js";
 
 export interface ServerDiff<T extends ServerConfig = ServerConfig> {
@@ -31,7 +31,7 @@ function connectionFields(config: ServerConfig): Record<string, unknown> {
     type: config.type,
     url: config.url,
     headers: config.headers,
-    daemonHosted: isDaemonHosted(config),
+    auth: config._bridge?.auth,
   };
 }
 

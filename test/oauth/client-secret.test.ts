@@ -5,6 +5,7 @@ import {
   oauthCredentialKey,
   hasStoredOAuthCredential,
   isClientSecretEnvName,
+  clientSecretEnvName,
 } from "../../src/oauth/client-secret.js";
 import type { CredentialStore } from "../../src/credentials/credential-store.js";
 import { makeTestStore } from "../_helpers/credential-store.js";
@@ -16,6 +17,20 @@ describe("isClientSecretEnvName", () => {
 
   it.each(["OAUTHORITY", "MY_OAUTHIBITED", "oauth_secret", "HOME", "MCP_BRIDGE_MASTER_KEY", "OAUTH-SECRET", "1_OAUTH", ""])("rejects %j", (name) => {
     expect(isClientSecretEnvName(name)).toBe(false);
+  });
+});
+
+describe("clientSecretEnvName", () => {
+  it.each([
+    ["${NOTION_OAUTH_SECRET}", "NOTION_OAUTH_SECRET"],
+    ["${AWS_SECRET_ACCESS_KEY}", "AWS_SECRET_ACCESS_KEY"],
+    ["plain-secret", undefined],
+    ["prefix ${NOTION_OAUTH_SECRET}", undefined],
+    ["${lower_oauth}", undefined],
+    ["", undefined],
+    [undefined, undefined],
+  ])("reads %j as naming %j", (configValue, expected) => {
+    expect(clientSecretEnvName(configValue)).toBe(expected);
   });
 });
 

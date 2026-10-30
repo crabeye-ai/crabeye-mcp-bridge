@@ -78,6 +78,7 @@ export {
   type ReapResult,
 } from "./process-tracker.js";
 export { netTransport } from "./net-transport.js";
+export { tellManagerAuthChanged } from "./auth-changed.js";
 export { daemonFit, daemonVersionLabel, olderDaemonStillRunning, reportedDaemonPid, UNKNOWN_DAEMON_VERSION } from "./daemon-version.js";
 export {
   AWAIT_PREDECESSOR_FLAG,

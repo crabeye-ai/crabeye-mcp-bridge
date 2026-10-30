@@ -1,6 +1,6 @@
 import { ConfigWatcher } from "../../config/config-watcher.js";
 import { diffServers } from "../../config/config-diff.js";
-import { isDaemonHosted, resolveUpstreams, type BridgeConfig, type DaemonHostedConfig } from "../../config/schema.js";
+import { isHttpServer, resolveUpstreams, type BridgeConfig, type HttpServerConfig } from "../../config/schema.js";
 import type { CredentialStore } from "../../credentials/credential-store.js";
 import type { Logger } from "../../logging/index.js";
 import { resolveReconnectInputs } from "../../upstream/upstream-hash.js";
@@ -44,7 +44,7 @@ interface Hosted {
 
 /**
  * The daemon's copy of one config, shared by every bridge that would load it.
- * Holds a pooled connection for each daemon-hosted server and follows edits
+ * Holds a pooled connection for each HTTP and SSE server and follows edits
  * to the files it loaded.
  */
 export class Instance {
@@ -207,9 +207,9 @@ export class Instance {
     for (const { lease } of this._hosted.values()) lease.upstream.retryIfPaused();
   }
 
-  private _host(name: string, config: DaemonHostedConfig): void {
+  private _host(name: string, config: HttpServerConfig): void {
     const bridgeConfig = this._config;
-    const { key, network } = httpUpstreamIdentity(name, config, this._env);
+    const { key, network, env } = httpUpstreamIdentity(name, config, this._env);
     const lease = this._deps.pool.acquire({
       key,
       name,
@@ -218,6 +218,7 @@ export class Instance {
       reconnect: resolveReconnectInputs(bridgeConfig._bridge, config),
       healthCheckIntervalSec: bridgeConfig._bridge.healthCheckInterval,
       network,
+      env,
     });
     const unsubscribe = lease.upstream.subscribe({
       onSnapshot: (snapshot) => this._broadcast({ method: "UPSTREAM", params: snapshot }),
@@ -244,10 +245,10 @@ export class Instance {
   }
 }
 
-function hostedServers(config: BridgeConfig): Record<string, DaemonHostedConfig> {
-  const hosted: Record<string, DaemonHostedConfig> = {};
+function hostedServers(config: BridgeConfig): Record<string, HttpServerConfig> {
+  const hosted: Record<string, HttpServerConfig> = {};
   for (const [name, server] of Object.entries(resolveUpstreams(config))) {
-    if (isDaemonHosted(server)) hosted[name] = server;
+    if (isHttpServer(server)) hosted[name] = server;
   }
   return hosted;
 }

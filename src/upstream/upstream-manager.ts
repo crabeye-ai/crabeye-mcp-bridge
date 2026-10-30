@@ -20,7 +20,7 @@ export interface UpstreamManagerOptions {
   credentialStore?: CredentialStore;
   /** Health check interval in seconds. 0 to disable. Overrides config value. */
   healthCheckInterval?: number;
-  /** The bridge's link to its daemon instance, which connects the HTTP and SSE upstreams without `_bridge.auth`. `closeAll` closes it. */
+  /** The bridge's link to its daemon instance, which connects every HTTP and SSE upstream. `closeAll` closes it. */
   instanceLink?: UpstreamLink;
   /** Injectable client factory for testing. */
   _clientFactory?: UpstreamClientFactory;

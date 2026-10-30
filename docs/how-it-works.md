@@ -1,6 +1,6 @@
 # How it works
 
-When the AI assistant starts its session, the bridge launches every configured upstream server, connects to it, and discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. STDIO servers run in a per-user [manager](stdio-manager.md) process shared by every bridge, and the manager also connects the HTTP and SSE servers that have no `_bridge.auth`, once for all bridges. A bridge starts the manager as soon as its config has an upstream. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
+When the AI assistant starts its session, the bridge launches every configured upstream server, connects to it, and discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. STDIO servers run in a per-user [manager](stdio-manager.md) process shared by every bridge, and the manager also connects every HTTP and SSE server, once for all bridges. A bridge starts the manager as soon as its config has an upstream. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
 
 The bridge exposes exactly two tools to the AI assistant, and that list never changes during a session:
 
@@ -35,7 +35,7 @@ The bridge advertises its own `instructions` string to clients during the MCP `i
 1. **Base instructions** — a static block telling the assistant how and when to call `search_tools` and `run_tool`.
 2. **Per-server passthrough blocks** — appended for every upstream that opted in via `_bridge.passthrough` (see [configuration.md](configuration.md#context-passthrough)). One H2-headed block per upstream, in the order upstreams are resolved from the config.
 
-Upstream `instructions` are read from each upstream's `initialize` response and surfaced via the SDK `Client.getInstructions()` API. For STDIO upstreams that share a daemon-owned child, the daemon caches the field in its `CachedInit` and replays it from the initialize short-circuit, so subsequent sessions on the same child see the same text. For HTTP upstreams the manager connects, every bridge gets the instructions from the manager's one connection.
+Upstream `instructions` are read from each upstream's `initialize` response and surfaced via the SDK `Client.getInstructions()` API. For STDIO upstreams that share a daemon-owned child, the daemon caches the field in its `CachedInit` and replays it from the initialize short-circuit, so subsequent sessions on the same child see the same text. For HTTP and SSE upstreams, every bridge gets the instructions from the manager's one connection.
 
 When an upstream connects after the bridge starts, or when `_bridge.passthrough` changes via config hot-reload, the bridge regenerates this string. The change applies to the **next** client `initialize` only — MCP has no mechanism to push an updated instructions string to a connected session.
 

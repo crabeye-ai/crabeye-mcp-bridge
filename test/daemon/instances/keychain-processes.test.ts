@@ -17,7 +17,7 @@ import { bundleForSubprocess } from "../../_helpers/subprocess-bundle.js";
 const isWindows = process.platform === "win32";
 const run = promisify(execFile);
 
-describe("a credential header resolved by the detached daemon", { timeout: 90_000 }, () => {
+describe("credentials read by the detached daemon", { timeout: 90_000 }, () => {
   let cliScript: string;
   let home: string;
   let server: CountingUpstream;
@@ -80,6 +80,28 @@ describe("a credential header resolved by the detached daemon", { timeout: 90_00
     expect(result).toMatchObject({ content: [{ type: "text", text: "called echo {}" }] });
     expect(server.authorizations()).toContain("Bearer from-the-store");
     expect(await daemonStatus()).toMatchObject({ httpUpstreams: [{ server: "svc", state: "connected" }] });
+  });
+
+  it("refreshes the tokens of an upstream with _bridge.auth with the client secret the CLI stored, read through the keychain in the daemon process", async () => {
+    const authorizing = await startCountingUpstream({ oauth: true });
+    try {
+      const set = (key: string, ...value: string[]) => run(process.execPath, [cliScript, "credential", "set", key, ...value], { env: env() });
+      await set("oauth:svc", "--json", JSON.stringify({ type: "oauth2", access_token: "at-0", refresh_token: "rt-0", token_type: "Bearer", issuer: authorizing.issuer }));
+      await set("oauth-client-secret:svc", "secret-from-the-store");
+      const configPath = join(home, "client.json");
+      await writeFile(configPath, JSON.stringify({ mcpServers: { svc: { url: authorizing.url, _bridge: { auth: { type: "oauth2", clientId: "client-1" } } } } }));
+      const bridge = await connect(configPath, env());
+      expect(await bridge.client.callTool(viaRunTool("svc__echo"))).toMatchObject({ content: [{ type: "text", text: "called echo {}" }] });
+
+      authorizing.expireAccessTokens();
+
+      expect(await bridge.client.callTool(viaRunTool("svc__echo"))).toMatchObject({ content: [{ type: "text", text: "called echo {}" }] });
+      expect(authorizing.tokenRequestLog()).toEqual([{ grantType: "refresh_token", clientId: "client-1", clientSecret: "secret-from-the-store", refreshToken: "rt-0" }]);
+      expect(await daemonStatus()).toMatchObject({ httpUpstreams: [{ server: "svc", state: "connected" }] });
+      expect(authorizing.count("tools/list")).toBe(1);
+    } finally {
+      await authorizing.close();
+    }
   });
 
   it.skipIf(isWindows)("doesn't let a client whose entry sets another master key use credentials stored under this one", async () => {

@@ -1,5 +1,5 @@
 import type { Logger } from "../logging/index.js";
-import type { HealthState, UpstreamClient } from "./types.js";
+import { ConnectionSupersededError, type HealthState, type UpstreamClient } from "./types.js";
 
 export interface HealthChecksOptions {
   /** Seconds between pings. 0 disables the checks. */
@@ -121,6 +121,7 @@ export class HealthChecks {
     tracking.consecutiveFailures = 0;
     tracking.health = "unknown";
     client.reconnect().catch((reconnectErr: unknown) => {
+      if (reconnectErr instanceof ConnectionSupersededError) return;
       this._logger.error("reconnect failed", { server: member.server, error: errorMessage(reconnectErr) });
     });
   }

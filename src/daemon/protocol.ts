@@ -59,6 +59,7 @@ export type DaemonMethod =
   | "CALL_TOOL"
   | "CANCEL_TOOL"
   | "RETRY"
+  | "AUTH_CHANGED"
   | "UPSTREAM"
   | "UPSTREAM_REMOVED"
   | "LOG";
@@ -224,6 +225,17 @@ export interface RetryParams {
 
 export interface UpstreamRemovedParams {
   upstream: string;
+}
+
+/** `AUTH_CHANGED.params`: the stored credentials of the upstreams named `upstream` changed. Needs no `ATTACH`. */
+export interface AuthChangedParams {
+  upstream: string;
+}
+
+/** Sent once every connection to those upstreams has tried to connect again. */
+export interface AuthChangedResult {
+  /** How many connections, across every instance, tried to connect again. */
+  connections: number;
 }
 
 export type UpstreamLogLevel = "warn" | "error";

@@ -57,8 +57,27 @@ describe("httpUpstreamIdentity", () => {
     expect(httpUpstreamKey("svc", tuned, masterKeyEnv("k"))).toBe(httpUpstreamKey("svc", base, masterKeyEnv("k")));
   });
 
-  it("ignores client-secret variables, which only matter to upstreams with _bridge.auth", () => {
-    expect(httpUpstreamKey("svc", base, { ...masterKeyEnv("k"), NOTION_OAUTH_SECRET: "s" })).toBe(httpUpstreamKey("svc", base, masterKeyEnv("k")));
+  it("ignores client-secret variables the upstream's clientSecret doesn't name", () => {
+    const named = http({ ...base, _bridge: { auth: { type: "oauth2", clientSecret: "${NOTION_OAUTH_SECRET}" } } });
+    const inline = http({ ...base, _bridge: { auth: { type: "oauth2", clientSecret: "plain-secret" } } });
+    const env = { ...masterKeyEnv("k"), NOTION_OAUTH_SECRET: "s" };
+    expect(httpUpstreamKey("svc", base, { ...env, OTHER_OAUTH: "x" })).toBe(httpUpstreamKey("svc", base, masterKeyEnv("k")));
+    expect(httpUpstreamKey("svc", inline, { ...env, OTHER_OAUTH: "x" })).toBe(httpUpstreamKey("svc", inline, masterKeyEnv("k")));
+    expect(httpUpstreamKey("svc", named, { ...env, OTHER_OAUTH: "x" })).toBe(httpUpstreamKey("svc", named, env));
+  });
+
+  it("hands the connection the variable its clientSecret names, and no other", () => {
+    const named = http({ ...base, _bridge: { auth: { type: "oauth2", clientSecret: "${NOTION_OAUTH_SECRET}" } } });
+    const env = { ...masterKeyEnv("k"), NOTION_OAUTH_SECRET: "s", OTHER_OAUTH: "o" };
+    expect(httpUpstreamIdentity("svc", named, env).env).toEqual({ NOTION_OAUTH_SECRET: "s" });
+    expect(httpUpstreamIdentity("svc", named, masterKeyEnv("k")).env).toEqual({});
+    expect(httpUpstreamIdentity("svc", base, env).env).toEqual({});
+  });
+
+  it("differs for another value, or no value, of the variable the upstream's clientSecret names", () => {
+    const named = http({ ...base, _bridge: { auth: { type: "oauth2", clientSecret: "${NOTION_OAUTH_SECRET}" } } });
+    const key = (value?: string) => httpUpstreamKey("svc", named, { ...masterKeyEnv("k"), ...(value !== undefined && { NOTION_OAUTH_SECRET: value }) });
+    expect(new Set([key("s"), key("t"), key()]).size).toBe(3);
   });
 
   it("ignores a proxy the client doesn't use, and takes the lowercase proxy variables first", () => {

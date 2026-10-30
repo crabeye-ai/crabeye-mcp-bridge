@@ -20,6 +20,7 @@ import {
   errorResponse,
   notInDaemonConfig,
   type AttachResult,
+  type AuthChangedResult,
   type DaemonResponse,
   type InstanceSource,
   type StatusHttpUpstream,
@@ -29,7 +30,7 @@ import type { FrameChannel } from "../transport.js";
 import { HttpUpstreamPool, type CreateHttpClient } from "./http-upstream-pool.js";
 import { instanceKey } from "./identity.js";
 import { Instance, type InstanceAttachment, type InstanceDeps, type InstanceNotification, type LoadedConfig } from "./instance.js";
-import { parseAttachParams, parseCallToolParams, parseCancelToolParams, parseRetryParams } from "./params.js";
+import { parseAttachParams, parseAuthChangedParams, parseCallToolParams, parseCancelToolParams, parseRetryParams } from "./params.js";
 
 const MAX_INSTANCES = 64;
 const MAX_CALLS_PER_BRIDGE = MAX_INFLIGHT_PER_SESSION;
@@ -171,6 +172,17 @@ export class InstanceHost {
     return { id, result: await upstream.retry() };
   }
 
+  /** Connects every upstream named in the params again, in every instance, so stored credentials that changed apply at once. */
+  async handleAuthChanged(id: string, raw: unknown): Promise<DaemonResponse> {
+    if (this._stopping) return errorResponse(id, ERROR_CODE_DAEMON_STOPPING, "manager is shutting down");
+    const params = parseAuthChangedParams(raw);
+    if (params === null) return errorResponse(id, ERROR_CODE_INVALID_PARAMS, "AUTH_CHANGED params malformed");
+    const connections = await this._pool.credentialsChanged(params.upstream);
+    this._log.info("credentials changed; connecting again", { server: params.upstream, connections });
+    const result: AuthChangedResult = { connections };
+    return { id, result };
+  }
+
   handleCancelTool(raw: unknown, channel: FrameChannel): void {
     const params = parseCancelToolParams(raw);
     if (params !== null) this._attachments.get(channel)?.calls.get(params.callId)?.abort(new Error("Request cancelled"));
@@ -200,7 +212,8 @@ export class InstanceHost {
       .sort((a, b) => a.serverName.localeCompare(b.serverName));
   }
 
-  async close(): Promise<void> {
+  /** Closes every instance and connection, letting refreshes save their tokens for a moment, never longer than `maxSaveWaitMs`. */
+  async close(maxSaveWaitMs: number): Promise<void> {
     this._stopping = true;
     for (const attachment of this._attachments.values()) {
       for (const controller of attachment.calls.values()) controller.abort(new Error("daemon shutdown"));
@@ -210,7 +223,7 @@ export class InstanceHost {
     this._entries.clear();
     for (const entry of entries) clearTimeout(entry.idleTimer);
     await Promise.allSettled(entries.map(async (entry) => (await entry.opening).close()));
-    await this._pool.close();
+    await this._pool.close(maxSaveWaitMs);
   }
 
   /** `fresh` when the config was loaded for this open, so it needn't be read again. */

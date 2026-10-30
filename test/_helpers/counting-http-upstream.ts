@@ -16,10 +16,22 @@ export const ECHOED = [{ type: "text", text: "called echo {}" }];
 export interface CountingUpstreamOptions {
   era?: ProtocolEra;
   instructions?: string;
-  /** Require a bearer token issued by this server's own rotating authorization server. */
+  /**
+   * Require a bearer token issued by this server's own authorization server,
+   * which rotates refresh tokens, approves every `/authorize` request at once
+   * and registers any client at `/register`.
+   */
   oauth?: boolean;
   /** Serve HTTPS with this key and certificate. */
   tls?: { key: string; cert: string };
+}
+
+/** What a token request carried. */
+export interface TokenRequest {
+  grantType: string | null;
+  clientId: string | null;
+  clientSecret: string | null;
+  refreshToken: string | null;
 }
 
 export interface CountingUpstream {
@@ -34,12 +46,21 @@ export interface CountingUpstream {
   /** The Authorization header of every MCP request, in order. */
   authorizations: () => Array<string | undefined>;
   tokenRequests: () => number;
+  /** Every token request, in order. */
+  tokenRequestLog: () => TokenRequest[];
+  /** While set, responses to refreshes wait; clearing it sends the ones held. The refresh itself takes effect on arrival. */
+  holdRefreshResponses: (hold: boolean) => void;
+  heldRefreshResponses: () => number;
+  /** While set, every MCP request is refused, whatever its access token. */
+  refuseEveryAccessToken: (refuse: boolean) => void;
+  /** MCP requests answered 401. */
+  unauthorizedResponses: () => number;
   /** Ends every legacy session: requests naming one get 404 from now on. */
   endSessions: () => Promise<void>;
   /** Answers health checks (`ping`, and `server/discover` once connected) with HTTP 500 while set. */
   failHealthChecks: (fail: boolean) => void;
-  /** Refuses the current access token, so the client has to refresh. */
-  expireAccessToken: () => void;
+  /** Refuses every access token issued so far, so the client has to refresh. */
+  expireAccessTokens: () => void;
   /** While false, drops open connections and every new one, as an unreachable server would. */
   setReachable: (reachable: boolean) => void;
   /** Connections from clients that are still open. */
@@ -69,6 +90,11 @@ interface Inbound {
   id?: unknown;
 }
 
+function withRegistration(metadata: Record<string, unknown>, base: string): Record<string, unknown> {
+  if (!("token_endpoint" in metadata)) return metadata;
+  return { ...metadata, registration_endpoint: `${base}/register`, token_endpoint_auth_methods_supported: ["client_secret_post", "none"] };
+}
+
 function messagesOf(body: Buffer): Inbound[] {
   try {
     const parsed: unknown = JSON.parse(body.toString("utf8"));
@@ -87,10 +113,16 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
   let cancellations = 0;
   let failingHealth = false;
   let reachable = true;
-  let tokenRequests = 0;
+  const tokenLog: TokenRequest[] = [];
+  const held: Array<() => void> = [];
+  const codes = new Set<string>();
+  let holdingRefreshes = false;
+  let unauthorized = 0;
+  let registered = 0;
   let issued = 0;
-  let refreshToken = "rt-0";
-  let accessToken = "at-0";
+  const accessTokens = new Set(["at-0"]);
+  const refreshTokens = new Set(["rt-0"]);
+  let refusing = false;
   const onCancelled = () => cancellations++;
   const modern = createMcpHandler(() => toolServer(onCancelled, instructions));
 
@@ -126,16 +158,40 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
       res.end(JSON.stringify(payload));
     };
     const metadata = oauth ? oauthMetadataFor(url.pathname, base) : undefined;
-    if (metadata !== undefined) return json(200, metadata);
+    if (metadata !== undefined) return json(200, withRegistration(metadata, base));
+    if (oauth && url.pathname === "/authorize") {
+      const code = `code-${randomUUID()}`;
+      codes.add(code);
+      const back = new URL(url.searchParams.get("redirect_uri")!);
+      back.searchParams.set("code", code);
+      back.searchParams.set("state", url.searchParams.get("state") ?? "");
+      res.writeHead(302, { location: back.href });
+      return res.end();
+    }
+    if (oauth && url.pathname === "/register" && req.method === "POST") {
+      registered++;
+      return json(201, { ...JSON.parse(body.toString("utf8")), client_id: `registered-${registered}` });
+    }
     if (oauth && url.pathname === "/token") {
-      tokenRequests++;
-      if (new URLSearchParams(body.toString("utf8")).get("refresh_token") !== refreshToken) {
-        return json(400, { error: "invalid_grant", error_description: "refresh token already used" });
+      const form = new URLSearchParams(body.toString("utf8"));
+      tokenLog.push({
+        grantType: form.get("grant_type"),
+        clientId: form.get("client_id"),
+        clientSecret: form.get("client_secret"),
+        refreshToken: form.get("refresh_token"),
+      });
+      const refreshing = form.get("grant_type") === "refresh_token";
+      const granted = refreshing ? refreshTokens.delete(form.get("refresh_token") ?? "") : codes.delete(form.get("code") ?? "");
+      if (granted) {
+        issued++;
+        accessTokens.add(`at-${issued}`);
+        refreshTokens.add(`rt-${issued}`);
       }
-      issued++;
-      refreshToken = `rt-${issued}`;
-      accessToken = `at-${issued}`;
-      return json(200, { access_token: accessToken, token_type: "Bearer", refresh_token: refreshToken, expires_in: 3600 });
+      const tokens = { access_token: `at-${issued}`, token_type: "Bearer", refresh_token: `rt-${issued}`, expires_in: 3600 };
+      const refused = { error: "invalid_grant", error_description: refreshing ? "refresh token already used" : "authorization code already used" };
+      const respond = () => (granted ? json(200, tokens) : json(400, refused));
+      if (holdingRefreshes && refreshing) return void held.push(respond);
+      return respond();
     }
     if (url.pathname !== "/mcp") {
       res.writeHead(404);
@@ -145,7 +201,8 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
     const methods = messages.map((m) => m.method);
     for (const method of methods) counts.set(method, (counts.get(method) ?? 0) + 1);
     authorizations.push(req.headers.authorization);
-    if (oauth && req.headers.authorization !== `Bearer ${accessToken}`) {
+    if (oauth && (refusing || !accessTokens.has(req.headers.authorization?.replace(/^Bearer /, "") ?? ""))) {
+      unauthorized++;
       res.writeHead(401, { "www-authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"` });
       return res.end();
     }
@@ -179,7 +236,17 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
     sessions: () => sessionCount,
     cancellations: () => cancellations,
     authorizations: () => [...authorizations],
-    tokenRequests: () => tokenRequests,
+    tokenRequests: () => tokenLog.length,
+    tokenRequestLog: () => [...tokenLog],
+    holdRefreshResponses: (hold) => {
+      holdingRefreshes = hold;
+      if (!hold) for (const respond of held.splice(0)) respond();
+    },
+    heldRefreshResponses: () => held.length,
+    refuseEveryAccessToken: (refuse) => {
+      refusing = refuse;
+    },
+    unauthorizedResponses: () => unauthorized,
     endSessions: async () => {
       const ended = [...sessions.values()];
       sessions.clear();
@@ -188,8 +255,8 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
     failHealthChecks: (fail) => {
       failingHealth = fail;
     },
-    expireAccessToken: () => {
-      accessToken = `expired-${randomUUID()}`;
+    expireAccessTokens: () => {
+      accessTokens.clear();
     },
     openSockets: () => openSockets,
     setReachable: (value) => {

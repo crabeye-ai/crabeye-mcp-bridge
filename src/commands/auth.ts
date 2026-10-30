@@ -65,6 +65,8 @@ export interface AuthCommandDeps {
   openBrowser?: typeof openBrowser;
   /** Inject for testing RFC 9728 probes in `--list`. */
   discoverProtectedResource?: typeof discoverOAuthProtectedResourceMetadata;
+  /** Tells a running manager the server's credentials changed, without starting one. When omitted, no manager is told. */
+  tellManagerAuthChanged?: (server: string, opts: { signal?: AbortSignal }) => Promise<void>;
 }
 
 function defaultPrint(line: string): void {
@@ -323,6 +325,7 @@ export async function runAuthRemove(
     if (removed.includes(clientKey)) parts.push("registered client");
     if (removed.includes(issuerKey)) parts.push("authorization-server binding");
     print(`Removed local ${parts.join(" + ")} for "${canonical}"`);
+    await tellManagerQuietly(canonical, deps);
     return 0;
   } catch (err) {
     errPrint(`Error: ${formatErr(err)}`);
@@ -397,6 +400,15 @@ export async function runAuthLogin(
   opts: { configPath?: string; serverName: string },
   deps: AuthCommandDeps & { signal?: AbortSignal } = {},
 ): Promise<number> {
+  const { code, authenticatedServer } = await authorize(opts, deps);
+  if (authenticatedServer !== undefined) await tellManagerQuietly(authenticatedServer, deps);
+  return code;
+}
+
+async function authorize(
+  opts: { configPath?: string; serverName: string },
+  deps: AuthCommandDeps & { signal?: AbortSignal },
+): Promise<{ code: number; authenticatedServer?: string }> {
   const print = deps.print ?? defaultPrint;
   const errPrint = deps.errPrint ?? defaultErrPrint;
 
@@ -414,7 +426,7 @@ export async function runAuthLogin(
         `Error: server "${opts.serverName}" is not configured or is not an HTTP upstream.\n` +
         `  OAuth via \`auth <server>\` requires an HTTP/streamable-http server.`,
       );
-      return 1;
+      return { code: 1 };
     }
 
     const store = deps.store ?? new CredentialStore({ keychain: createKeychainAdapter() });
@@ -431,6 +443,7 @@ export async function runAuthLogin(
       serverName,
       authConfig?.clientSecret,
       store,
+      process.env,
     );
 
     const startFn = deps.startCallbackServer ?? startCallbackServer;
@@ -472,9 +485,9 @@ export async function runAuthLogin(
       fetchFn: tokenEndpointFetch,
     });
     if (first === "AUTHORIZED") {
-      // Already authorized via cached tokens — nothing more to do.
+      // Already authorized via cached tokens, possibly just refreshed.
       print(`Already authenticated as "${serverName}"`);
-      return 0;
+      return { code: 0, authenticatedServer: serverName };
     }
 
     // first === "REDIRECT": SDK invoked onRedirect; wait for the callback.
@@ -491,7 +504,7 @@ export async function runAuthLogin(
         `Error: OAuth flow did not initialize state — internal error.\n` +
         `  Re-run \`${APP_NAME} auth ${serverName}\`.`,
       );
-      return 1;
+      return { code: 1 };
     }
     if (!constantTimeEquals(expected, callback.state)) {
       errPrint(
@@ -499,7 +512,7 @@ export async function runAuthLogin(
         `  This usually means the authorization flow was interrupted or a stale\n` +
         `  callback arrived. Re-run \`${APP_NAME} auth ${serverName}\`.`,
       );
-      return 1;
+      return { code: 1 };
     }
 
     assertCallbackIssuerWithoutMetadata(provider.discoveryState(), callback.iss);
@@ -513,7 +526,7 @@ export async function runAuthLogin(
 
     if (result !== "AUTHORIZED") {
       errPrint("Error: authorization did not complete");
-      return 1;
+      return { code: 1 };
     }
 
     const stored = await provider.tokens();
@@ -523,10 +536,10 @@ export async function runAuthLogin(
       const expiresAt = Math.floor(Date.now() / 1000) + stored.expires_in;
       print(`  Expires: ${formatExpiry(expiresAt)}`);
     }
-    return 0;
+    return { code: 0, authenticatedServer: serverName };
   } catch (err) {
     errPrint(`Error: ${formatErr(err)}`);
-    return 1;
+    return { code: 1 };
   } finally {
     if (handle) {
       try {
@@ -540,6 +553,14 @@ export async function runAuthLogin(
         errPrint(`warning: failed to close callback listener: ${message}`);
       }
     }
+  }
+}
+
+async function tellManagerQuietly(server: string, deps: AuthCommandDeps & { signal?: AbortSignal }): Promise<void> {
+  try {
+    await deps.tellManagerAuthChanged?.(server, { signal: deps.signal });
+  } catch {
+    // ignore
   }
 }
 

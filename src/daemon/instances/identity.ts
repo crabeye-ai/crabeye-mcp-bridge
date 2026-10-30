@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { HttpServerConfig } from "../../config/schema.js";
 import { MASTER_KEY_ENV } from "../../credentials/keychain.js";
+import { clientSecretEnvName } from "../../oauth/client-secret.js";
 import { canonicalize } from "../../upstream/upstream-hash.js";
 import { credentialEnv, networkSettings, type NetworkSettings } from "../instance-env.js";
 import type { InstanceSource } from "../protocol.js";
@@ -15,15 +16,20 @@ export interface HttpUpstreamIdentity {
   key: string;
   /** How that connection is made. */
   network: NetworkSettings;
+  /** The client's variables that connection reads, each of them part of `key`. */
+  env: Record<string, string>;
 }
 
 /**
  * Headers are compared as configured: within one daemon, the same templates
  * and master key resolve to the same values. The network settings count,
- * since they decide how the connection is made; timing settings don't.
+ * since they decide how the connection is made, and so does the value of the
+ * variable `_bridge.auth.clientSecret` names; timing settings don't.
  */
 export function httpUpstreamIdentity(name: string, config: HttpServerConfig, env: Record<string, string>): HttpUpstreamIdentity {
   const network = networkSettings(env);
+  const secretName = clientSecretEnvName(config._bridge?.auth?.clientSecret);
+  const clientSecretEnv = secretName !== undefined && env[secretName] !== undefined ? { [secretName]: env[secretName] } : {};
   const key = digest({
     name,
     transport: config.type === "sse" ? "sse" : "streamable-http",
@@ -31,9 +37,10 @@ export function httpUpstreamIdentity(name: string, config: HttpServerConfig, env
     headers: config.headers ?? {},
     auth: config._bridge?.auth ?? null,
     masterKey: env[MASTER_KEY_ENV] ?? null,
+    clientSecretEnv,
     network,
   });
-  return { key, network };
+  return { key, network, env: clientSecretEnv };
 }
 
 function digest(value: unknown): string {

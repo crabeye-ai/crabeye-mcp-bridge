@@ -2,7 +2,7 @@
 
 The STDIO manager is a per-user background process the bridge spawns automatically. It owns every STDIO upstream MCP server and lets multiple bridges share one subprocess per upstream — so running Claude Desktop, Cursor, and a CLI bridge against the same Linear MCP server doesn't spawn three copies of the Linear MCP server.
 
-The manager also connects the HTTP and SSE upstreams that have no `_bridge.auth`, once for every bridge that uses them (see [HTTP and SSE upstreams](#http-and-sse-upstreams)). There is no inline fallback for either kind: when the manager can't be started or reached, those upstreams fail to connect and say why, and the bridge keeps trying.
+The manager also connects every HTTP and SSE upstream, once for every bridge that uses them (see [HTTP and SSE upstreams](#http-and-sse-upstreams)). There is no inline fallback for either kind: when the manager can't be started or reached, those upstreams fail to connect and say why, and the bridge keeps trying.
 
 ## Why it exists
 
@@ -26,7 +26,7 @@ The bridge dedupes config entries by `upstreamHash` locally — duplicate identi
 
 ## HTTP and SSE upstreams
 
-The manager connects every HTTP and SSE upstream without `_bridge.auth`, including servers you authorized with `crabeye-mcp-bridge auth <server>` and no config change. Upstreams with `_bridge.auth` are still connected by each bridge.
+The manager connects every HTTP and SSE upstream, including servers you authorized with `crabeye-mcp-bridge auth <server>` and no config change.
 
 Bridges that load the same config share the manager's copy of it: the same `--config` file (or `MCP_BRIDGE_CONFIG`), or, without either, the default set made of `~/.crabeye-mcp-bridge/config.json` and the client config files it lists. A bridge whose MCP entry sets different values for any of these variables gets its own copy, so it never uses another client's credentials or network settings:
 
@@ -46,17 +46,19 @@ The manager runs without `NODE_OPTIONS`. A bridge whose Node options would chang
 
 The manager's own `OPENSSL_CONF`, from the client whose bridge started it, applies to every client. Its `SSL_CERT_DIR`, on Node builds that read it, applies only to clients whose certificate settings are the same as its own and that set no `SSL_CERT_FILE`. On Linux, the system's certificates are read with the manager's own `SSL_CERT_FILE` and `SSL_CERT_DIR`.
 
-Each upstream gets one connection for all of these bridges. Two entries share a connection, even across configs, if they have the same server name, transport, URL, headers (as written, before `${credential:…}` is filled in), master key and network settings. A server on the 2026-07-28 protocol sees one client, and a server on an earlier protocol sees one session. When a server ends that session, the manager starts one new session for everyone once the connection closes or three health checks in a row fail.
+Each upstream gets one connection for all of these bridges. Two entries share a connection, even across configs, if they have the same server name, transport, URL, headers (as written, before `${credential:…}` is filled in), `_bridge.auth` settings, master key, value of the variable their `clientSecret` names, and network settings. A server on the 2026-07-28 protocol sees one client, and a server on an earlier protocol sees one session. When a server ends that session, the manager starts one new session for everyone once the connection closes or three health checks in a row fail.
 
 The manager:
 
 * reads the config files, the credential store and the keychain itself, and fills in `${credential:…}` header values on every connect, so a changed credential is used from the next connect on;
 * checks each connection's health once, with the `healthCheckInterval` of the longest-standing config using it and the reconnect settings of the config that first needed it;
-* uses and refreshes stored OAuth tokens for every bridge at once, so clients no longer each refresh an expired token, and pauses an upstream that needs authorization for every bridge at once;
+* uses and refreshes stored OAuth tokens for every bridge at once, so clients don't each refresh an expired token, even when their settings give them separate connections to the server, and pauses an upstream that needs authorization for every bridge at once;
+* reads a `clientSecret` from the variables of the client the connection is for, never from its own environment;
+* connects a server again for every bridge as soon as `crabeye-mcp-bridge auth <server>` or `auth --remove <server>` changes its stored credentials;
 * follows edits to the files it loaded (the `--config` file, or the client config files), applying a change once for every bridge;
 * reads the config again whenever another bridge starts using it.
 
-When an HTTP or SSE server's URL or headers change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server or gives it `_bridge.auth`, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Everything else in that file takes effect for each client when that client restarts.
+When an HTTP or SSE server's URL, headers or `_bridge.auth` change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Everything else in that file takes effect for each client when that client restarts.
 
 What `search_tools` and `run_tool` show doesn't change: each bridge still applies its own tool policy, rate limits and passthrough settings. Cancelling a call cancels it at the server, and each server's instructions reach every client.
 
@@ -146,7 +148,7 @@ Bridge has hot-reload: it reads the saved config and reconciles upstream session
 
    This is the only case where you need to invoke the `daemon` CLI manually.
 
-For HTTP and SSE upstreams the manager connects, it applies the edit itself, once for every bridge: a changed URL or header reconnects the server, and an added or removed server appears or goes away for every client.
+For HTTP and SSE upstreams the manager connects, it applies the edit itself, once for every bridge: a changed URL, header or `_bridge.auth` reconnects the server, and an added or removed server appears or goes away for every client.
 
 ### Where do paths live?
 
@@ -199,7 +201,7 @@ The log records:
 * a start that fails, with the error, and a start that finds a manager already running and leaves it to serve;
 * waiting for a previous manager to exit, and taking over from one that is no longer running;
 * sessions opening, closing (and why), and being refused (and why);
-* bridges attaching to and detaching from a config, a config that can't be loaded (and why), and servers added, removed or reconnected after an edit;
+* bridges attaching to and detaching from a config, a config that can't be loaded (and why), servers added, removed or reconnected after an edit, and servers connected again after `crabeye-mcp-bridge auth` or `auth --remove`;
 * HTTP and SSE upstreams connecting, failing to connect, being paused for authorization, failing health checks, and their other warnings;
 * STDIO servers starting, exiting on their own (with their exit code or signal), and being stopped (idle, not answering pings, restarted, or shutting down).
 

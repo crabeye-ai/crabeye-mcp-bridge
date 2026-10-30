@@ -3,7 +3,9 @@ import { HttpServerConfigSchema } from "../../../src/config/schema.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
 import type { Logger } from "../../../src/logging/index.js";
 import { networkSettings } from "../../../src/daemon/instance-env.js";
-import { HttpUpstreamPool, type PooledUpstreamListener, type PooledUpstreamSpec } from "../../../src/daemon/instances/http-upstream-pool.js";
+import { HttpUpstreamPool, PooledUpstream, STOP_SAVE_WAIT_MS, type CreateHttpClient, type PooledUpstreamListener, type PooledUpstreamSpec } from "../../../src/daemon/instances/http-upstream-pool.js";
+import { ConnectionSupersededError } from "../../../src/upstream/types.js";
+import { settledWithin } from "../../_helpers/processes.js";
 import { ScriptedUpstreamClient, tool } from "../../_helpers/scripted-upstream-client.js";
 import { spyLogger, type SpyLogger } from "../../_helpers/spy-logger.js";
 
@@ -18,6 +20,7 @@ function spec(overrides: Partial<PooledUpstreamSpec> = {}): PooledUpstreamSpec {
     reconnect: {},
     healthCheckIntervalSec: 0,
     network: networkSettings({}),
+    env: {},
     ...overrides,
   };
 }
@@ -37,18 +40,21 @@ describe("HttpUpstreamPool", () => {
   let daemonLog: SpyLogger;
   let created: ScriptedUpstreamClient[];
   let clientLoggers: Logger[];
+  let clientDeps: Array<Parameters<CreateHttpClient>[2]>;
   let pool: HttpUpstreamPool;
 
   beforeEach(() => {
     daemonLog = spyLogger();
     created = [];
     clientLoggers = [];
+    clientDeps = [];
     pool = new HttpUpstreamPool({
       logger: daemonLog,
       createClient: (name, _config, deps) => {
         const client = new ScriptedUpstreamClient(name);
         created.push(client);
         clientLoggers.push(deps.logger);
+        clientDeps.push(deps);
         return client;
       },
     });
@@ -56,7 +62,8 @@ describe("HttpUpstreamPool", () => {
 
   afterEach(async () => {
     vi.useRealTimers();
-    await pool.close();
+    vi.restoreAllMocks();
+    await pool.close(0);
   });
 
   it("shares one connection between leases with the same key and closes it with the last one", async () => {
@@ -167,6 +174,24 @@ describe("HttpUpstreamPool", () => {
     expect(context.error.length).toBeLessThan(1_100);
   });
 
+  it("doesn't log a first connect that a reconnect or close replaced as failing", async () => {
+    pool = new HttpUpstreamPool({
+      logger: daemonLog,
+      createClient: (name) => {
+        const client = new ScriptedUpstreamClient(name);
+        client.attempt = () => Promise.reject(new ConnectionSupersededError(name));
+        created.push(client);
+        return client;
+      },
+    });
+
+    pool.acquire(spec());
+    await vi.waitFor(() => expect(created[0]!.status).toBe("disconnected"));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(daemonLog.warn.mock.calls.filter(([message]) => String(message).startsWith("failed to connect"))).toEqual([]);
+  });
+
   it("keeps its own connect failures and authorization pauses in the daemon log, since each bridge logs them itself", async () => {
     pool = new HttpUpstreamPool({
       logger: daemonLog,
@@ -264,10 +289,141 @@ describe("HttpUpstreamPool", () => {
     expect(ping).toHaveBeenCalledTimes(1);
   });
 
+  it("gives every connection the same shared refreshes and the environment of the instance that opened it", () => {
+    pool.acquire(spec({ env: { NOTION_OAUTH_SECRET: "a" } }));
+    pool.acquire(spec({ key: "k2", name: "other", env: { NOTION_OAUTH_SECRET: "b" } }));
+
+    expect(clientDeps.map((deps) => deps.env)).toEqual([{ NOTION_OAUTH_SECRET: "a" }, { NOTION_OAUTH_SECRET: "b" }]);
+    expect(clientDeps[0]!.refreshes).toBeDefined();
+    expect(clientDeps[1]!.refreshes).toBe(clientDeps[0]!.refreshes);
+  });
+
+  it("connects every connection to the named upstream again, connected or not, telling each it was replaced, and nothing else", async () => {
+    pool.acquire(spec());
+    pool.acquire(spec({ key: "k2" }));
+    pool.acquire(spec({ key: "k3", name: "other" }));
+    await vi.waitFor(() => expect(created.map((c) => c.status)).toEqual(["connected", "connected", "connected"]));
+    created[1]!.setStatus("auth_required");
+    let finish!: () => void;
+    created[0]!.attempt = () => new Promise<void>((resolve) => (finish = resolve)).then(() => created[0]!.setStatus("connected"));
+
+    let settled = false;
+    const reconnecting = pool.credentialsChanged("svc").then((count) => {
+      settled = true;
+      return count;
+    });
+    await vi.waitFor(() => expect(created[1]!.status).toBe("connected"));
+    expect(settled).toBe(false);
+    finish();
+
+    expect(await reconnecting).toBe(2);
+    expect(created.map((c) => c.reconnects)).toEqual([1, 1, 0]);
+    expect(created.map((c) => c.authRetirements)).toEqual([1, 1, 0]);
+  });
+
+  it("reconnects nothing, and says so, for a name it has no connection to", async () => {
+    pool.acquire(spec());
+    expect(await pool.credentialsChanged("missing")).toBe(0);
+    expect(created[0]!.reconnects).toBe(0);
+  });
+
+  it("settles a reconnect whose attempt fails", async () => {
+    pool.acquire(spec());
+    created[0]!.attempt = () => Promise.reject(new Error("refused"));
+
+    expect(await pool.credentialsChanged("svc")).toBe(1);
+    expect(created[0]!.status).toBe("disconnected");
+  });
+
+  it("gives each connection its own count of refreshes whose tokens aren't saved yet", () => {
+    pool.acquire(spec());
+    pool.acquire(spec({ key: "k2" }));
+
+    expect(clientDeps[0]!.pendingSaves).toBeDefined();
+    expect(clientDeps[1]!.pendingSaves).not.toBe(clientDeps[0]!.pendingSaves);
+  });
+
+  it("closes a released connection's client at once, and finishes closing only once its refreshes saved their tokens", async () => {
+    const lease = pool.acquire(spec());
+    const settle = clientDeps[0]!.pendingSaves.track();
+    lease.release();
+    const closing = pool.close(10_000);
+
+    await vi.waitFor(() => expect(created[0]!.closed).toBe(true));
+    expect(await settledWithin(closing, 100)).toBe(false);
+    expect(created[0]!.authRetirements).toBe(0);
+    settle();
+
+    await closing;
+    expect(created[0]!.authRetirements).toBe(1);
+  });
+
+  it("keeps connections still closing from changing stored credentials when told those of their upstream changed, and only those", async () => {
+    const [svc, other] = [pool.acquire(spec()), pool.acquire(spec({ key: "k2", name: "other" }))];
+    const settles = [clientDeps[0]!.pendingSaves.track(), clientDeps[1]!.pendingSaves.track()];
+    svc.release();
+    other.release();
+
+    expect(await pool.credentialsChanged("svc")).toBe(0);
+
+    expect(created.map((c) => c.authRetirements)).toEqual([1, 0]);
+    for (const settle of settles) settle();
+  });
+
+  it("stops waiting for refreshes to save after the time it was given when the manager stops", async () => {
+    pool.acquire(spec());
+    clientDeps[0]!.pendingSaves.track();
+    const startedAt = Date.now();
+
+    await pool.close(200);
+
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(190);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it("lets a connection a reload or idle close is closing wait longer than a stopping manager would for its refreshes to save", async () => {
+    vi.useFakeTimers();
+    const closing = vi.spyOn(PooledUpstream.prototype, "close");
+    const lease = pool.acquire(spec());
+    const settle = clientDeps[0]!.pendingSaves.track();
+    lease.release();
+    let closed = false;
+    void (closing.mock.results[0]!.value as Promise<void>).then(() => (closed = true));
+
+    await vi.advanceTimersByTimeAsync(STOP_SAVE_WAIT_MS + 1);
+    expect(closed).toBe(false);
+    settle();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(closed).toBe(true);
+  });
+
+  it("caps the save wait of a connection a reload or idle close is already closing when the manager stops", async () => {
+    const lease = pool.acquire(spec());
+    clientDeps[0]!.pendingSaves.track();
+    lease.release();
+
+    expect(await settledWithin(pool.close(50), 1_000)).toBe(true);
+  });
+
+  it("waits no longer than a stopping manager may for refreshes to save, however long it was given", async () => {
+    vi.useFakeTimers();
+    pool.acquire(spec());
+    clientDeps[0]!.pendingSaves.track();
+    let closed = false;
+    void pool.close(10_000).then(() => (closed = true));
+
+    await vi.advanceTimersByTimeAsync(STOP_SAVE_WAIT_MS - 1);
+    expect(closed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(closed).toBe(true);
+  });
+
   it("closes every connection on close", async () => {
     pool.acquire(spec());
     pool.acquire(spec({ key: "k2" }));
-    await pool.close();
+    await pool.close(0);
     expect(created.map((c) => c.closed)).toEqual([true, true]);
     expect(pool.upstreams()).toEqual([]);
   });

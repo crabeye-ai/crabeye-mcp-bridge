@@ -6,21 +6,7 @@ import {
   GlobalBridgeConfigSchema,
   PassthroughLevelSchema,
   RateLimitConfigOrDisabledSchema,
-  ServerConfigSchema,
-  isDaemonHosted,
 } from "../../src/config/schema.js";
-
-describe("isDaemonHosted", () => {
-  it.each([
-    ["an HTTP server", { url: "https://mcp.example.com/mcp" }, true],
-    ["an SSE server", { type: "sse", url: "https://mcp.example.com/sse" }, true],
-    ["an HTTP server with other _bridge settings", { url: "https://mcp.example.com/mcp", _bridge: { category: "x" } }, true],
-    ["an HTTP server with _bridge.auth", { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } }, false],
-    ["a STDIO server", { command: "node" }, false],
-  ])("is %s daemon-hosted: %s", (_label, server, expected) => {
-    expect(isDaemonHosted(ServerConfigSchema.parse(server))).toBe(expected);
-  });
-});
 
 describe("config — removed sharing settings", () => {
   it.each(["auto", "shared", "dedicated", "bogus", 42])("ServerBridgeConfigSchema still accepts sharing %j", (sharing) => {

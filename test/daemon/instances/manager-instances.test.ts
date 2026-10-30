@@ -3,7 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgeConfigSchema } from "../../../src/config/schema.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
+import { tellManagerAuthChanged } from "../../../src/daemon/auth-changed.js";
 import { DaemonClient } from "../../../src/daemon/client.js";
+import { InstanceHost } from "../../../src/daemon/instances/instance-host.js";
 import { ManagerDaemon } from "../../../src/daemon/manager.js";
 import { netTransport } from "../../../src/daemon/net-transport.js";
 import { INSTANCE_BRIDGE_PROTOCOL_VERSION, type DaemonNotification, type StatusResult } from "../../../src/daemon/protocol.js";
@@ -18,12 +20,13 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
   let clients: ScriptedUpstreamClient[];
   const bridges: DaemonClient[] = [];
 
-  function start(idleMs = 60_000): Promise<void> {
+  function start(idleMs = 60_000, killGraceMs?: number): Promise<void> {
     manager = new ManagerDaemon({
       socketPath: join(dir, "m.sock"),
       pidPath: join(dir, "m.pid"),
       lockPath: join(dir, "m.lock"),
       idleMs,
+      killGraceMs,
       transport: netTransport,
       _instances: {
         loadConfig: async () => ({
@@ -62,6 +65,7 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
   afterEach(async () => {
     for (const client of bridges.splice(0)) client.close();
     await manager.stop(0).catch(() => {});
+    vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -91,6 +95,20 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
     await vi.waitFor(() => expect(clients[0]!.calls).toHaveLength(2));
     client.sendNotification("CANCEL_TOOL", { callId: "2" });
     await expect(slow).rejects.toThrow("Request cancelled");
+  });
+
+  it("reconnects a server when told its credentials changed, by a connection that never attached", async () => {
+    await start();
+    const { client } = await bridge();
+    await client.call("ATTACH", attachParams);
+    clients[0]!.setStatus("auth_required", new Error("needs auth"));
+    const control = await bridge();
+
+    expect(await control.client.call("AUTH_CHANGED", { upstream: "svc" })).toEqual({ connections: 1 });
+    expect(clients[0]!.status).toBe("connected");
+
+    await tellManagerAuthChanged("svc", { socketPath: join(dir, "m.sock") });
+    expect(clients[0]!.reconnects).toBe(2);
   });
 
   it("answers a reply too large to send with an error instead of leaving the call waiting", async () => {
@@ -127,5 +145,14 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
     await manager.stop(0);
 
     expect(clients[0]!.closed).toBe(true);
+  });
+
+  it("gives connections no longer than its kill grace to save their refreshes' tokens when it stops", async () => {
+    await start(60_000, 300);
+    const closing = vi.spyOn(InstanceHost.prototype, "close");
+
+    await manager.stop(0);
+
+    expect(closing).toHaveBeenCalledWith(300);
   });
 });

@@ -1,14 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "../src/config/schema.js";
+import { HealthChecks } from "../src/upstream/health-checks.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
-import type {
-  UpstreamClient,
-  ConnectionStatus,
-  StatusChangeCallback,
-  ToolsChangedCallback,
+import {
+  ConnectionSupersededError,
+  type UpstreamClient,
+  type ConnectionStatus,
+  type StatusChangeCallback,
+  type ToolsChangedCallback,
 } from "../src/upstream/types.js";
+import { spyLogger } from "./_helpers/spy-logger.js";
 
 function makeTool(name: string): Tool {
   return {
@@ -190,6 +193,25 @@ describe("Health monitoring", () => {
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
 
     await manager.closeAll();
+  });
+
+  it.each([
+    ["logs a reconnect that fails", new Error("refused"), true],
+    ["doesn't log a reconnect whose connect another reconnect or a close replaced", new ConnectionSupersededError("srv"), false],
+  ])("%s", async (_label, failure, logged) => {
+    const mockClient = new MockUpstreamClient("srv", [makeTool("t")]);
+    await mockClient.connect();
+    mockClient.pingFn = () => Promise.reject(new Error("timeout"));
+    mockClient.reconnectFn = () => Promise.reject(failure);
+    const logger = spyLogger();
+    const checks = new HealthChecks({ intervalSec: 10, logger, unhealthyThreshold: 1 });
+    checks.add(mockClient, "srv");
+    checks.start();
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    checks.stop();
+
+    expect(logger.error.mock.calls.some(([message]) => message === "reconnect failed")).toBe(logged);
   });
 
   it("does not reconnect when the third failed ping paused the upstream for authorization", async () => {

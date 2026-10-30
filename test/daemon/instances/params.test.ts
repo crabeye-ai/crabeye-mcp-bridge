@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   parseAttachParams,
+  parseAuthChangedParams,
   parseCallToolParams,
   parseCancelToolParams,
   parseRetryParams,
@@ -78,5 +79,22 @@ describe("parseRetryParams and parseCancelToolParams", () => {
     expect(parseRetryParams(undefined)).toBeNull();
     expect(parseCancelToolParams({ callId: 1 })).toBeNull();
     expect(parseCancelToolParams(null)).toBeNull();
+  });
+});
+
+describe("parseAuthChangedParams", () => {
+  it("accepts a server name", () => {
+    expect(parseAuthChangedParams({ upstream: "svc" })).toEqual({ upstream: "svc" });
+  });
+
+  it.each([
+    ["no params", undefined],
+    ["no server", {}],
+    ["an empty name", { upstream: "" }],
+    ["a name that isn't a string", { upstream: 1 }],
+    ["a name over 256 bytes", { upstream: "é".repeat(129) }],
+    ["an array", ["svc"]],
+  ])("refuses %s", (_label, raw) => {
+    expect(parseAuthChangedParams(raw)).toBeNull();
   });
 });

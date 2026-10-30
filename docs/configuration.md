@@ -40,7 +40,7 @@ Remote servers accessible via HTTP:
 
 > **Deprecation.** The HTTP+SSE transport was superseded by Streamable HTTP in the MCP 2025-03-26 spec, and the MCP SDK now marks it deprecated. The bridge plans to remove `"sse"` support on **2027-07-28** (tracked in #201). If your server offers both, prefer `"streamable-http"` now.
 
-HTTP and SSE upstreams without `_bridge.auth` are connected by the per-user manager, once for every bridge that uses them with the same master key and network settings, so a server usually sees one connection however many AI clients are open; see [stdio-manager.md](stdio-manager.md#http-and-sse-upstreams). Upstreams with `_bridge.auth` are connected by each bridge, as are the HTTP and SSE upstreams of a bridge from crabeye 1.3.0 or earlier. A bridge starts the manager as soon as its config has an upstream.
+HTTP and SSE upstreams are connected by the per-user manager, once for every bridge that uses them with the same master key, network settings and value of the variable a `clientSecret` names, so a server usually sees one connection however many AI clients are open; see [stdio-manager.md](stdio-manager.md#http-and-sse-upstreams). A bridge from crabeye 1.3.0 or earlier still connects its HTTP and SSE upstreams itself. A bridge starts the manager as soon as its config has an upstream.
 
 ### OAuth-authenticated HTTP servers
 

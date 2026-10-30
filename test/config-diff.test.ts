@@ -68,26 +68,23 @@ describe("diffConfigs", () => {
       expect(diff.servers.reconnect).toHaveLength(1);
     });
 
-    it("reconnects an HTTP server that gains _bridge.auth, since each bridge connects it from then on", () => {
-      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp" } });
-      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } });
-
-      const diff = diffConfigs(oldCfg, newCfg);
+    it.each([
+      ["gains _bridge.auth", undefined, { type: "oauth2" }],
+      ["loses _bridge.auth", { type: "oauth2" }, undefined],
+      ["changes its scopes", { type: "oauth2" }, { type: "oauth2", scopes: ["read"] }],
+      ["changes its client id", { type: "oauth2", clientId: "a" }, { type: "oauth2", clientId: "b" }],
+      ["changes its client secret", { type: "oauth2", clientSecret: "${A_OAUTH}" }, { type: "oauth2", clientSecret: "${B_OAUTH}" }],
+    ])("reconnects an HTTP server that %s", (_label, before, after) => {
+      const server = (auth: unknown) => ({ url: "https://mcp.example.com/mcp", _bridge: { category: "docs", ...(auth !== undefined && { auth }) } });
+      const diff = diffConfigs(makeConfig({ svc: server(before) }), makeConfig({ svc: server(after) }));
 
       expect(diff.servers.reconnect.map((r) => r.name)).toEqual(["svc"]);
       expect(diff.servers.updated).toEqual([]);
     });
 
-    it("reconnects an HTTP server that loses _bridge.auth, since the daemon connects it from then on", () => {
-      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } });
-      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp" } });
-
-      expect(diffConfigs(oldCfg, newCfg).servers.reconnect.map((r) => r.name)).toEqual(["svc"]);
-    });
-
-    it("still treats a change inside _bridge.auth as metadata", () => {
-      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } });
-      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2", scopes: ["read"] } } } });
+    it("treats a category change of a server with _bridge.auth as metadata", () => {
+      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" }, category: "a" } } });
+      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" }, category: "b" } } });
 
       const diff = diffConfigs(oldCfg, newCfg);
 

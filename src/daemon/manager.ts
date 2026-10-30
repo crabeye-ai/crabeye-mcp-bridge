@@ -569,6 +569,7 @@ export class ManagerDaemon {
       this.publicationTimer = null;
     }
 
+    const closingInstances = this.instances.close(this.killGraceMs());
     // Tear down all sessions before dropping connections so children get
     // a clean kill and the tracker is up-to-date.
     const sessionIds = Array.from(this.sessions.keys());
@@ -579,7 +580,7 @@ export class ManagerDaemon {
     while (this.pendingTeardowns.size > 0) {
       await Promise.allSettled(Array.from(this.pendingTeardowns));
     }
-    await this.instances.close();
+    await closingInstances;
 
     for (const ch of this.connections) {
       try {
@@ -696,6 +697,8 @@ export class ManagerDaemon {
         return this.instances.handleRetry(req.id, req.params, channel);
       case "RESTART":
         return this.handleRestart(req.id, req.params);
+      case "AUTH_CHANGED":
+        return this.instances.handleAuthChanged(req.id, req.params);
       case "PING": {
         const params = req.params as Partial<PingParams> | undefined;
         if (

@@ -10,11 +10,15 @@ import {
   APP_VERSION,
   BRIDGE_CONFIG_FILENAME,
   CREDENTIALS_DIR,
+  CREDENTIALS_FILENAME,
   DAEMON_DIR,
   DAEMON_LOCK_FILENAME,
   DAEMON_RUN_SUBDIR,
   DAEMON_SOCKET_FILENAME,
 } from "../../../src/constants.js";
+import { CredentialStore } from "../../../src/credentials/credential-store.js";
+import { createKeychainAdapter } from "../../../src/credentials/keychain.js";
+import { oauthCredentialKey } from "../../../src/oauth/client-secret.js";
 import { processExists } from "../../../src/process/process-utils.js";
 import { connectBridgeProcess, type BridgeProcess } from "../../_helpers/bridge-process.js";
 import { ECHOED, startCountingUpstream, type CountingUpstream } from "../../_helpers/counting-http-upstream.js";
@@ -136,9 +140,12 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
     });
   });
 
-  it("starts the daemon without the NODE_OPTIONS of the bridge that started it", async () => {
+  it.each([
+    ["without _bridge.auth", {}],
+    ["with _bridge.auth", { _bridge: { auth: { type: "oauth2", clientId: "client-1" } } }],
+  ])("starts the daemon without the NODE_OPTIONS of the bridge that started it, and warns about them, for an upstream %s", async (_label, extra) => {
     const server = await upstream();
-    const configPath = await workspace({ svc: { url: server.url } });
+    const configPath = await workspace({ svc: { url: server.url, ...extra } });
     const marker = join(dir, "marker.cjs");
     const ran = join(dir, "ran.txt");
     await writeFile(marker, `require("node:fs").appendFileSync(${JSON.stringify(ran)}, process.pid + "\\n");`);
@@ -216,6 +223,25 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
 
     expect(server.count("tools/list")).toBe(2);
     expect((await status()).instances).toEqual([{ source: { kind: "file", path: configPath }, bridges: 1, upstreams: ["svc"] }]);
+  });
+
+  it.each(["this version's bridge", "the 1.3.0 bridge"])("shares the stored tokens of an upstream with _bridge.auth with a bridge from crabeye 1.3.0, both working after they expire when %s calls first", async (first) => {
+    const server = await upstream({ oauth: true });
+    const configPath = await workspace({ svc: { url: server.url, _bridge: { auth: { type: "oauth2", clientId: "client-1" } } } });
+    const store = new CredentialStore({ keychain: createKeychainAdapter({ env: { MCP_BRIDGE_MASTER_KEY: MASTER_KEY } }), filePath: join(dir, CREDENTIALS_DIR, CREDENTIALS_FILENAME) });
+    await store.set(oauthCredentialKey("svc"), { type: "oauth2", access_token: "at-0", refresh_token: "rt-0", token_type: "Bearer", issuer: server.issuer });
+    const released = await releasedBridgeAt("1.3.0", join(dir, "crabeye-1.3.0"));
+    const current = await connect(configPath);
+    const old = await connect(configPath, released);
+    expect(await runTool(current, "svc__echo")).toMatchObject({ content: ECHOED });
+    expect(await runTool(old, "svc__echo")).toMatchObject({ content: ECHOED });
+
+    server.expireAccessTokens();
+
+    const order = first === "the 1.3.0 bridge" ? [old, current, old] : [current, old, current];
+    for (const bridge of order) expect(await runTool(bridge, "svc__echo")).toMatchObject({ content: ECHOED });
+    expect(server.tokenRequests()).toBe(1);
+    expect(server.count("tools/list")).toBe(2);
   });
 
   it("replaces a daemon from crabeye 1.3.0 when an HTTP-only config needs one", async () => {

@@ -9,12 +9,13 @@ import type {
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger, methodLabel } from "../logging/index.js";
-import type {
-  UpstreamClient,
-  ConnectionStatus,
-  StatusChangeEvent,
-  StatusChangeCallback,
-  ToolsChangedCallback,
+import {
+  ConnectionSupersededError,
+  type UpstreamClient,
+  type ConnectionStatus,
+  type StatusChangeEvent,
+  type StatusChangeCallback,
+  type ToolsChangedCallback,
 } from "./types.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
@@ -203,11 +204,13 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         await failed.close().catch(() => {});
       }
       this._onTransportClosed();
-      this._setStatus(
-        this._isAuthFailure(err) ? "auth_required" : "disconnected",
-        err instanceof Error ? err : undefined,
-      );
-      throw err;
+      if (!this._isSuperseded(myEpoch)) {
+        this._setStatus(
+          this._isAuthFailure(err) ? "auth_required" : "disconnected",
+          err instanceof Error ? err : undefined,
+        );
+      }
+      throw this._isSuperseded(myEpoch) ? this._supersededError() : err;
     }
   }
 
@@ -272,9 +275,16 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     }
   }
 
+  /**
+   * Abandons a connect in flight, which then reports no status and fails as
+   * superseded for whoever awaits it, and connects again. Calls that were
+   * waiting on the same abandoned connect share the one that replaces it.
+   */
   async reconnect(): Promise<void> {
+    this._epoch++;
     await this._connectPromise?.catch(() => {});
     if (this._closed) return;
+    if (this._connectPromise) return this._connectPromise;
     this._endConnection();
     this._clearReconnectTimer();
     this._epoch++;
@@ -366,7 +376,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   }
 
   private _supersededError(): Error {
-    return new Error(`connection attempt for "${this.name}" was superseded`);
+    return new ConnectionSupersededError(this.name);
   }
 
   /** Subclasses create the real transport here. */

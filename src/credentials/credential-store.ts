@@ -101,10 +101,10 @@ class AsyncMutex {
   }
 }
 
-// Mutating ops (`set`, `delete`, `deleteMany`) are serialized in-process so
-// concurrent read-modify-write cycles cannot lose writes. Reads (`get`,
-// `list`) skip the lock — atomic rename on write means readers always see a
-// self-consistent file (pre- or post-write, never a torn snapshot).
+// Mutating ops are serialized in-process so concurrent read-modify-write
+// cycles cannot lose writes. Reads (`get`, `list`) skip the lock — atomic
+// rename on write means readers always see a self-consistent file (pre- or
+// post-write, never a torn snapshot).
 //
 // Across processes (bridges, CLI commands), each mutating op also holds the
 // store's lock file (`withStoreWriteLock`) for its whole read-modify-write,
@@ -214,6 +214,24 @@ export class CredentialStore {
   ): Promise<ConditionalChange<"replaced">> {
     return this._changeIfStored("replaceIf", key, shouldReplace, "replaced", (credentials) => {
       credentials[key] = credential;
+    });
+  }
+
+  /** Store `credential` under `key` where nothing is stored, or replace what is stored if `shouldReplace` approves, under the store lock. */
+  async setIf(
+    key: string,
+    credential: Credential,
+    shouldReplace: (stored: Credential) => boolean,
+  ): Promise<"added" | "replaced" | "kept"> {
+    this._validateKey(key);
+    return this._mutate("setIf", async (giveUp) => {
+      await this._forgetMasterKeyIfStoreMissing();
+      const { store, masterKey } = await this._openStore(await this._getOrCreateMasterKey());
+      const stored = Object.hasOwn(store.credentials, key) ? store.credentials[key] : undefined;
+      if (stored !== undefined && !shouldReplace(stored)) return "kept";
+      store.credentials[key] = credential;
+      await this._writeStore(store, masterKey, giveUp);
+      return stored === undefined ? "added" : "replaced";
     });
   }
 

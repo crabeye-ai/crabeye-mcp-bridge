@@ -7,11 +7,11 @@ import { oauthCredentialKey } from "../../../src/oauth/client-secret.js";
 import { awaitConnectedClient } from "../../../src/server/upstream-wait.js";
 import { ECHOED, type CountingUpstream } from "../../_helpers/counting-http-upstream.js";
 import { HAS_OPENSSL, selfSignedCertificate } from "../../_helpers/self-signed.js";
-import { LockedKeychain, MASTER_KEY, useSharedHttpFixture, type TestBridge } from "../../_helpers/shared-http-fixture.js";
+import { LockedKeychain, MASTER_KEY, storeOAuth, useSharedHttpFixture, type TestBridge } from "../../_helpers/shared-http-fixture.js";
 
 describe.skipIf(process.platform === "win32")("credentials and network settings of HTTP upstreams shared through daemon instances", { timeout: 30_000 }, () => {
   const fixture = useSharedHttpFixture();
-  const { daemon, upstream, writeJson, bridge, status, storeFor, storeOAuth, credentialsPath } = fixture;
+  const { daemon, upstream, writeJson, bridge, status, storeFor, credentialsPath } = fixture;
 
   async function connectWithStoredHeader(): Promise<{ client: TestBridge; server: CountingUpstream }> {
     const server = await upstream();
@@ -62,7 +62,7 @@ describe.skipIf(process.platform === "win32")("credentials and network settings 
     const [a, b] = [await bridge(config), await bridge(config)];
     expect(await a.call("svc")).toEqual(ECHOED);
 
-    server.expireAccessToken();
+    server.expireAccessTokens();
 
     expect(await Promise.all([a.call("svc"), b.call("svc")])).toEqual([ECHOED, ECHOED]);
     expect(server.tokenRequests()).toBe(1);
@@ -79,7 +79,7 @@ describe.skipIf(process.platform === "win32")("credentials and network settings 
     const clients = [await bridge(config), await bridge(config), await bridge(config)];
     expect(await clients[0]!.call("svc")).toEqual(ECHOED);
 
-    server.expireAccessToken();
+    server.expireAccessTokens();
     const results = await Promise.all(clients.flatMap((each) => [each.call("svc"), each.call("svc"), each.call("svc")]));
 
     expect(results).toEqual(Array(9).fill(ECHOED));

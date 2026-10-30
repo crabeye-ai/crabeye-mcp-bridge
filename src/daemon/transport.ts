@@ -4,6 +4,7 @@ import { FrameDecoder, encodeFrame, FrameError } from "./protocol.js";
 
 export interface FrameChannel extends EventEmitter {
   send(payload: unknown): boolean;
+  /** Sends what is queued, then closes; once it has, the connection no longer keeps the process alive. */
   close(): void;
   readonly remote: string;
 }
@@ -90,7 +91,7 @@ export function wrapSocket(socket: Socket, remote: string): FrameChannel {
   emitter.close = (): void => {
     if (closed) return;
     closed = true;
-    socket.end();
+    socket.end(() => socket.unref());
   };
 
   return emitter;

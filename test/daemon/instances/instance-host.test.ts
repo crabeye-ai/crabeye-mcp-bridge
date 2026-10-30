@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { BridgeConfigSchema } from "../../../src/config/schema.js";
 import { ConfigError } from "../../../src/config/loader.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
+import type { Logger } from "../../../src/logging/index.js";
+import { HttpUpstreamPool } from "../../../src/daemon/instances/http-upstream-pool.js";
 import { InstanceHost } from "../../../src/daemon/instances/instance-host.js";
 import type { DaemonResponse, InstanceSource } from "../../../src/daemon/protocol.js";
 import type { FrameChannel } from "../../../src/daemon/transport.js";
@@ -41,10 +43,10 @@ describe("InstanceHost", () => {
   let onIdle: Mock<() => void>;
   let host: InstanceHost;
 
-  function makeHost(idleMs = 60_000): InstanceHost {
+  function makeHost(idleMs = 60_000, logger: Logger = spyLogger()): InstanceHost {
     return new InstanceHost({
       idleMs,
-      logger: spyLogger(),
+      logger,
       onIdle,
       loadConfig: async (source) => {
         loads++;
@@ -86,11 +88,20 @@ describe("InstanceHost", () => {
 
   afterEach(async () => {
     vi.useRealTimers();
-    await host.close();
+    vi.restoreAllMocks();
+    await host.close(0);
+  });
+
+  it("gives connections no longer than it was given to save their refreshes' tokens when it closes", async () => {
+    const closing = vi.spyOn(HttpUpstreamPool.prototype, "close");
+
+    await host.close(300);
+
+    expect(closing).toHaveBeenCalledWith(300);
   });
 
   describe("ATTACH", () => {
-    it("sends a snapshot of each daemon-hosted server, then answers with their names", async () => {
+    it("sends a snapshot of each HTTP and SSE server, then answers with their names", async () => {
       const channel = fakeChannel();
 
       expect(await attach(channel)).toEqual({ id: "a1", result: { upstreams: ["svc"] } });
@@ -199,7 +210,7 @@ describe("InstanceHost", () => {
     });
 
     it("refuses once the host is closing", async () => {
-      await host.close();
+      await host.close(0);
       expect((await attach(fakeChannel())).error?.code).toBe("daemon_stopping");
     });
   });
@@ -352,7 +363,7 @@ describe("InstanceHost", () => {
       const running = host.handleCallTool("c", { callId: "1", upstream: "svc", name: "slow" }, channel);
       await vi.waitFor(() => expect(clients[0]!.calls).toHaveLength(1));
 
-      await host.close();
+      await host.close(0);
 
       expect((await running).error).toEqual({ code: "upstream_error", message: "daemon shutdown" });
     });
@@ -396,9 +407,69 @@ describe("InstanceHost", () => {
     });
   });
 
+  describe("AUTH_CHANGED", () => {
+    it("reconnects the server in every instance, without an attachment of its own, and answers how many connections it reconnected", async () => {
+      configs.set("/home/u/other.json", { mcpServers: { svc: { url: "https://svc.example.com/mcp" }, docs: { url: "https://docs.example.com/mcp" } } });
+      await attach(fakeChannel());
+      await attach(fakeChannel(), attachParams({ source: { kind: "file", path: "/home/u/other.json" } }));
+      await attach(fakeChannel(), attachParams({ env: { MCP_BRIDGE_MASTER_KEY: "k" } }));
+      clients[0]!.setStatus("auth_required", new Error("needs auth"));
+
+      expect(await host.handleAuthChanged("c", { upstream: "svc" })).toEqual({ id: "c", result: { connections: 2 } });
+
+      expect(clients.map((client) => [client.name, client.reconnects, client.status])).toEqual([
+        ["svc", 1, "connected"],
+        ["docs", 0, "connected"],
+        ["svc", 1, "connected"],
+      ]);
+    });
+
+    it("answers once the reconnects have tried", async () => {
+      await attach(fakeChannel());
+      let finish!: () => void;
+      clients[0]!.attempt = () => new Promise<void>((resolve) => (finish = resolve));
+      let answered = false;
+      const answer = host.handleAuthChanged("c", { upstream: "svc" }).then((response) => {
+        answered = true;
+        return response;
+      });
+
+      await vi.waitFor(() => expect(clients[0]!.status).toBe("connecting"));
+      expect(answered).toBe(false);
+      finish();
+      expect(await answer).toEqual({ id: "c", result: { connections: 1 } });
+    });
+
+    it("logs the reconnect with the number of connections", async () => {
+      const log = spyLogger();
+      await host.close(0);
+      host = makeHost(60_000, log);
+      await attach(fakeChannel());
+
+      await host.handleAuthChanged("c", { upstream: "svc" });
+
+      expect(log.info).toHaveBeenCalledWith("credentials changed; connecting again", { server: "svc", connections: 1 });
+    });
+
+    it("refuses once the host is closing", async () => {
+      await attach(fakeChannel());
+
+      await host.close(0);
+
+      expect((await host.handleAuthChanged("c", { upstream: "svc" })).error?.code).toBe("daemon_stopping");
+    });
+
+    it("answers no connections for a server it doesn't have, and refuses malformed params", async () => {
+      await attach(fakeChannel());
+      expect(await host.handleAuthChanged("c", { upstream: "nope" })).toEqual({ id: "c", result: { connections: 0 } });
+      expect((await host.handleAuthChanged("c", {})).error?.code).toBe("invalid_params");
+      expect(clients[0]!.reconnects).toBe(0);
+    });
+  });
+
   it("closes every instance and connection on close", async () => {
     await attach(fakeChannel());
-    await host.close();
+    await host.close(0);
     expect(host.isEmpty).toBe(true);
     expect(clients[0]!.closed).toBe(true);
   });
@@ -414,7 +485,7 @@ describe.skipIf(process.platform === "win32")("InstanceHost loading a config its
   });
 
   afterEach(async () => {
-    await host.close();
+    await host.close(0);
     await rm(dir, { recursive: true, force: true });
   });
 

@@ -1,5 +1,4 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
 import {
   AuthorizationServerMismatchError,
   InsecureTokenEndpointError,
@@ -11,8 +10,9 @@ import {
   SseError,
   UnauthorizedError,
 } from "@modelcontextprotocol/client";
-import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/client";
+import type { Transport } from "@modelcontextprotocol/client";
 import { HttpUpstreamClient } from "../../src/upstream/http-client.js";
+import { hangingTransport, servingTransport, type ServingOptions } from "../_helpers/upstream-transports.js";
 import { OAuthError as BridgeOAuthError, ReauthorizationRequiredError } from "../../src/oauth/errors.js";
 
 type Outcome = "ok" | "refused" | "hang" | Error;
@@ -32,51 +32,6 @@ function failingTransport(error: Error): Transport {
     },
   };
   return transport;
-}
-
-function hangingTransport(release: Promise<void>): Transport {
-  const transport: Transport = {
-    async start() {
-      await release;
-      throw new Error("released");
-    },
-    async send() {},
-    async close() {
-      transport.onclose?.();
-    },
-  };
-  return transport;
-}
-
-interface ServingOptions {
-  gate?: Promise<void>;
-  requestFailure?: (method: string) => Error | undefined;
-  onClose?: () => void;
-}
-
-function servingTransport(options: ServingOptions = {}): Transport {
-  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  const server = new Server({ name: "upstream", version: "1.0.0" }, { capabilities: { tools: {} } });
-  server.setRequestHandler("tools/list", () => ({ tools: [] }));
-  server.setRequestHandler("tools/call", () => ({ content: [] }));
-  void server.connect(serverSide);
-  const start = clientSide.start.bind(clientSide);
-  const send = clientSide.send.bind(clientSide);
-  const close = clientSide.close.bind(clientSide);
-  clientSide.start = async () => {
-    await options.gate;
-    await start();
-  };
-  clientSide.send = async (message: JSONRPCMessage, sendOptions) => {
-    const failure = "method" in message ? options.requestFailure?.(message.method) : undefined;
-    if (failure) throw failure;
-    await send(message, sendOptions);
-  };
-  clientSide.close = async () => {
-    options.onClose?.();
-    await close();
-  };
-  return clientSide;
 }
 
 function scriptedClient(script: () => Outcome) {

@@ -144,12 +144,15 @@ describe("master key cache", () => {
     expect(keychain.reads).toBe(2);
   });
 
-  it("writes a recreated store with the key the keychain holds now", async () => {
+  it.each([
+    ["set", (store: CredentialStore) => store.set("fresh", token("f"))],
+    ["setIf", (store: CredentialStore) => store.setIf("fresh", token("f"), () => true)],
+  ])("writes a recreated store with the key the keychain holds now, through %s", async (_label, write) => {
     const { store, keychain } = await seededStore();
     await keychain.deleteKey();
     rmSync(filePath);
 
-    await store.set("fresh", token("f"));
+    await write(store);
 
     const restarted = new CredentialStore({ keychain, filePath });
     expect(await restarted.get("fresh")).toEqual(token("f"));

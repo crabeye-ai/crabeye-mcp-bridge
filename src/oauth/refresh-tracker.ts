@@ -1,10 +1,17 @@
 import { refreshRequestOf } from "./refresh-request.js";
+import { PendingSaves } from "./pending-saves.js";
+import { SharedRefreshes } from "./shared-refreshes.js";
 
 export type FetchLike = typeof fetch;
 
 type RefreshOutcome = "succeeded" | "transient" | "rejected";
 
-const REUSE_SUCCESSFUL_REFRESH_MS = 30_000;
+const REDEMPTIONS_KEPT = 16;
+
+interface Redemption {
+  refreshToken: string;
+  settle: () => void;
+}
 
 function isTransientStatus(status: number): boolean {
   return status >= 500 || status === 429 || status === 408;
@@ -15,21 +22,31 @@ function outcomeOf(response: Response): RefreshOutcome {
   return isTransientStatus(response.status) ? "transient" : "rejected";
 }
 
+function endpointOf(input: Parameters<FetchLike>[0]): string {
+  if (input instanceof URL) return input.href;
+  if (typeof input === "string") return input;
+  return input.url;
+}
+
 /**
- * Coalesces refreshes that redeem the same refresh token into one
- * token-endpoint call: those in flight together, and those started up to
- * 30 seconds after one succeeded (a request sent before that refresh can come
- * back unauthorized after it, and redeeming the old token again would be
- * refused by a server that rotates refresh tokens). Remembers every refresh
+ * Sends refreshes through `shared`, so that refreshes of the same refresh
+ * token at the same token endpoint coalesce with every other tracker using
+ * it, and records what came back for this tracker's own provider: which
+ * refresh token each new access token was issued for, and every refresh
  * token the authorization server rejected outright (a non-transient error
- * response); a rejected refresh token never becomes valid again, so that set
- * is never cleared.
+ * response). A rejected refresh token never becomes valid again, so that set
+ * is never cleared. A refresh counts in `pending` until it fails, or until
+ * the provider says it is done saving the tokens it issued.
  */
 export class RefreshTracker {
-  private readonly inFlight = new Map<string | undefined, Promise<Response>>();
-  private readonly succeeded = new Map<string, { response: Response; at: number }>();
   private readonly rejected = new Set<string>();
+  private readonly redemptions = new Map<string, Redemption>();
   private failedTransiently = false;
+
+  constructor(
+    private readonly shared: SharedRefreshes = new SharedRefreshes(),
+    private readonly pending: PendingSaves = new PendingSaves(),
+  ) {}
 
   get lastRefreshFailedTransiently(): boolean {
     return this.failedTransiently;
@@ -47,64 +64,53 @@ export class RefreshTracker {
     return refreshToken !== undefined && this.rejected.has(refreshToken);
   }
 
+  /** The refresh token whose refresh, seen by this tracker, issued `accessToken`. */
+  redeemedFor(accessToken: string): string | undefined {
+    return this.redemptions.get(accessToken)?.refreshToken;
+  }
+
+  /** The provider is done saving the tokens issued with `accessToken`, whether it saved them or not. */
+  saveFinished(accessToken: string): void {
+    this.redemptions.get(accessToken)?.settle();
+  }
+
   wrap(baseFetch: FetchLike): FetchLike {
     return async (input, init) => {
-      const refresh = refreshRequestOf(init);
-      if (!refresh) return baseFetch(input, init);
-      const recent = this.recentSuccess(refresh.refreshToken);
-      if (recent !== undefined) return recent.clone();
-      let pending = this.inFlight.get(refresh.refreshToken);
-      if (!pending) {
-        pending = this.send(baseFetch, input, init, refresh.refreshToken);
-        this.inFlight.set(refresh.refreshToken, pending);
+      const refreshToken = refreshRequestOf(init)?.refreshToken;
+      if (refreshToken === undefined) return baseFetch(input, init);
+      const settle = this.pending.track();
+      let response: Response;
+      try {
+        response = await this.shared.fetch(endpointOf(input), refreshToken, (signal) => baseFetch(input, { ...init, signal }));
+      } catch (err) {
+        settle();
+        this.record(refreshToken, "transient");
+        throw err;
       }
-      const response = await pending;
-      return response.clone();
+      const outcome = outcomeOf(response);
+      this.record(refreshToken, outcome);
+      const awaitingSave = outcome === "succeeded" && (await this.rememberRedemption(response, { refreshToken, settle }));
+      if (!awaitingSave) settle();
+      return response;
     };
   }
 
-  private send(
-    baseFetch: FetchLike,
-    input: Parameters<FetchLike>[0],
-    init: RequestInit | undefined,
-    refreshToken: string | undefined,
-  ): Promise<Response> {
-    const pending = baseFetch(input, init);
-    pending.then(
-      (response) => {
-        const outcome = outcomeOf(response);
-        this.record(refreshToken, outcome);
-        if (outcome === "succeeded" && refreshToken !== undefined) this.rememberSuccess(refreshToken, response);
-      },
-      () => this.record(refreshToken, "transient"),
-    );
-    pending
-      .finally(() => {
-        if (this.inFlight.get(refreshToken) === pending) this.inFlight.delete(refreshToken);
-      })
-      .catch(() => {});
-    return pending;
-  }
-
-  private recentSuccess(refreshToken: string | undefined): Response | undefined {
-    if (refreshToken === undefined) return undefined;
-    const entry = this.succeeded.get(refreshToken);
-    if (entry === undefined) return undefined;
-    if (Date.now() - entry.at < REUSE_SUCCESSFUL_REFRESH_MS) return entry.response;
-    this.succeeded.delete(refreshToken);
-    return undefined;
-  }
-
-  private rememberSuccess(refreshToken: string, response: Response): void {
-    const now = Date.now();
-    for (const [token, entry] of this.succeeded) {
-      if (now - entry.at >= REUSE_SUCCESSFUL_REFRESH_MS) this.succeeded.delete(token);
+  private async rememberRedemption(response: Response, redemption: Redemption): Promise<boolean> {
+    const body = (await response.clone().json().catch(() => undefined)) as { access_token?: unknown } | undefined;
+    if (typeof body?.access_token !== "string") return false;
+    this.redemptions.get(body.access_token)?.settle();
+    this.redemptions.delete(body.access_token);
+    this.redemptions.set(body.access_token, redemption);
+    if (this.redemptions.size > REDEMPTIONS_KEPT) {
+      const [oldest, forgotten] = this.redemptions.entries().next().value!;
+      forgotten.settle();
+      this.redemptions.delete(oldest);
     }
-    this.succeeded.set(refreshToken, { response: response.clone(), at: now });
+    return true;
   }
 
-  private record(refreshToken: string | undefined, outcome: RefreshOutcome): void {
+  private record(refreshToken: string, outcome: RefreshOutcome): void {
     this.failedTransiently = outcome === "transient";
-    if (outcome === "rejected" && refreshToken !== undefined) this.rejected.add(refreshToken);
+    if (outcome === "rejected") this.rejected.add(refreshToken);
   }
 }

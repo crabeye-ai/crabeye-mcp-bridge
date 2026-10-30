@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path";
 import { CERTIFICATE_FILE_ENV_NAMES, isInstanceEnvName } from "../instance-env.js";
-import type { AttachParams, CallToolParams, CancelToolParams, InstanceSource, RetryParams } from "../protocol.js";
+import type { AttachParams, AuthChangedParams, CallToolParams, CancelToolParams, InstanceSource, RetryParams } from "../protocol.js";
 
 const MAX_PATH_BYTES = 4096;
 const MAX_ENV_COUNT = 64;
@@ -30,6 +30,10 @@ export function parseCallToolParams(raw: unknown): CallToolParams | null {
 export function parseRetryParams(raw: unknown): RetryParams | null {
   if (!isPlainObject(raw) || !isUpstreamName(raw.upstream)) return null;
   return { upstream: raw.upstream };
+}
+
+export function parseAuthChangedParams(raw: unknown): AuthChangedParams | null {
+  return parseRetryParams(raw);
 }
 
 export function parseCancelToolParams(raw: unknown): CancelToolParams | null {

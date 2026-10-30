@@ -6,6 +6,14 @@ export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
 
 const KNOWN_STATUSES: ReadonlySet<unknown> = new Set(CONNECTION_STATUSES);
 
+/** The error of a connect abandoned because a reconnect or close replaced it. */
+export class ConnectionSupersededError extends Error {
+  constructor(serverName: string) {
+    super(`connection attempt for "${serverName}" was superseded`);
+    this.name = "ConnectionSupersededError";
+  }
+}
+
 export function isConnectionStatus(value: unknown): value is ConnectionStatus {
   return KNOWN_STATUSES.has(value);
 }

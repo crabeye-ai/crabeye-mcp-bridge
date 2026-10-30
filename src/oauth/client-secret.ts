@@ -22,6 +22,11 @@ const ENV_REF = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
 const ALLOWED_ENV_NAME = /(^|_)X?OAUTH2?(_|$)/;
 const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
+/** The environment variable a `clientSecret` of the form `${NAME}` names, allowed or not. */
+export function clientSecretEnvName(configValue: string | undefined): string | undefined {
+  return configValue?.match(ENV_REF)?.[1];
+}
+
 /** Whether a `clientSecret` `${...}` reference may name this environment variable. */
 export function isClientSecretEnvName(name: string): boolean {
   return ENV_NAME.test(name) && ALLOWED_ENV_NAME.test(name);
@@ -73,7 +78,7 @@ export async function resolveClientSecret(
   serverName: string,
   configValue: string | undefined,
   store: CredentialStore | undefined,
-  env: Record<string, string | undefined> = process.env,
+  env: Record<string, string | undefined>,
   logger?: Logger,
 ): Promise<string | undefined> {
   // 1. Credential store
@@ -85,9 +90,8 @@ export async function resolveClientSecret(
   if (!configValue) return undefined;
 
   // 2. Env-var reference
-  const match = configValue.match(ENV_REF);
-  if (match) {
-    const varName = match[1];
+  const varName = clientSecretEnvName(configValue);
+  if (varName !== undefined) {
     if (!isClientSecretEnvName(varName)) {
       throw new Error(
         `Client secret env var "${varName}" is not allowed (referenced by "${serverName}._bridge.auth.clientSecret"). ` +

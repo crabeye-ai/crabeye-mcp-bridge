@@ -16,10 +16,12 @@ import type { Logger } from "../logging/index.js";
 import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "./client-secret.js";
 import { OAuthError, ReauthorizationRequiredError } from "./errors.js";
 import { RefreshTracker, type FetchLike } from "./refresh-tracker.js";
-import { RepeatedSaves, sameTokens, type SavedTokens, type TokenPair } from "./repeated-saves.js";
+import type { PendingSaves } from "./pending-saves.js";
+import type { SharedRefreshes } from "./shared-refreshes.js";
+import { RepeatedSaves } from "./repeated-saves.js";
+import { TokenWrites, type TokenOrigin } from "./token-writes.js";
 import {
   isIssuerStampOnly,
-  issuerAllows,
   issuersMatch,
   parseStoredClientInfo,
 } from "./issuer-binding.js";
@@ -57,18 +59,24 @@ export interface BridgeOAuthProviderOptions {
    * CLI flows set this `false` (default).
    */
   runtime?: boolean;
+  /** Refreshes shared with other providers, so the same refresh token is redeemed once among them. Defaults to this provider's own. */
+  refreshes?: SharedRefreshes;
+  /** Counts this provider's refreshes until their tokens are saved. Defaults to its own. */
+  pendingSaves?: PendingSaves;
+  /**
+   * Aborts once the stored credentials changed elsewhere and this provider's
+   * connection is being replaced: the provider then starts no more refreshes
+   * and changes nothing stored, except that a refresh already under way may
+   * still save its tokens over the very tokens it refreshed.
+   */
+  retirement?: AbortSignal;
 }
 
-// Refresh-loop circuit breaker thresholds. If a runtime provider saves
-// tokens more than this many times within the window, we mark it exhausted
-// so the next `tokens()` call returns undefined — forcing the SDK to surface
-// the `mcp-bridge auth <server>` message instead of hammering the token
-// endpoint indefinitely against a refresh that succeeds but doesn't satisfy
-// the upstream.
+// Refresh-loop circuit breaker: a runtime provider saving tokens more than this
+// many times within the window is exhausted, so the SDK surfaces the
+// `auth <server>` message instead of hammering the token endpoint.
 const REFRESH_WINDOW_MS = 60_000;
 const REFRESH_BURST_LIMIT = 6;
-
-const RECENT_READS_KEPT = 16;
 
 /**
  * `OAuthClientProvider` implementation backed by the bridge's encrypted
@@ -90,7 +98,8 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   private _state: string | undefined;
   private _recentSaves: number[] = [];
   private _refreshExhausted = false;
-  private readonly _refreshes = new RefreshTracker();
+  private readonly _refreshTracker: RefreshTracker;
+  private readonly _tokenWrites: TokenWrites;
   // Sync mirror of the stored credential's refresh_token. Lets `saveTokens`
   // preserve it on non-rotating IdPs without an async re-read, closing the
   // saveTokens-vs-invalidateCredentials TOCTOU.
@@ -100,16 +109,21 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   // refuses to write the cache from a stale read whose result predates a
   // concurrent invalidate.
   private _invalidateEpoch = 0;
-  private readonly _recentReads: TokenPair[] = [];
   private readonly _repeatedSaves = new RepeatedSaves();
   private _discoveryState: OAuthDiscoveryState | undefined;
 
   get refreshFailedTransiently(): boolean {
-    return this._refreshes.lastRefreshFailedTransiently && !this._refreshExhausted;
+    return this._refreshTracker.lastRefreshFailedTransiently && !this._refreshExhausted;
   }
 
   constructor(opts: BridgeOAuthProviderOptions) {
     this._opts = opts;
+    this._refreshTracker = new RefreshTracker(opts.refreshes, opts.pendingSaves);
+    this._tokenWrites = new TokenWrites({ store: opts.store, serverName: opts.serverName, logger: opts.logger });
+  }
+
+  private get _retired(): boolean {
+    return this._opts.retirement?.aborted === true;
   }
 
   discoveryState(): OAuthDiscoveryState | undefined {
@@ -162,7 +176,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
           `If the change is legitimate, run \`${APP_NAME} auth --remove ${this._opts.serverName}\` first.`,
         );
       }
-      if (ctx?.issuer && !recorded) {
+      if (ctx?.issuer && !recorded && !this._retired) {
         await this._opts.store.set(clientIssuerKey(this._opts.serverName), {
           type: "secret",
           value: JSON.stringify({ client_id: this._opts.clientId, issuer: ctx.issuer }),
@@ -190,7 +204,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       );
       // Self-heal: drop the corrupt entry so the next registration attempt
       // can write a fresh one instead of repeatedly bouncing off this branch.
-      await this._opts.store.delete(clientInfoKey(this._opts.serverName));
+      if (!this._retired) await this._opts.store.delete(clientInfoKey(this._opts.serverName));
       if (this._opts.runtime) throw this._runtimeRegistrationError();
       return undefined;
     }
@@ -213,7 +227,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   }
 
   async saveClientInformation(info: StoredOAuthClientInformation): Promise<void> {
-    if (this._opts.clientId) return;
+    if (this._opts.clientId || this._retired) return;
 
     if (this._opts.runtime) {
       const stored = parseStoredClientInfo(
@@ -240,7 +254,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   }
 
   async tokens(): Promise<StoredOAuthTokens | undefined> {
-    if (this._refreshExhausted) {
+    if (this._refreshExhausted || this._retired) {
       // Force the SDK to take the authorization path, where
       // `redirectToAuthorization` throws a clear "run mcp-bridge auth" error.
       return undefined;
@@ -252,7 +266,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     const cred = await this._opts.store.get(oauthCredentialKey(this._opts.serverName));
     if (!cred || cred.type !== "oauth2") return undefined;
 
-    this._rememberRead({ access_token: cred.access_token, refresh_token: cred.refresh_token });
+    this._tokenWrites.rememberRead({ access_token: cred.access_token, refresh_token: cred.refresh_token });
     if (this._invalidateEpoch === epoch) {
       this._lastRefreshToken = cred.refresh_token;
     }
@@ -290,11 +304,16 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     };
   }
 
-  async saveTokens(
-    tokens: StoredOAuthTokens,
-    ctx?: OAuthClientInformationContext,
-  ): Promise<void> {
-    this._refreshes.clearTransientFailure();
+  async saveTokens(tokens: StoredOAuthTokens, ctx?: OAuthClientInformationContext): Promise<void> {
+    try {
+      await this._saveTokens(tokens, ctx);
+    } finally {
+      this._refreshTracker.saveFinished(tokens.access_token);
+    }
+  }
+
+  private async _saveTokens(tokens: StoredOAuthTokens, ctx: OAuthClientInformationContext | undefined): Promise<void> {
+    this._refreshTracker.clearTransientFailure();
     if (!isSendableHeaderValue(`Bearer ${tokens.access_token}`)) {
       throw new OAuthError(
         "invalid_token",
@@ -326,21 +345,17 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       ...(this._opts.clientId ? { client_id: this._opts.clientId } : {}),
       ...(issuer ? { issuer } : {}),
     };
-    const saved: SavedTokens = { access_token: tokens.access_token, refresh_token: refreshToken, issuer };
-    if (await this._repeatedSaves.saveOnce(saved, () => this._write(credential, saved))) this._countRefresh();
+    const origin: TokenOrigin = { redeemed: this._refreshTracker.redeemedFor(tokens.access_token), addIfMissing: !this._retired };
+    if (await this._repeatedSaves.saveOnce(credential, () => this._write(credential, origin))) this._countRefresh();
   }
 
-  private async _write(credential: OAuth2Credential, saved: SavedTokens): Promise<void> {
-    const key = oauthCredentialKey(this._opts.serverName);
-    if (this._recentReads.some((read) => sameTokens(read, saved))) {
-      await this._opts.store.replaceIf(
-        key,
-        credential,
-        (stored) => stored.type === "oauth2" && sameTokens(stored, saved) && issuerAllows(stored.issuer, saved.issuer),
-      );
-    } else {
-      await this._opts.store.set(key, credential);
-    }
+  private async _write(credential: OAuth2Credential, origin: TokenOrigin): Promise<void> {
+    const dropped = this._retired && origin.redeemed === undefined;
+    if (dropped || !(await this._tokenWrites.write(credential, origin))) this._logDroppedRefresh();
+  }
+
+  private _logDroppedRefresh(): void {
+    this._opts.logger?.info(`dropped the tokens of a refresh for "${this._opts.serverName}" after the stored tokens changed`, { component: "oauth" });
   }
 
   private _countRefresh(): void {
@@ -382,13 +397,14 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
-   * Wrap a `fetch` implementation so concurrent refreshes of the same refresh
-   * token coalesce to one token-endpoint call, and so the provider learns
-   * which refresh tokens the authorization server rejected. Every fetch the
-   * SDK uses for this provider's token endpoint must go through it.
+   * Wrap a `fetch` so concurrent refreshes of the same refresh token coalesce
+   * to one token-endpoint call, also with the other providers sharing the
+   * `refreshes` option, and so the provider learns which refresh tokens the
+   * authorization server rejected and which one each refresh redeemed. Every
+   * fetch the SDK uses for this provider's token endpoint must go through it.
    */
   wrapFetch(baseFetch: FetchLike): FetchLike {
-    return this._refreshes.wrap(baseFetch);
+    return this._refreshTracker.wrap(baseFetch);
   }
 
   saveCodeVerifier(verifier: string): void {
@@ -421,45 +437,16 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     return this._state;
   }
 
-  private _rememberRead(read: TokenPair): void {
-    if (this._recentReads.some((known) => sameTokens(known, read))) return;
-    this._recentReads.push(read);
-    if (this._recentReads.length > RECENT_READS_KEPT) this._recentReads.shift();
-  }
-
-  private async _deleteTokens({
-    keepTokensRefreshedElsewhere,
-  }: {
-    keepTokensRefreshedElsewhere: boolean;
-  }): Promise<ConditionalChange<"deleted">> {
-    const key = oauthCredentialKey(this._opts.serverName);
-    if (!keepTokensRefreshedElsewhere || !this._refreshes.hasRejections()) {
-      return (await this._opts.store.delete(key)) ? "deleted" : "missing";
-    }
-    let outcome: ConditionalChange<"deleted">;
-    try {
-      outcome = await this._opts.store.deleteIf(
-        key,
-        (stored) => stored.type !== "oauth2" || this._refreshes.wasRejected(stored.refresh_token),
-      );
-    } catch (err) {
-      this._opts.logger?.warn(`could not check the stored tokens for "${this._opts.serverName}"; keeping them`, {
-        component: "oauth",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
-    }
-    if (outcome === "kept") {
-      this._opts.logger?.info(`kept the tokens for "${this._opts.serverName}" that were refreshed elsewhere`, {
-        component: "oauth",
-      });
-    }
-    return outcome;
+  private _deleteTokens({ keepTokensRefreshedElsewhere }: { keepTokensRefreshedElsewhere: boolean }): Promise<ConditionalChange<"deleted">> {
+    const tracker = this._refreshTracker;
+    if (!keepTokensRefreshedElsewhere || !tracker.hasRejections()) return this._tokenWrites.delete();
+    return this._tokenWrites.deleteRefused((refreshToken) => tracker.wasRejected(refreshToken));
   }
 
   async invalidateCredentials(
     scope: "all" | "client" | "tokens" | "verifier" | "discovery",
   ): Promise<void> {
+    if (this._retired) return;
     if (scope === "verifier" || scope === "all") {
       this._verifier = undefined;
     }
@@ -478,7 +465,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       // from writing the stale read back into the just-cleared cache.
       this._invalidateEpoch++;
       this._lastRefreshToken = undefined;
-      this._refreshes.clearTransientFailure();
+      this._refreshTracker.clearTransientFailure();
       const outcome = await this._deleteTokens({ keepTokensRefreshedElsewhere: scope === "tokens" });
       if (outcome !== "kept") {
         this._recentSaves = [];

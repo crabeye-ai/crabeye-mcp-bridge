@@ -7,6 +7,8 @@ import { hasStoredOAuthCredential, resolveClientSecret } from "../oauth/client-s
 import {
   BridgeOAuthClientProvider,
 } from "../oauth/sdk-provider.js";
+import type { PendingSaves } from "../oauth/pending-saves.js";
+import type { SharedRefreshes } from "../oauth/shared-refreshes.js";
 import { isDefinitiveAuthFailure, isReauthorizationRequired } from "../oauth/errors.js";
 import { makeOriginPinningFetch } from "../oauth/origin-pinning.js";
 import { BaseUpstreamClient } from "./base-client.js";
@@ -24,6 +26,12 @@ export interface HttpUpstreamClientOptions extends BaseUpstreamClientOptions {
   credentialStore?: CredentialStore;
   /** Makes every request of the connection, OAuth included. Defaults to the global `fetch`. */
   fetch?: typeof fetch;
+  /** Where a `clientSecret` of the form `${NAME}` is looked up. Defaults to no variables at all. */
+  env?: Record<string, string | undefined>;
+  /** Shared with the other connections whose refreshes should coalesce with this one's. */
+  refreshes?: SharedRefreshes;
+  /** Counts this connection's refreshes until their tokens are saved. */
+  pendingSaves?: PendingSaves;
 }
 
 export class HttpUpstreamClient extends BaseUpstreamClient {
@@ -36,13 +44,20 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
   private _authShadowWarned = false;
   private _transportOwnedWarned = false;
   private _authProvider: BridgeOAuthClientProvider | undefined;
+  private _authRetirement = new AbortController();
   private _fetch: typeof fetch | undefined;
+  private readonly _env: Record<string, string | undefined>;
+  private readonly _refreshes: SharedRefreshes | undefined;
+  private readonly _pendingSaves: PendingSaves | undefined;
 
   constructor(options: HttpUpstreamClientOptions) {
     super(options);
     this._config = options.config;
     this._credentialStore = options.credentialStore;
     this._fetch = options.fetch;
+    this._env = options.env ?? {};
+    this._refreshes = options.refreshes;
+    this._pendingSaves = options.pendingSaves;
   }
 
   protected override async _prepareConnect(): Promise<void> {
@@ -71,7 +86,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
         this.name,
         authConfig.clientSecret,
         this._credentialStore,
-        process.env,
+        this._env,
         this._logger,
       );
     }
@@ -90,6 +105,16 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
         this.name,
       );
     }
+  }
+
+  /**
+   * Keeps every OAuth provider this client has built from starting refreshes
+   * or changing stored credentials, since they changed elsewhere; the
+   * connection must then be replaced, which builds a new provider.
+   */
+  retireAuth(): void {
+    this._authRetirement.abort();
+    this._authRetirement = new AbortController();
   }
 
   protected override _isAuthFailure(err: unknown): boolean {
@@ -127,6 +152,9 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
             scopes: authConfig?.scopes,
             logger: this._logger,
             runtime: true,
+            refreshes: this._refreshes,
+            pendingSaves: this._pendingSaves,
+            retirement: this._authRetirement.signal,
           })
         : undefined;
     this._authProvider = authProvider;

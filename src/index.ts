@@ -7,7 +7,7 @@ import {
   ConfigWatcher,
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
-import { findSelfReferences, resolveUpstreams, isDaemonHosted, isStdioServer } from "./config/schema.js";
+import { findSelfReferences, resolveUpstreams, isHttpServer, isStdioServer } from "./config/schema.js";
 import { warnRemovedSettings } from "./config/removed-settings.js";
 import { launchedByAnotherBridge } from "./upstream/launch-guard.js";
 import type {
@@ -26,7 +26,7 @@ import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { InstanceLink, instanceSourceFor } from "./upstream/instance-link.js";
 import { FOLLOWED_NODE_OPTIONS, instanceEnvFrom, unfollowedNodeOptions } from "./daemon/instance-env.js";
-import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning } from "./daemon/index.js";
+import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning, tellManagerAuthChanged } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
 import type { Logger } from "./logging/index.js";
@@ -162,7 +162,7 @@ program
       }
 
       const unfollowed = unfollowedNodeOptions(process.env);
-      if (unfollowed.length > 0 && Object.values(upstreams).some(isDaemonHosted)) {
+      if (unfollowed.length > 0 && Object.values(upstreams).some(isHttpServer)) {
         logger.warn(`the manager doesn't apply ${unfollowed.join(", ")} to the HTTP and SSE upstreams it connects; of the Node options, it follows only ${FOLLOWED_NODE_OPTIONS.join(" and ")}`, {
           component: "bridge",
         });
@@ -615,7 +615,7 @@ const authCmd = program
     const configPath = program.opts<{ config?: string }>().config;
 
     if (options.remove) {
-      process.exitCode = await runAuthRemove(options.remove, { configPath });
+      process.exitCode = await runAuthRemove(options.remove, { configPath }, { tellManagerAuthChanged });
       return;
     }
 
@@ -635,7 +635,7 @@ const authCmd = program
     try {
       process.exitCode = await runAuthLogin(
         { configPath, serverName: server },
-        { signal: abort.signal },
+        { signal: abort.signal, tellManagerAuthChanged },
       );
     } finally {
       for (const sig of signals) process.off(sig, onSig);

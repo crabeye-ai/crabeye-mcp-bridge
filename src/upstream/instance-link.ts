@@ -62,7 +62,7 @@ export interface InstanceLinkOptions {
 
 /**
  * A bridge's one connection to its daemon instance, shared by the stand-ins
- * of every daemon-hosted upstream. Attaches on first use, attaches again
+ * of every HTTP and SSE upstream. Attaches on first use, attaches again
  * after the daemon is replaced, and backs off while it can't be reached.
  */
 export class InstanceLink {

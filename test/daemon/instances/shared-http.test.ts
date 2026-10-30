@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { diffConfigs } from "../../../src/config/config-diff.js";
 import { loadConfig } from "../../../src/config/loader.js";
 import { loadMergedConfig } from "../../../src/config/merged-loader.js";
-import { HttpUpstreamClient } from "../../../src/upstream/http-client.js";
 import { InstanceUpstreamClient } from "../../../src/upstream/instance-upstream-client.js";
 import { ECHOED } from "../../_helpers/counting-http-upstream.js";
 import { settledWithin } from "../../_helpers/processes.js";
@@ -157,7 +156,7 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     expect((await status()).instances).toEqual([]);
   });
 
-  it("connects an upstream with _bridge.auth from each client, and the plain one once through the daemon", async () => {
+  it("connects an upstream with _bridge.auth once through the daemon, as it does the others", async () => {
     await daemon();
     const [plain, oauth] = [await upstream(), await upstream()];
     const config = await writeJson("bridge.json", {
@@ -165,11 +164,12 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     });
     const [a, b] = [await bridge(config), await bridge(config)];
 
-    expect(a.manager.getClient("oauth")).toBeInstanceOf(HttpUpstreamClient);
+    expect(a.manager.getClient("oauth")).toBeInstanceOf(InstanceUpstreamClient);
     expect(a.manager.getClient("plain")).toBeInstanceOf(InstanceUpstreamClient);
     expect(await a.call("oauth")).toEqual(ECHOED);
+    expect(await b.call("oauth")).toEqual(ECHOED);
     expect(await b.call("plain")).toEqual(ECHOED);
-    expect(oauth.count("tools/list")).toBe(2);
+    expect(oauth.count("tools/list")).toBe(1);
     expect(plain.count("tools/list")).toBe(1);
   });
 

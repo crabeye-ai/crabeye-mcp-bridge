@@ -19,6 +19,8 @@ export class ScriptedUpstreamClient implements UpstreamClient {
   instructions: string | undefined;
   connects = 0;
   retries = 0;
+  reconnects = 0;
+  authRetirements = 0;
   closed = false;
   readonly calls: RecordedToolCall[] = [];
   /** What a connect attempt does; by default it connects. */
@@ -61,7 +63,12 @@ export class ScriptedUpstreamClient implements UpstreamClient {
     await this.connect().catch(() => {});
   }
 
+  retireAuth(): void {
+    this.authRetirements++;
+  }
+
   async reconnect(): Promise<void> {
+    this.reconnects++;
     await this.connect();
   }
 
