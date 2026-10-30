@@ -99,7 +99,7 @@ Claude Code auto-registers the bridge as an MCP server. If you haven't configure
 - **Configuration.** STDIO, HTTP, and SSE upstreams; categories; multi-source config keys. See [docs/configuration.md](docs/configuration.md).
 - **Authentication.** Encrypted credential store, OS-keychain-backed master key, `${credential:key}` templates, and a one-shot `auth <server>` OAuth flow for HTTP upstreams. See [docs/auth.md](docs/auth.md).
 - **Policies.** Per-tool / per-server / global tool policies (`always` / `prompt` / `never`), rate limiting. See [docs/policies.md](docs/policies.md).
-- **STDIO manager.** STDIO upstreams routed through a per-user manager process so multiple bridges share a single subprocess per upstream. See [docs/stdio-manager.md](docs/stdio-manager.md).
+- **STDIO manager.** STDIO upstreams, and HTTP and SSE upstreams without `_bridge.auth`, routed through a per-user manager process so multiple bridges share a single subprocess or connection per upstream. See [docs/stdio-manager.md](docs/stdio-manager.md).
 - **CLI.** `init`, `restore`, `credential`, `daemon`, `--validate`. See [docs/cli.md](docs/cli.md).
 
 ## License

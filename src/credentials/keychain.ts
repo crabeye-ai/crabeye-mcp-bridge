@@ -289,7 +289,11 @@ export class WindowsKeychain implements KeychainAdapter {
 
 // --- Factory ---
 
+export const MASTER_KEY_ENV = "MCP_BRIDGE_MASTER_KEY";
+
 export interface CreateKeychainOptions {
+  /** Where to look for `MCP_BRIDGE_MASTER_KEY`. Defaults to this process's environment. */
+  env?: Record<string, string | undefined>;
   _adapter?: KeychainAdapter;
   _platform?: NodeJS.Platform;
 }
@@ -301,7 +305,7 @@ export function createKeychainAdapter(
     return options._adapter;
   }
 
-  const envKey = process.env.MCP_BRIDGE_MASTER_KEY;
+  const envKey = (options?.env ?? process.env)[MASTER_KEY_ENV];
   if (envKey) {
     return new EnvKeychain(envKey);
   }

@@ -354,3 +354,10 @@ export function isStdioServer(
 ): config is StdioServerConfig {
   return "command" in config;
 }
+
+export type DaemonHostedConfig = HttpServerConfig & { _bridge?: { auth?: undefined } };
+
+/** HTTP and SSE upstreams without `_bridge.auth` are connected by the daemon, not by each bridge. */
+export function isDaemonHosted(config: ServerConfig): config is DaemonHostedConfig {
+  return isHttpServer(config) && config._bridge?.auth === undefined;
+}

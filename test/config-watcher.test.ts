@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigWatcher } from "../src/config/config-watcher.js";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
 import { loadConfig } from "../src/config/loader.js";
+import { spyLogger } from "./_helpers/spy-logger.js";
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), "config-watcher-test-"));
@@ -143,6 +144,42 @@ describe("ConfigWatcher", () => {
     }));
     await waitFor(() => received.length >= 1);
     expect(received).toHaveLength(1);
+  });
+
+  it("counts an edit back to the earlier config as a change after a config was applied without it", async () => {
+    const dir = makeTmpDir();
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const configPath = join(dir, "config.json");
+    const first = validConfig();
+    writeConfig(configPath, first);
+    const received: BridgeConfig[] = [];
+    const watcher = new ConfigWatcher({ configPaths: [configPath], loadConfig: () => loadConfig({ configPath }), debounceMs: 50 });
+    cleanups.push(() => watcher.stop());
+    watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(first));
+    await new Promise((r) => setTimeout(r, 100));
+
+    watcher.markApplied(BridgeConfigSchema.parse(validConfig({ svc: { type: "streamable-http", url: "http://localhost:3000" } })));
+    writeConfig(configPath, first);
+
+    await waitFor(() => received.length >= 1);
+    expect(received[0]!.mcpServers).toEqual({});
+  });
+
+  it("stops watching a directory whose watcher fails, logging why, instead of throwing", async () => {
+    const dir = makeTmpDir();
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const configPath = join(dir, "config.json");
+    writeConfig(configPath, validConfig());
+    const logger = spyLogger();
+    const watcher = new ConfigWatcher({ configPaths: [configPath], loadConfig: () => loadConfig({ configPath }), debounceMs: 50, logger });
+    cleanups.push(() => watcher.stop());
+    watcher.start(() => {});
+    const [fsWatcher] = (watcher as unknown as { _watchers: FSWatcher[] })._watchers;
+
+    expect(() => fsWatcher!.emit("error", new Error("EPERM: operation not permitted, watch"))).not.toThrow();
+
+    expect(logger.warn).toHaveBeenCalledWith("stopped watching config directory", expect.objectContaining({ path: dir, error: "EPERM: operation not permitted, watch" }));
+    expect((watcher as unknown as { _watchers: FSWatcher[] })._watchers).toEqual([]);
   });
 
   it("survives invalid JSON without crashing", async () => {

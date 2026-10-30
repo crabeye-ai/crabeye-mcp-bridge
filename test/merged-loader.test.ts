@@ -44,6 +44,20 @@ describe("loadMergedConfig", () => {
     await expect(loadMergedConfig()).rejects.toThrow(/init/);
   });
 
+  it("reads the bridge config at the given path instead of the one in the home directory", async () => {
+    const client = await writeConfig("client.json", { mcpServers: { svc: { url: "http://localhost:1/mcp" } } });
+    const bridgeConfigPath = await writeConfig("config.json", { configPaths: [client] });
+
+    const { config, watchPaths } = await loadMergedConfig({ bridgeConfigPath });
+
+    expect(config.mcpServers).toHaveProperty("svc");
+    expect(watchPaths).toEqual([client]);
+  });
+
+  it("throws ConfigError when the given bridge config doesn't exist", async () => {
+    await expect(loadMergedConfig({ bridgeConfigPath: join(testDir, "missing.json") })).rejects.toThrow(ConfigError);
+  });
+
   it("loads JSONC config file with comments", async () => {
     const content = `{
       // comment

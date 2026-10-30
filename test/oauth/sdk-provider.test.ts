@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { CredentialStore } from "../../src/credentials/credential-store.js";
 import type { Credential } from "../../src/credentials/types.js";
 import {
@@ -8,6 +8,7 @@ import { makeOriginPinningFetch } from "../../src/oauth/origin-pinning.js";
 import { OAuthError, ReauthorizationRequiredError } from "../../src/oauth/errors.js";
 import { oauthCredentialKey } from "../../src/oauth/index.js";
 import { makeTestStore } from "../_helpers/credential-store.js";
+import { spyLogger } from "../_helpers/spy-logger.js";
 
 const REDIRECT = "http://127.0.0.1:54321/callback";
 
@@ -162,6 +163,126 @@ describe("BridgeOAuthClientProvider", () => {
     const redirect = provider.redirectToAuthorization(new URL("https://provider/auth?state=x"));
     await expect(redirect).rejects.toThrow(/Authentication for "srv" expired.*mcp-bridge auth srv/);
     await expect(redirect).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+  });
+
+  describe("access tokens that can't be sent in a header", () => {
+    const provider = () => new BridgeOAuthClientProvider({ serverName: "srv", store, redirectUrl: REDIRECT, clientId: "ci", runtime: true });
+
+    it("asks for re-authorization instead of using a stored one, without the token in the error", async () => {
+      await store.set(oauthCredentialKey("srv"), { type: "oauth2", access_token: "secret-token\nX-Injected: 1", refresh_token: "rt" });
+
+      const failure = await provider().tokens().catch((err: unknown) => err);
+
+      expect(failure).toBeInstanceOf(ReauthorizationRequiredError);
+      expect((failure as Error).message).not.toContain("secret-token");
+    });
+
+    it("refuses to store one from the authorization server, without the token in the error", async () => {
+      const failure = await provider()
+        .saveTokens({ access_token: "secret-token\r\nX-Injected: 1", token_type: "Bearer" })
+        .catch((err: unknown) => err);
+
+      expect(failure).toBeInstanceOf(OAuthError);
+      expect((failure as Error).message).not.toContain("secret-token");
+      expect(await store.get(oauthCredentialKey("srv"))).toBeUndefined();
+    });
+
+    it("refuses one that starts with a line break, which ends up inside the Bearer header", async () => {
+      await store.set(oauthCredentialKey("srv"), { type: "oauth2", access_token: "\nsecret-token", refresh_token: "rt" });
+
+      await expect(provider().tokens()).rejects.toBeInstanceOf(ReauthorizationRequiredError);
+      await expect(provider().saveTokens({ access_token: "\r\nsecret-token", token_type: "Bearer" })).rejects.toBeInstanceOf(OAuthError);
+    });
+
+    it("lets the auth command authorize again instead of using a stored one", async () => {
+      await store.set(oauthCredentialKey("srv"), { type: "oauth2", access_token: "secret-token\nX-Injected: 1", refresh_token: "rt" });
+
+      expect(await new BridgeOAuthClientProvider({ serverName: "srv", store, redirectUrl: REDIRECT, clientId: "ci" }).tokens()).toBeUndefined();
+    });
+
+    it("keeps one that only ends in a line break, which fetch trims", async () => {
+      await store.set(oauthCredentialKey("srv"), { type: "oauth2", access_token: "token\n", refresh_token: "rt" });
+
+      expect(await provider().tokens()).toMatchObject({ access_token: "token\n" });
+    });
+  });
+
+  describe("saving the tokens of one refresh again", () => {
+    const TOKENS = { access_token: "at-1", token_type: "Bearer", refresh_token: "rt-1" };
+    const runtimeProvider = (logger = spyLogger()) =>
+      new BridgeOAuthClientProvider({ serverName: "srv", store, redirectUrl: REDIRECT, clientId: "ci", runtime: true, logger });
+
+    it("writes them once and doesn't count the repeats toward the refresh circuit breaker", async () => {
+      const logger = spyLogger();
+      const provider = runtimeProvider(logger);
+      const set = vi.spyOn(store, "set");
+
+      await Promise.all(Array.from({ length: 10 }, () => provider.saveTokens(TOKENS)));
+
+      expect(set).toHaveBeenCalledTimes(1);
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(await provider.tokens()).toMatchObject({ access_token: "at-1", refresh_token: "rt-1" });
+    });
+
+    it("writes them again when the authorization server's issuer is added", async () => {
+      const provider = runtimeProvider();
+      const set = vi.spyOn(store, "set");
+
+      await provider.saveTokens(TOKENS);
+      await provider.saveTokens({ ...TOKENS, issuer: "https://as.example.com" });
+
+      expect(set).toHaveBeenCalledTimes(2);
+      expect(await store.get(oauthCredentialKey("srv"))).toMatchObject({ issuer: "https://as.example.com" });
+    });
+
+    it("doesn't write them back once they were invalidated", async () => {
+      const provider = runtimeProvider();
+      await provider.saveTokens(TOKENS);
+      await provider.invalidateCredentials("tokens");
+
+      await provider.saveTokens(TOKENS);
+
+      expect(await store.get(oauthCredentialKey("srv"))).toBeUndefined();
+    });
+
+    it("fails the repeats waiting on a save that failed", async () => {
+      const provider = runtimeProvider();
+      vi.spyOn(store, "set").mockRejectedValueOnce(new Error("disk full"));
+
+      const saves = await Promise.allSettled([provider.saveTokens(TOKENS), provider.saveTokens(TOKENS), provider.saveTokens(TOKENS)]);
+
+      expect(saves.map((save) => save.status)).toEqual(["rejected", "rejected", "rejected"]);
+    });
+
+    it("returns from a repeat only once the first save is stored", async () => {
+      const provider = runtimeProvider();
+      const first = provider.saveTokens(TOKENS);
+
+      await provider.saveTokens(TOKENS);
+
+      expect(await store.get(oauthCredentialKey("srv"))).toMatchObject({ access_token: "at-1" });
+      await first;
+    });
+
+    it("doesn't write a repeat over tokens another process stored since", async () => {
+      const provider = runtimeProvider();
+      await provider.saveTokens(TOKENS);
+      await store.set(oauthCredentialKey("srv"), { type: "oauth2", access_token: "at-2", refresh_token: "rt-2" });
+
+      await provider.saveTokens(TOKENS);
+
+      expect(await store.get(oauthCredentialKey("srv"))).toMatchObject({ access_token: "at-2", refresh_token: "rt-2" });
+    });
+
+    it("writes them again when the first save failed", async () => {
+      const provider = runtimeProvider();
+      vi.spyOn(store, "set").mockRejectedValueOnce(new Error("disk full"));
+
+      await expect(provider.saveTokens(TOKENS)).rejects.toThrow("disk full");
+      await provider.saveTokens(TOKENS);
+
+      expect(await store.get(oauthCredentialKey("srv"))).toMatchObject({ access_token: "at-1" });
+    });
   });
 
   describe("redirectToAuthorization after a refresh attempt (runtime)", () => {
@@ -591,26 +712,53 @@ describe("BridgeOAuthClientProvider", () => {
       expect(calls).toBe(2);
     });
 
-    it("allows a fresh refresh after the in-flight one settles", async () => {
-      const provider = new BridgeOAuthClientProvider({
-        serverName: "srv",
-        store,
-        redirectUrl: REDIRECT,
-        clientId: "ci",
+    describe("after a refresh succeeded", () => {
+      let calls: number;
+      let wrapped: typeof fetch;
+
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        calls = 0;
+        const base: typeof fetch = async () => {
+          calls++;
+          return Response.json({ access_token: `at-${calls}`, token_type: "Bearer" });
+        };
+        wrapped = new BridgeOAuthClientProvider({ serverName: "srv", store, redirectUrl: REDIRECT, clientId: "ci" }).wrapFetch(base);
       });
+
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it("answers every late refresh of the same refresh token within 30 seconds with that refresh's tokens", async () => {
+        await wrapped("https://as/token", refreshInit());
+        vi.advanceTimersByTime(29_000);
+        const late = [await wrapped("https://as/token", refreshInit()), await wrapped("https://as/token", refreshInit())];
+
+        expect(calls).toBe(1);
+        for (const response of late) expect(await response.json()).toEqual({ access_token: "at-1", token_type: "Bearer" });
+      });
+
+      it("redeems the refresh token again once 30 seconds have passed, and a different one at once", async () => {
+        await wrapped("https://as/token", refreshInit());
+        await wrapped("https://as/token", refreshInit("rt-2"));
+        vi.advanceTimersByTime(30_000);
+        await wrapped("https://as/token", refreshInit());
+
+        expect(calls).toBe(3);
+      });
+    });
+
+    it("redeems the refresh token again after a refresh that failed", async () => {
+      const provider = new BridgeOAuthClientProvider({ serverName: "srv", store, redirectUrl: REDIRECT, clientId: "ci" });
       let calls = 0;
       const base: typeof fetch = async () => {
         calls++;
-        return new Response(
-          JSON.stringify({ access_token: `at-${calls}`, token_type: "Bearer" }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
+        return new Response(null, { status: 503 });
       };
       const wrapped = provider.wrapFetch(base);
       await wrapped("https://as/token", refreshInit());
       await wrapped("https://as/token", refreshInit());
-      // Two SEQUENTIAL refreshes are independent and each hit the IdP — we
-      // only coalesce overlapping in-flight calls, not back-to-back ones.
       expect(calls).toBe(2);
     });
 

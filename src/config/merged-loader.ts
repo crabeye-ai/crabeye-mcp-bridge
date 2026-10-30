@@ -28,6 +28,8 @@ function pickKnownKeys(obj: Record<string, unknown>): Record<string, unknown> {
 export interface MergedLoaderOptions {
   /** Explicit --config override path (highest priority). */
   configOverridePath?: string;
+  /** The bridge-owned config.json to read instead of the one in this process's home directory. */
+  bridgeConfigPath?: string;
 }
 
 export interface MergedLoaderResult {
@@ -38,7 +40,7 @@ export interface MergedLoaderResult {
 export async function loadMergedConfig(
   options?: MergedLoaderOptions,
 ): Promise<MergedLoaderResult> {
-  const bridgeOwned = await loadBridgeOwnedConfig();
+  const bridgeOwned = await loadBridgeOwnedConfig(options?.bridgeConfigPath);
 
   if (!bridgeOwned && !options?.configOverridePath) {
     throw new ConfigError(

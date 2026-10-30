@@ -11,10 +11,9 @@
  * String tokens lose type fidelity (acceptable per AIT-247 scope).
  */
 
-export type InnerId = string | number;
+import { MAX_INFLIGHT_PER_SESSION } from "./protocol.js";
 
-/** Hard cap on tracked in-flight outer ids per session. */
-export const MAX_INFLIGHT_PER_SESSION = 4096;
+export type InnerId = string | number;
 
 export class InflightOverflowError extends Error {
   constructor(message: string) {

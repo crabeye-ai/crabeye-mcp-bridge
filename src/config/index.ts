@@ -9,6 +9,7 @@ export {
   BridgeConfigSchema,
   isHttpServer,
   isStdioServer,
+  isDaemonHosted,
 } from "./schema.js";
 export type {
   ToolPolicy,
@@ -30,7 +31,7 @@ export type { LoadConfigOptions, ConfigIssue } from "./loader.js";
 
 export { generateJsonSchema } from "./json-schema.js";
 
-export { diffConfigs } from "./config-diff.js";
+export { diffConfigs, diffServers } from "./config-diff.js";
 export type { ConfigDiff } from "./config-diff.js";
 
 export { ConfigWatcher } from "./config-watcher.js";

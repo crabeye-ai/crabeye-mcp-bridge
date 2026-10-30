@@ -549,6 +549,20 @@ describe("createKeychainAdapter", () => {
     expect(adapter).toBeInstanceOf(EnvKeychain);
   });
 
+  it("takes MCP_BRIDGE_MASTER_KEY from the given environment instead of this process's", async () => {
+    process.env.MCP_BRIDGE_MASTER_KEY = "a".repeat(64);
+    const adapter = createKeychainAdapter({ env: { MCP_BRIDGE_MASTER_KEY: "b".repeat(64) } });
+    expect(adapter).toBeInstanceOf(EnvKeychain);
+    expect((await adapter.getKey())?.toString("hex")).toBe("b".repeat(64));
+  });
+
+  it("ignores this process's MCP_BRIDGE_MASTER_KEY when the given environment has none", async () => {
+    process.env.MCP_BRIDGE_MASTER_KEY = "a".repeat(64);
+    const { MacKeychain } = await import("../src/credentials/keychain.js");
+    const adapter = createKeychainAdapter({ env: {}, _platform: "darwin" });
+    expect(adapter).toBeInstanceOf(MacKeychain);
+  });
+
   it("returns MacKeychain on darwin", async () => {
     delete process.env.MCP_BRIDGE_MASTER_KEY;
     const { MacKeychain } = await import("../src/credentials/keychain.js");

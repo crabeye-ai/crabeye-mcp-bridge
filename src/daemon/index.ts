@@ -1,7 +1,7 @@
 export { ManagerDaemon, DaemonAlreadyRunningError, DaemonStoppedWhileStartingError } from "./manager.js";
 export type { ManagerOptions, ChildGroup, SessionAttachment } from "./manager.js";
 export { DaemonClient, DaemonRpcError, DAEMON_CONNECTION_CLOSED, DAEMON_REJECTED } from "./client.js";
-export type { DaemonClientOpts } from "./client.js";
+export type { CallOptions, DaemonClientOpts } from "./client.js";
 export type { ChildEraLabel } from "./child-era.js";
 export {
   encodeFrame,

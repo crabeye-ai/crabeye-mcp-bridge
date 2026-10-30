@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Logger, LogLevel } from "../../src/logging/index.js";
 import { DaemonStoppedWhileStartingError, ManagerDaemon, type ManagerOptions } from "../../src/daemon/manager.js";
 import { isServing, netTransport } from "../../src/daemon/net-transport.js";
 import { DaemonClient } from "../../src/daemon/client.js";
@@ -10,36 +9,17 @@ import { deadPid } from "../_helpers/processes.js";
 import type { FrameChannel } from "../../src/daemon/transport.js";
 import { OpenSessionFixture, spawnTestManager, until, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { STUB_STDIO_SERVER } from "../_helpers/stub-stdio-server.js";
+import { recordingLogger, type LoggedLine } from "../_helpers/spy-logger.js";
 
 const isWindows = process.platform === "win32";
 const SECRET = "marker-5f1c9e";
 const BRIDGE_PROTOCOL_VERSION = 2;
 const TAKEOVER = "took over from a previous daemon that is no longer running";
 
-interface Entry {
-  level: LogLevel;
-  message: string;
-  context: Record<string, unknown>;
-}
-
-function recordingLogger(entries: Entry[], defaults: Record<string, unknown> = {}): Logger {
-  const record = (level: LogLevel) => (message: string, context: Record<string, unknown> = {}) => {
-    entries.push({ level, message, context: { ...defaults, ...context } });
-  };
-  return {
-    debug: record("debug"),
-    info: record("info"),
-    warn: record("warn"),
-    error: record("error"),
-    setLevel: () => {},
-    child: (context) => recordingLogger(entries, { ...defaults, ...context }),
-  };
-}
-
 describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
   let fx: DaemonFixture | undefined;
   let stub: string;
-  let entries: Entry[];
+  let entries: LoggedLine[];
   const sessions: OpenSessionFixture[] = [];
   let nextId = 1;
 
@@ -53,7 +33,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     expect(JSON.stringify(entries ?? [])).not.toMatch(/[0-9a-f]{64}|"upstreamHash"|"groupId"/);
   });
 
-  function managerBeside(fixture: DaemonFixture, log: Entry[], opts: Partial<ManagerOptions> = {}): ManagerDaemon {
+  function managerBeside(fixture: DaemonFixture, log: LoggedLine[], opts: Partial<ManagerOptions> = {}): ManagerDaemon {
     const manager = new ManagerDaemon({
       socketPath: fixture.socketPath,
       pidPath: fixture.pidPath,
@@ -98,7 +78,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     return session.waitForFrame((p) => (p as { id?: unknown }).id === id, 5_000);
   }
 
-  const find = (message: string, from: Entry[] = entries) => from.filter((e) => e.message === message);
+  const find = (message: string, from: LoggedLine[] = entries) => from.filter((e) => e.message === message);
   const indexOf = (message: string) => entries.findIndex((e) => e.message === message);
   const appears = (message: string) => until(() => find(message).length > 0);
   const refusals = () => find("session refused").map((e) => [e.level, e.context.reason, e.context.server, e.context.errorCode]);
@@ -292,7 +272,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     await fx!.manager.stop(0, "test");
     const gone = deadPid();
     await fx!.writePidfile(gone);
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
 
     await managerBeside(fx!, log).start();
 
@@ -304,7 +284,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     await fx!.manager.stop(0, "test");
     const gone = deadPid();
     await writeFile(fx!.lockPath, `${gone}\n00000000-0000-0000-0000-000000000000\n`);
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
 
     await managerBeside(fx!, log).start();
 
@@ -315,7 +295,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     await startManager();
     await fx!.manager.stop(0, "test");
     await fx!.writePidfile(process.ppid);
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
 
     await managerBeside(fx!, log).start();
 
@@ -325,7 +305,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
   it("logs a connection refused while starting at the connection cap", async () => {
     await startManager();
     await fx!.manager.stop(0, "test");
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
     const processTracker = {
       reapStale: async () => {
         const client = new DaemonClient({ socketPath: fx!.socketPath, transport: netTransport, rpcTimeoutMs: 1_000, connectTimeoutMs: 1_000 });
@@ -343,7 +323,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
 
   it("logs waiting for the previous daemon, then serving once it is gone", async () => {
     await startManager();
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
     const successor = managerBeside(fx!, log, { awaitPredecessorMs: 10_000 });
 
     const started = successor.start();
@@ -356,7 +336,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
 
   it("gives up starting when stopped while waiting for the previous daemon", async () => {
     await startManager();
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
     const successor = managerBeside(fx!, log, { awaitPredecessorMs: 10_000 });
     const started = successor.start();
     await until(() => find("waiting for the previous daemon to exit", log).length > 0);
@@ -389,7 +369,7 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
   it("finishes giving up before stop resolves when stopped mid-start", async () => {
     await startManager();
     await fx!.manager.stop(0, "test");
-    const log: Entry[] = [];
+    const log: LoggedLine[] = [];
     let releaseServer!: () => void;
     const serverHeld = new Promise<void>((resolve) => (releaseServer = resolve));
     const successor = managerBeside(fx!, log, {

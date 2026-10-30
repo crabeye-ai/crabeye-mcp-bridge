@@ -10,11 +10,13 @@ import type {
 } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { ConditionalChange, CredentialStore } from "../credentials/credential-store.js";
+import { isSendableHeaderValue } from "../credentials/resolve-templates.js";
 import type { OAuth2Credential } from "../credentials/types.js";
 import type { Logger } from "../logging/index.js";
 import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "./client-secret.js";
 import { OAuthError, ReauthorizationRequiredError } from "./errors.js";
 import { RefreshTracker, type FetchLike } from "./refresh-tracker.js";
+import { RepeatedSaves, sameTokens, type SavedTokens, type TokenPair } from "./repeated-saves.js";
 import {
   isIssuerStampOnly,
   issuerAllows,
@@ -68,15 +70,6 @@ const REFRESH_BURST_LIMIT = 6;
 
 const RECENT_READS_KEPT = 16;
 
-interface TokenPair {
-  access_token: string;
-  refresh_token?: string;
-}
-
-function sameTokens(a: TokenPair, b: TokenPair): boolean {
-  return a.access_token === b.access_token && a.refresh_token === b.refresh_token;
-}
-
 /**
  * `OAuthClientProvider` implementation backed by the bridge's encrypted
  * credential store.
@@ -108,6 +101,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   // concurrent invalidate.
   private _invalidateEpoch = 0;
   private readonly _recentReads: TokenPair[] = [];
+  private readonly _repeatedSaves = new RepeatedSaves();
   private _discoveryState: OAuthDiscoveryState | undefined;
 
   get refreshFailedTransiently(): boolean {
@@ -274,6 +268,14 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       return undefined;
     }
 
+    if (!isSendableHeaderValue(`Bearer ${cred.access_token}`)) {
+      if (!this._opts.runtime) return undefined;
+      throw new ReauthorizationRequiredError(
+        `The stored access token for "${this._opts.serverName}" can't be sent in a header. ` +
+        `Run: ${APP_NAME} auth ${this._opts.serverName}`,
+      );
+    }
+
     const expiresIn =
       typeof cred.expires_at === "number"
         ? Math.max(0, cred.expires_at - Math.floor(Date.now() / 1000))
@@ -293,6 +295,12 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     ctx?: OAuthClientInformationContext,
   ): Promise<void> {
     this._refreshes.clearTransientFailure();
+    if (!isSendableHeaderValue(`Bearer ${tokens.access_token}`)) {
+      throw new OAuthError(
+        "invalid_token",
+        `The authorization server for "${this._opts.serverName}" issued an access token that can't be sent in a header.`,
+      );
+    }
     const issuer = tokens.issuer ?? ctx?.issuer;
     const expiresAt =
       typeof tokens.expires_in === "number"
@@ -318,34 +326,38 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       ...(this._opts.clientId ? { client_id: this._opts.clientId } : {}),
       ...(issuer ? { issuer } : {}),
     };
+    const saved: SavedTokens = { access_token: tokens.access_token, refresh_token: refreshToken, issuer };
+    if (await this._repeatedSaves.saveOnce(saved, () => this._write(credential, saved))) this._countRefresh();
+  }
+
+  private async _write(credential: OAuth2Credential, saved: SavedTokens): Promise<void> {
     const key = oauthCredentialKey(this._opts.serverName);
-    const written = { access_token: tokens.access_token, refresh_token: refreshToken };
-    if (this._recentReads.some((read) => sameTokens(read, written))) {
+    if (this._recentReads.some((read) => sameTokens(read, saved))) {
       await this._opts.store.replaceIf(
         key,
         credential,
-        (stored) => stored.type === "oauth2" && sameTokens(stored, written) && issuerAllows(stored.issuer, issuer),
+        (stored) => stored.type === "oauth2" && sameTokens(stored, saved) && issuerAllows(stored.issuer, saved.issuer),
       );
     } else {
       await this._opts.store.set(key, credential);
     }
+  }
 
-    // Refresh-loop circuit breaker, counting every save — only meaningful for
-    // the runtime provider where unsupervised refreshes could otherwise spin
-    // forever.
-    if (this._opts.runtime) {
-      const now = Date.now();
-      this._recentSaves.push(now);
-      this._recentSaves = this._recentSaves.filter((t) => now - t <= REFRESH_WINDOW_MS);
-      if (this._recentSaves.length > REFRESH_BURST_LIMIT) {
-        this._refreshExhausted = true;
-        this._opts.logger?.warn(
-          `refresh-on-401 circuit breaker tripped for "${this._opts.serverName}" — ` +
-          `${this._recentSaves.length} refreshes within ${REFRESH_WINDOW_MS / 1000}s. ` +
-          `Run \`${APP_NAME} auth ${this._opts.serverName}\` to re-authorize.`,
-          { component: "oauth" },
-        );
-      }
+  private _countRefresh(): void {
+    // Refresh-loop circuit breaker, counting every save of new tokens — only meaningful
+    // for the runtime provider, where unsupervised refreshes could otherwise spin forever.
+    if (!this._opts.runtime) return;
+    const now = Date.now();
+    this._recentSaves.push(now);
+    this._recentSaves = this._recentSaves.filter((t) => now - t <= REFRESH_WINDOW_MS);
+    if (this._recentSaves.length > REFRESH_BURST_LIMIT) {
+      this._refreshExhausted = true;
+      this._opts.logger?.warn(
+        `refresh-on-401 circuit breaker tripped for "${this._opts.serverName}" — ` +
+        `${this._recentSaves.length} refreshes within ${REFRESH_WINDOW_MS / 1000}s. ` +
+        `Run \`${APP_NAME} auth ${this._opts.serverName}\` to re-authorize.`,
+        { component: "oauth" },
+      );
     }
   }
 

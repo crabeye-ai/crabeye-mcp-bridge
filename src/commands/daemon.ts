@@ -34,12 +34,16 @@ import { LockBusyError, processExists } from "../process/index.js";
 import { escapeLabel, type Logger } from "../logging/index.js";
 import { getBridgeConfigPath, loadDaemonSettings, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
+import type { InstanceSource } from "../daemon/protocol.js";
+import { isConnectionStatus, type ConnectionStatus } from "../upstream/types.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
 
 interface StatusReply extends DaemonStatus {
   uptime?: unknown;
   children?: unknown;
+  instances?: unknown;
+  httpUpstreams?: unknown;
   telemetry?: { upstreamRequests?: { refusedTotal?: unknown } };
 }
 
@@ -245,6 +249,8 @@ async function runStatus(): Promise<number> {
       appVersion: daemonVersionLabel(status),
       refusedUpstreamRequests: refusedRequestCounts(status.telemetry?.upstreamRequests?.refusedTotal),
       children: childEras(status.children),
+      instances: instanceRows(status.instances),
+      httpUpstreams: httpUpstreamRows(status.httpUpstreams),
     });
     return 0;
   } catch (err) {
@@ -262,6 +268,8 @@ async function runStatus(): Promise<number> {
       appVersion: UNKNOWN_DAEMON_VERSION,
       refusedUpstreamRequests: null,
       children: null,
+      instances: null,
+      httpUpstreams: null,
     });
     return 0;
   }
@@ -298,6 +306,46 @@ function childEras(value: unknown): { server: string; era: ChildEraLabel }[] | n
     children.push({ server: escapeLabel(serverName), era: era as ChildEraLabel });
   }
   return children.sort((a, b) => a.server.localeCompare(b.server));
+}
+
+interface InstanceRow {
+  config: string;
+  kind: InstanceSource["kind"];
+  bridges: number;
+  servers: string[];
+}
+
+interface HttpUpstreamRow {
+  server: string;
+  state: ConnectionStatus;
+  instances: number;
+}
+
+function instanceRows(value: unknown): InstanceRow[] | null {
+  if (!Array.isArray(value)) return null;
+  const rows: InstanceRow[] = [];
+  for (const instance of value) {
+    if (typeof instance !== "object" || instance === null) return null;
+    const { source, bridges, upstreams } = instance as { source?: unknown; bridges?: unknown; upstreams?: unknown };
+    if (typeof source !== "object" || source === null || !isNonNegativeInteger(bridges)) return null;
+    if (!Array.isArray(upstreams) || !upstreams.every((name) => typeof name === "string")) return null;
+    const { kind, path } = source as { kind?: unknown; path?: unknown };
+    if ((kind !== "file" && kind !== "merged") || typeof path !== "string") return null;
+    rows.push({ config: escapeLabel(path), kind, bridges, servers: (upstreams as string[]).map(escapeLabel).sort() });
+  }
+  return rows.sort((a, b) => a.config.localeCompare(b.config));
+}
+
+function httpUpstreamRows(value: unknown): HttpUpstreamRow[] | null {
+  if (!Array.isArray(value)) return null;
+  const rows: HttpUpstreamRow[] = [];
+  for (const upstream of value) {
+    if (typeof upstream !== "object" || upstream === null) return null;
+    const { serverName, status, instances } = upstream as { serverName?: unknown; status?: unknown; instances?: unknown };
+    if (typeof serverName !== "string" || !isConnectionStatus(status) || !isNonNegativeInteger(instances)) return null;
+    rows.push({ server: escapeLabel(serverName), state: status, instances });
+  }
+  return rows.sort((a, b) => a.server.localeCompare(b.server));
 }
 
 function writeStatus(status: Record<string, unknown>): void {

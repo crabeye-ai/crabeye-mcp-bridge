@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { CONNECTION_STATUSES } from "../../src/upstream/types.js";
 import {
   encodeFrame,
   FrameDecoder,
@@ -51,6 +52,21 @@ describe("daemon protocol", () => {
       expect(dec.next()).toBeNull();
       dec.push(frame.subarray(6));
       expect(dec.next()).toEqual({ x: 1 });
+    });
+
+    it("decodes a large frame that arrives in many chunks, with the next frame's start in the last one", () => {
+      const big = encodeFrame({ text: "x".repeat(1_000_000) });
+      const next = encodeFrame({ n: 2 });
+      const stream = Buffer.concat([big, next.subarray(0, 2)]);
+      const dec = new FrameDecoder();
+      for (let at = 0; at < stream.length; at += 65_536) {
+        expect(dec.next()).toBeNull();
+        dec.push(stream.subarray(at, at + 65_536));
+      }
+      expect(dec.next()).toEqual({ text: "x".repeat(1_000_000) });
+      expect(dec.next()).toBeNull();
+      dec.push(next.subarray(2));
+      expect(dec.next()).toEqual({ n: 2 });
     });
 
     it("decodes a back-to-back stream of frames in order", () => {
@@ -125,9 +141,10 @@ describe("daemon protocol", () => {
       expect(r.error?.message).toContain("RPC");
     });
 
-    it("speaks a protocol newer than crabeye 1.3.0's while still accepting every protocol from 1", () => {
-      expect(PROTOCOL_VERSION).toBe(2);
-      expect([MIN_BRIDGE_PROTOCOL_VERSION, MIN_DAEMON_PROTOCOL_VERSION, UNREPORTED_BRIDGE_PROTOCOL_VERSION]).toEqual([1, 1, 1]);
+    it("speaks protocol 3 and needs a daemon that does, while still accepting bridges from protocol 1", () => {
+      expect(PROTOCOL_VERSION).toBe(3);
+      expect(MIN_DAEMON_PROTOCOL_VERSION).toBe(3);
+      expect([MIN_BRIDGE_PROTOCOL_VERSION, UNREPORTED_BRIDGE_PROTOCOL_VERSION]).toEqual([1, 1]);
     });
   });
 
@@ -169,5 +186,10 @@ describe("daemon protocol", () => {
       const m: DaemonMethod = "PING";
       expect(m).toBe("PING");
     });
+  });
+
+  it("reports only the upstream states bridges of this protocol version know; another one needs a protocol version bump", () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+    expect(CONNECTION_STATUSES).toEqual(["disconnected", "connecting", "connected", "auth_required"]);
   });
 });

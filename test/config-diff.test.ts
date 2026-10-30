@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { diffConfigs } from "../src/config/config-diff.js";
+import { diffConfigs, diffServers } from "../src/config/config-diff.js";
 import type { BridgeConfig } from "../src/config/schema.js";
 import { BridgeConfigSchema } from "../src/config/schema.js";
 
@@ -66,6 +66,47 @@ describe("diffConfigs", () => {
 
       const diff = diffConfigs(oldCfg, newCfg);
       expect(diff.servers.reconnect).toHaveLength(1);
+    });
+
+    it("reconnects an HTTP server that gains _bridge.auth, since each bridge connects it from then on", () => {
+      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp" } });
+      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } });
+
+      const diff = diffConfigs(oldCfg, newCfg);
+
+      expect(diff.servers.reconnect.map((r) => r.name)).toEqual(["svc"]);
+      expect(diff.servers.updated).toEqual([]);
+    });
+
+    it("reconnects an HTTP server that loses _bridge.auth, since the daemon connects it from then on", () => {
+      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } });
+      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp" } });
+
+      expect(diffConfigs(oldCfg, newCfg).servers.reconnect.map((r) => r.name)).toEqual(["svc"]);
+    });
+
+    it("still treats a change inside _bridge.auth as metadata", () => {
+      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" } } } });
+      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2", scopes: ["read"] } } } });
+
+      const diff = diffConfigs(oldCfg, newCfg);
+
+      expect(diff.servers.reconnect).toEqual([]);
+      expect(diff.servers.updated.map((u) => u.name)).toEqual(["svc"]);
+    });
+
+    it("diffs two sets of upstreams directly", () => {
+      const before = { kept: { url: "http://localhost:1/mcp" }, gone: { command: "node" } };
+      const after = { kept: { url: "http://localhost:2/mcp" }, fresh: { command: "node" } };
+
+      const diff = diffServers(
+        makeConfig(before).mcpServers,
+        makeConfig(after).mcpServers,
+      );
+
+      expect(diff.added.map((a) => a.name)).toEqual(["fresh"]);
+      expect(diff.removed).toEqual(["gone"]);
+      expect(diff.reconnect.map((r) => r.name)).toEqual(["kept"]);
     });
 
     it("detects reconnect when STDIO command changes", () => {

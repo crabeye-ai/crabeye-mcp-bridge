@@ -162,7 +162,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
 
     it("tries the replacement once per bridge, using an older daemon that came back after it, with a warning", async () => {
       await workspace({ reconnect: { reconnectBaseDelay: 100, reconnectMaxDelay: 1_000 } });
-      const old = await startOlderDaemon("--relaunch-on-shutdown");
+      const old = await startOlderDaemon("--relaunch-on-shutdown", "--status-extra-json", JSON.stringify({ version: PROTOCOL_VERSION }));
 
       const bridge = await connectBridge();
       await until(async () => bridge.stderr().includes(STILL_RUNNING_WARNING), 20_000);
@@ -266,7 +266,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
 
     it("fails when an older daemon is still running after the replacement, naming its version", async () => {
       await workspace();
-      await startOlderDaemon("--relaunch-on-shutdown", "--status-version", "0.8.0");
+      await startOlderDaemon("--relaunch-on-shutdown", "--status-version", "0.8.0", "--status-extra-json", JSON.stringify({ version: PROTOCOL_VERSION }));
 
       const result = await runCli(cliScript, "daemon", "start");
 
@@ -293,7 +293,47 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         appVersion: APP_VERSION,
         refusedUpstreamRequests: {},
         children: [],
+        instances: [],
+        httpUpstreams: [],
       });
+    });
+
+    it("shows each instance's config and attached bridges, and each HTTP upstream's state, sorted and escaped", async () => {
+      await workspace();
+      const instances = [
+        { source: { kind: "merged", path: "/home/u/.crabeye-mcp-bridge/config.json" }, bridges: 2, upstreams: ["b", "a"] },
+        { source: { kind: "file", path: "/home/u/z\u001b[2J.json" }, bridges: 0, upstreams: [] },
+      ];
+      const httpUpstreams = [
+        { serverName: "notion", status: "auth_required", instances: 1 },
+        { serverName: "linear\u202e", status: "connected", instances: 2 },
+      ];
+      await startOlderDaemon("--status-extra-json", JSON.stringify({ instances, httpUpstreams }));
+
+      const status = JSON.parse((await runCli(cliScript, "daemon", "status")).stdout);
+
+      expect(status.instances).toEqual([
+        { config: "/home/u/.crabeye-mcp-bridge/config.json", kind: "merged", bridges: 2, servers: ["a", "b"] },
+        { config: "/home/u/z\\x1b[2J.json", kind: "file", bridges: 0, servers: [] },
+      ]);
+      expect(status.httpUpstreams).toEqual([
+        { server: "linear\\u202e", state: "connected", instances: 2 },
+        { server: "notion", state: "auth_required", instances: 1 },
+      ]);
+    });
+
+    it.each([
+      ["instances", { instances: [{ source: { kind: "url", path: "/x" }, bridges: 1 }] }],
+      ["instances", { instances: [{ source: { kind: "file", path: "/x" }, bridges: -1, upstreams: [] }] }],
+      ["instances", { instances: [{ source: { kind: "file", path: "/x" }, bridges: 1 }] }],
+      ["httpUpstreams", { httpUpstreams: [{ serverName: "x", status: "sleeping", instances: 1 }] }],
+      ["httpUpstreams", { httpUpstreams: [{ serverName: "x", status: "connected", instances: -1 }] }],
+      ["httpUpstreams", { httpUpstreams: "none" }],
+    ])("shows %s as null when the daemon reports them in a shape it can't read", async (field, extra) => {
+      await workspace();
+      await startOlderDaemon("--status-extra-json", JSON.stringify(extra));
+
+      expect(JSON.parse((await runCli(cliScript, "daemon", "status")).stdout)[field]).toBeNull();
     });
 
     it("shows the protocol era of each server a bridge is using", async () => {
@@ -361,6 +401,8 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         appVersion: "0.8.0",
         refusedUpstreamRequests: { "roots/list": 1 },
         children: [],
+        instances: null,
+        httpUpstreams: null,
       });
     });
 
@@ -416,6 +458,8 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         appVersion: "unknown",
         refusedUpstreamRequests: null,
         children: [],
+        instances: null,
+        httpUpstreams: null,
       });
     });
 
@@ -435,6 +479,8 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         appVersion: "unknown",
         refusedUpstreamRequests: null,
         children: null,
+        instances: null,
+        httpUpstreams: null,
       });
     });
   });

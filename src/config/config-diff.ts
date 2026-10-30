@@ -1,14 +1,16 @@
 import type { BridgeConfig, ServerConfig, ToolPolicy } from "./schema.js";
-import { resolveUpstreams, isStdioServer } from "./schema.js";
+import { resolveUpstreams, isDaemonHosted, isStdioServer } from "./schema.js";
 import type { LogLevel } from "../logging/index.js";
 
+export interface ServerDiff<T extends ServerConfig = ServerConfig> {
+  added: Array<{ name: string; config: T }>;
+  removed: string[];
+  reconnect: Array<{ name: string; config: T }>;
+  updated: Array<{ name: string; config: T }>;
+}
+
 export interface ConfigDiff {
-  servers: {
-    added: Array<{ name: string; config: ServerConfig }>;
-    removed: string[];
-    reconnect: Array<{ name: string; config: ServerConfig }>;
-    updated: Array<{ name: string; config: ServerConfig }>;
-  };
+  servers: ServerDiff;
   bridge: {
     logLevel?: LogLevel;
     healthCheckInterval?: number;
@@ -29,6 +31,7 @@ function connectionFields(config: ServerConfig): Record<string, unknown> {
     type: config.type,
     url: config.url,
     headers: config.headers,
+    daemonHosted: isDaemonHosted(config),
   };
 }
 
@@ -61,16 +64,24 @@ function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 export function diffConfigs(oldConfig: BridgeConfig, newConfig: BridgeConfig): ConfigDiff {
-  const oldServers = resolveUpstreams(oldConfig);
-  const newServers = resolveUpstreams(newConfig);
+  return {
+    servers: diffServers(resolveUpstreams(oldConfig), resolveUpstreams(newConfig)),
+    bridge: diffBridgeSettings(oldConfig, newConfig),
+  };
+}
 
+/** Server changes between two sets of upstreams, by name. */
+export function diffServers<T extends ServerConfig>(
+  oldServers: Record<string, T>,
+  newServers: Record<string, T>,
+): ServerDiff<T> {
   const oldNames = new Set(Object.keys(oldServers));
   const newNames = new Set(Object.keys(newServers));
 
-  const added: ConfigDiff["servers"]["added"] = [];
+  const added: ServerDiff<T>["added"] = [];
   const removed: string[] = [];
-  const reconnect: ConfigDiff["servers"]["reconnect"] = [];
-  const updated: ConfigDiff["servers"]["updated"] = [];
+  const reconnect: ServerDiff<T>["reconnect"] = [];
+  const updated: ServerDiff<T>["updated"] = [];
 
   for (const name of newNames) {
     if (!oldNames.has(name)) {
@@ -96,7 +107,10 @@ export function diffConfigs(oldConfig: BridgeConfig, newConfig: BridgeConfig): C
     }
   }
 
-  // Bridge-level changes
+  return { added, removed, reconnect, updated };
+}
+
+function diffBridgeSettings(oldConfig: BridgeConfig, newConfig: BridgeConfig): ConfigDiff["bridge"] {
   const ob = oldConfig._bridge;
   const nb = newConfig._bridge;
   const bridge: ConfigDiff["bridge"] = { requiresRestart: [] };
@@ -112,8 +126,5 @@ export function diffConfigs(oldConfig: BridgeConfig, newConfig: BridgeConfig): C
     }
   }
 
-  return {
-    servers: { added, removed, reconnect, updated },
-    bridge,
-  };
+  return bridge;
 }

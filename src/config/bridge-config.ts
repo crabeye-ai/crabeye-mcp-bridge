@@ -28,10 +28,10 @@ export function getBridgeConfigPath(): string {
   return join(homedir(), CREDENTIALS_DIR, BRIDGE_CONFIG_FILENAME);
 }
 
-export async function loadBridgeOwnedConfig(): Promise<BridgeOwnedConfig | null> {
+export async function loadBridgeOwnedConfig(path: string = getBridgeConfigPath()): Promise<BridgeOwnedConfig | null> {
   let raw: string;
   try {
-    raw = await readFile(getBridgeConfigPath(), "utf-8");
+    raw = await readFile(path, "utf-8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return null;

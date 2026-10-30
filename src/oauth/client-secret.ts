@@ -20,6 +20,12 @@ const ENV_REF = /^\$\{([A-Z_][A-Z0-9_]*)\}$/;
  * conventionally uppercase, and accepting `oauth_foo` invited drift.
  */
 const ALLOWED_ENV_NAME = /(^|_)X?OAUTH2?(_|$)/;
+const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/** Whether a `clientSecret` `${...}` reference may name this environment variable. */
+export function isClientSecretEnvName(name: string): boolean {
+  return ENV_NAME.test(name) && ALLOWED_ENV_NAME.test(name);
+}
 
 /**
  * Credential-store key for tokens minted by `mcp-bridge auth`. The server
@@ -82,7 +88,7 @@ export async function resolveClientSecret(
   const match = configValue.match(ENV_REF);
   if (match) {
     const varName = match[1];
-    if (!ALLOWED_ENV_NAME.test(varName)) {
+    if (!isClientSecretEnvName(varName)) {
       throw new Error(
         `Client secret env var "${varName}" is not allowed (referenced by "${serverName}._bridge.auth.clientSecret"). ` +
         `The variable name must contain "OAUTH" as a bounded segment ` +

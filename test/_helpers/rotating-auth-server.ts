@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { readBody } from "./web-http.js";
+import { oauthMetadataFor, readBody } from "./web-http.js";
 
 export interface HeldTokenResponse {
   outcome: "rotated" | "rejected";
@@ -30,19 +30,8 @@ export async function startRotatingAuthServer(firstRefreshToken: string): Promis
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(payload));
     };
-    if (url.pathname.startsWith("/.well-known/oauth-protected-resource")) {
-      return json(200, { resource: `${base}/mcp`, authorization_servers: [base] });
-    }
-    if (url.pathname.startsWith("/.well-known/oauth-authorization-server")) {
-      return json(200, {
-        issuer: base,
-        authorization_endpoint: `${base}/authorize`,
-        token_endpoint: `${base}/token`,
-        response_types_supported: ["code"],
-        code_challenge_methods_supported: ["S256"],
-        token_endpoint_auth_methods_supported: ["none"],
-      });
-    }
+    const metadata = oauthMetadataFor(url.pathname, base);
+    if (metadata !== undefined) return json(200, metadata);
     if (url.pathname === "/token" && req.method === "POST") {
       const refreshToken = new URLSearchParams(body.toString("utf8")).get("refresh_token") ?? "";
       const rotated = refreshToken === current;

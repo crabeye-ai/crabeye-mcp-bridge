@@ -1,16 +1,17 @@
-import type { BridgeConfig, ServerConfig, HttpServerConfig, StdioServerConfig, ReconnectConfig } from "../config/schema.js";
+import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
 import { isStdioServer, resolveUpstreams } from "../config/schema.js";
 import type { ConfigDiff } from "../config/config-diff.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
-import { resolveCredentialTemplates } from "../credentials/resolve-templates.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { namespaceTool } from "../server/tool-namespacing.js";
-import { DaemonStdioClient } from "./daemon-stdio-client.js";
-import { HttpUpstreamClient } from "./http-client.js";
-import { upstreamHash, type UpstreamReconnectInputs } from "./upstream-hash.js";
-import type { UpstreamClient, ConnectionStatus, HealthState } from "./types.js";
+import { defaultClientFactory, resolveStdioEnv, type UpstreamClientFactory } from "./client-factory.js";
+import type { UpstreamLink } from "./instance-link.js";
+import { InstanceUpstreamClient } from "./instance-upstream-client.js";
+import { resolveReconnectInputs, upstreamHash } from "./upstream-hash.js";
+import { HealthChecks } from "./health-checks.js";
+import { authorizationPausedMessage, type UpstreamClient, type ConnectionStatus, type HealthState } from "./types.js";
 
 export interface UpstreamManagerOptions {
   config: BridgeConfig;
@@ -19,13 +20,10 @@ export interface UpstreamManagerOptions {
   credentialStore?: CredentialStore;
   /** Health check interval in seconds. 0 to disable. Overrides config value. */
   healthCheckInterval?: number;
+  /** The bridge's link to its daemon instance, which connects the HTTP and SSE upstreams without `_bridge.auth`. `closeAll` closes it. */
+  instanceLink?: UpstreamLink;
   /** Injectable client factory for testing. */
-  _clientFactory?: (
-    name: string,
-    config: ServerConfig,
-    resolvedEnv: Record<string, string>,
-    logger: Logger,
-  ) => UpstreamClient;
+  _clientFactory?: UpstreamClientFactory;
 }
 
 export interface UpstreamStatus {
@@ -34,12 +32,6 @@ export interface UpstreamStatus {
   health: HealthState;
   toolCount: number;
   lastPingAt?: number;
-}
-
-interface HealthTracking {
-  consecutiveFailures: number;
-  lastPingAt?: number;
-  health: HealthState;
 }
 
 interface ClientGroup {
@@ -66,12 +58,7 @@ export class UpstreamManager {
   private _toolRegistry: ToolRegistry;
   private _logger: Logger;
   private _credentialStore: CredentialStore | undefined;
-  private _clientFactory: (
-    name: string,
-    config: ServerConfig,
-    resolvedEnv: Record<string, string>,
-    logger: Logger,
-  ) => UpstreamClient;
+  private _clientFactory: UpstreamClientFactory;
   /** Every group, keyed by its primary name (the first alias added). */
   private _groups = new Map<string, ClientGroup>();
   /** Reverse index from any name (primary or alias) to its group. */
@@ -86,73 +73,28 @@ export class UpstreamManager {
    */
   private _hashLocks = new Map<string, Promise<void>>();
   private _registrations = new Map<string, Promise<void>>();
-  private _healthCheckInterval: number;
-  private _healthTimer: ReturnType<typeof setInterval> | undefined;
-  /**
-   * Health is tracked per underlying client (group), not per alias name. With
-   * dedupe, multiple alias names share one client; keying by name lost
-   * tracking when an alias was removed and reset `consecutiveFailures` to 0
-   * the next tick (see AIT-246 review C3).
-   */
-  private _healthTracking = new WeakMap<ClientGroup, HealthTracking>();
-  private _pingsInFlight = new WeakSet<ClientGroup>();
-  private _pingTimeoutMs = 5000;
+  private _health: HealthChecks;
+  private _instanceLink: UpstreamLink | undefined;
   private _clientsChangedListeners = new Set<() => void>();
-  private _unhealthyThreshold = 3;
 
   constructor(options: UpstreamManagerOptions) {
     this._config = options.config;
     this._toolRegistry = options.toolRegistry;
     this._logger = options.logger ?? createNoopLogger();
     this._credentialStore = options.credentialStore;
-    this._healthCheckInterval =
-      options.healthCheckInterval ?? options.config._bridge.healthCheckInterval;
+    this._instanceLink = options.instanceLink;
+    this._health = new HealthChecks({
+      intervalSec: options.healthCheckInterval ?? options.config._bridge.healthCheckInterval,
+      logger: this._logger,
+    });
 
-    const credentialStore = options.credentialStore;
     this._clientFactory =
       options._clientFactory ??
-      ((name, config, _resolvedEnv, logger) => {
-        const reconnectOpts = this._reconnectInputsFor(config);
-        if (isStdioServer(config)) {
-          // Re-resolve env on every reconnect so a rotated credential reaches
-          // the daemon-spawned child (matches HttpUpstreamClient behavior).
-          const daemonCfg = this._config._bridge.daemon;
-          return new DaemonStdioClient({
-            name,
-            config,
-            logger,
-            resolveEnv: () => this._resolveStdioEnv(config),
-            rpcTimeoutMs: daemonCfg.rpcTimeoutMs,
-            heartbeatMs: daemonCfg.heartbeatMs,
-            respawnLockWaitMs: daemonCfg.respawnLockWaitMs,
-            ...reconnectOpts,
-          });
-        }
-        return new HttpUpstreamClient({
-          name,
-          config: config as HttpServerConfig,
-          logger,
-          credentialStore,
-          ...reconnectOpts,
-        });
+      defaultClientFactory({
+        bridgeConfig: () => this._config,
+        credentialStore: options.credentialStore,
+        instanceLink: options.instanceLink,
       });
-  }
-
-  private _reconnectInputsFor(config: ServerConfig): UpstreamReconnectInputs {
-    const globalReconnect = this._config._bridge.reconnect;
-    const serverReconnect: ReconnectConfig | undefined = config._bridge?.reconnect;
-    return {
-      reconnectBaseDelay: serverReconnect?.reconnectBaseDelay ?? globalReconnect?.reconnectBaseDelay,
-      reconnectMaxDelay: serverReconnect?.reconnectMaxDelay ?? globalReconnect?.reconnectMaxDelay,
-    };
-  }
-
-  private async _resolveStdioEnv(config: StdioServerConfig): Promise<Record<string, string>> {
-    const env = (config.env ?? {}) as Record<string, string>;
-    if (!this._credentialStore) return env;
-    // resolveCredentialTemplates short-circuits per-value when no template
-    // matches, so we don't need a pre-flight `hasCredentialTemplates` check.
-    return resolveCredentialTemplates(env, this._credentialStore);
   }
 
   whenRegistered(name: string): Promise<void> {
@@ -199,14 +141,14 @@ export class UpstreamManager {
     if (isStdioServer(serverConfig)) {
       let resolvedEnv: Record<string, string>;
       try {
-        resolvedEnv = await this._resolveStdioEnv(serverConfig);
+        resolvedEnv = await resolveStdioEnv(serverConfig, this._credentialStore);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.error(`failed to resolve credentials: ${message}`);
         return { name, error: message };
       }
 
-      const reconnect = this._reconnectInputsFor(serverConfig);
+      const reconnect = resolveReconnectInputs(this._config._bridge, serverConfig);
       const hash = upstreamHash({
         command: serverConfig.command,
         args: serverConfig.args ?? [],
@@ -272,6 +214,7 @@ export class UpstreamManager {
         this._stdioHashIndex.set(hash, group);
         this._applyCategory(name, serverConfig);
         this._wireSubscriptions(group, log);
+        this._health.add(client, name);
         this._notifyClientsChanged();
       } finally {
         release();
@@ -303,6 +246,7 @@ export class UpstreamManager {
     this._nameToGroup.set(name, group);
     this._applyCategory(name, serverConfig);
     this._wireSubscriptions(group, log);
+    if (!(client instanceof InstanceUpstreamClient)) this._health.add(client, name);
     this._notifyClientsChanged();
     return group;
   }
@@ -332,7 +276,7 @@ export class UpstreamManager {
     const unsubStatus = group.client.onStatusChange((event) => {
       if (event.current === "auth_required" && !pauseLogged) {
         pauseLogged = true;
-        log.warn(`authorization required; paused until the next call or reload: ${event.error?.message ?? "unknown"}`);
+        log.warn(authorizationPausedMessage(event.error));
         return;
       }
       if (event.current === "connected") pauseLogged = false;
@@ -371,8 +315,7 @@ export class UpstreamManager {
       group.unsubscribers = [];
       if (group.hash !== null) this._stdioHashIndex.delete(group.hash);
       this._groups.delete(group.primaryName);
-      this._healthTracking.delete(group);
-      this._pingsInFlight.delete(group);
+      this._health.remove(group.client);
       await group.client.close().catch(() => {});
     }
   }
@@ -400,6 +343,7 @@ export class UpstreamManager {
     for (const group of this._groups.values()) {
       for (const unsub of group.unsubscribers) unsub();
       group.unsubscribers = [];
+      this._health.remove(group.client);
     }
 
     const allNames = Array.from(this._nameToGroup.keys());
@@ -419,8 +363,7 @@ export class UpstreamManager {
     this._groups.clear();
     this._nameToGroup.clear();
     this._stdioHashIndex.clear();
-    // _healthTracking and _pingsInFlight are WeakMap/WeakSet — entries drop
-    // automatically once the ClientGroup objects above are unreferenced.
+    await this._instanceLink?.close();
   }
 
   async applyConfigDiff(diff: ConfigDiff, newConfig: BridgeConfig): Promise<void> {
@@ -470,9 +413,7 @@ export class UpstreamManager {
   }
 
   restartHealthChecks(interval: number): void {
-    this.stopHealthChecks();
-    this._healthCheckInterval = interval;
-    this.startHealthChecks();
+    this._health.restart(interval);
   }
 
   /** Fires when a reload removes a server or a client is registered under a name; returns an unsubscribe. */
@@ -492,13 +433,13 @@ export class UpstreamManager {
   getStatuses(): UpstreamStatus[] {
     const out: UpstreamStatus[] = [];
     for (const [name, group] of this._nameToGroup) {
-      const tracking = this._healthTracking.get(group);
+      const { health, lastPingAt } = this._health.healthOf(group.client);
       out.push({
         name,
         status: group.client.status,
-        health: tracking?.health ?? "unknown",
+        health,
         toolCount: group.client.tools.length,
-        lastPingAt: tracking?.lastPingAt,
+        lastPingAt,
       });
     }
     return out;
@@ -511,93 +452,10 @@ export class UpstreamManager {
   }
 
   startHealthChecks(): void {
-    if (this._healthCheckInterval <= 0) return;
-    if (this._healthTimer) return;
-
-    this._logger.debug("starting health checks", {
-      component: "health",
-      interval: this._healthCheckInterval,
-    });
-
-    this._healthTimer = setInterval(() => {
-      this._runHealthCheck();
-    }, this._healthCheckInterval * 1000);
+    this._health.start();
   }
 
   stopHealthChecks(): void {
-    if (this._healthTimer) {
-      clearInterval(this._healthTimer);
-      this._healthTimer = undefined;
-    }
-  }
-
-  private _runHealthCheck(): void {
-    // Iterate unique groups so a deduped client is pinged once per tick. The
-    // tracking entry is keyed by the group itself (not by alias name), so
-    // removing one alias does not lose the failure counter for the others.
-    const seen = new Set<ClientGroup>();
-    for (const group of this._nameToGroup.values()) {
-      if (seen.has(group)) continue;
-      seen.add(group);
-      if (group.client.status !== "connected") continue;
-      if (this._pingsInFlight.has(group)) continue;
-
-      let tracking = this._healthTracking.get(group);
-      if (!tracking) {
-        tracking = { consecutiveFailures: 0, health: "unknown" };
-        this._healthTracking.set(group, tracking);
-      }
-
-      const logServer = group.primaryName;
-      this._pingsInFlight.add(group);
-
-      group.client.ping(this._pingTimeoutMs).then(
-        () => {
-          this._pingsInFlight.delete(group);
-          const t = this._healthTracking.get(group);
-          if (!t) return;
-          const wasUnhealthy = t.health === "unhealthy";
-          t.consecutiveFailures = 0;
-          t.lastPingAt = Date.now();
-          t.health = "healthy";
-          if (wasUnhealthy) {
-            this._logger.info("recovered", { component: "health", server: logServer });
-          }
-        },
-        (err) => {
-          this._pingsInFlight.delete(group);
-          const t = this._healthTracking.get(group);
-          if (!t) return;
-          t.consecutiveFailures++;
-          t.health = "unhealthy";
-
-          this._logger.warn("ping failed", {
-            component: "health",
-            server: logServer,
-            error: err instanceof Error ? err.message : String(err),
-            failures: t.consecutiveFailures,
-          });
-
-          if (t.consecutiveFailures >= this._unhealthyThreshold && group.client.status === "connected") {
-            this._logger.error(
-              `${t.consecutiveFailures} consecutive ping failures, reconnecting`,
-              { component: "health", server: logServer },
-            );
-            t.consecutiveFailures = 0;
-            t.health = "unknown";
-            group.client.reconnect().catch((reconnectErr) => {
-              this._logger.error("reconnect failed", {
-                component: "health",
-                server: logServer,
-                error:
-                  reconnectErr instanceof Error
-                    ? reconnectErr.message
-                    : String(reconnectErr),
-              });
-            });
-          }
-        },
-      );
-    }
+    this._health.stop();
   }
 }

@@ -66,3 +66,16 @@ export async function resolveCredentialTemplates(
 
   return resolved;
 }
+
+/** Whether fetch sends `value` as a header value: once trimmed, only tabs, visible ASCII, spaces and Latin-1. */
+export function isSendableHeaderValue(value: string): boolean {
+  let start = 0;
+  let end = value.length;
+  while (start < end && isHttpWhitespace(value.charCodeAt(start))) start++;
+  while (end > start && isHttpWhitespace(value.charCodeAt(end - 1))) end--;
+  return !/[^\t\x20-\x7e\x80-\xff]/.test(value.slice(start, end));
+}
+
+function isHttpWhitespace(code: number): boolean {
+  return code === 0x09 || code === 0x0a || code === 0x0d || code === 0x20;
+}

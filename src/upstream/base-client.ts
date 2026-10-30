@@ -26,6 +26,9 @@ const CLIENT_INPUT_CAPABILITY_BY_METHOD = new Map([
 ]);
 const CLIENT_INPUT_CAPABILITIES = new Set(CLIENT_INPUT_CAPABILITY_BY_METHOD.values());
 
+export const DEFAULT_RECONNECT_BASE_DELAY_MS = 1000;
+export const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
+
 export function upstreamClientInfo(serverName: string): Implementation {
   return { name: `${APP_NAME}/${serverName}`, version: APP_VERSION };
 }
@@ -62,8 +65,8 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
 
   constructor(options: BaseUpstreamClientOptions) {
     this.name = options.name;
-    this._reconnectBaseDelay = options.reconnectBaseDelay ?? 1000;
-    this._reconnectMaxDelay = options.reconnectMaxDelay ?? 30000;
+    this._reconnectBaseDelay = options.reconnectBaseDelay ?? DEFAULT_RECONNECT_BASE_DELAY_MS;
+    this._reconnectMaxDelay = options.reconnectMaxDelay ?? DEFAULT_RECONNECT_MAX_DELAY_MS;
     this._transportFactory = options._transportFactory;
     this._logger = options.logger ?? createNoopLogger();
   }

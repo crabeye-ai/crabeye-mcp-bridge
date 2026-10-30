@@ -2,7 +2,7 @@ import { StreamableHTTPClientTransport, SSEClientTransport } from "@modelcontext
 import type { Transport } from "@modelcontextprotocol/client";
 import type { HttpServerConfig } from "../config/schema.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
-import { hasCredentialTemplates, resolveCredentialTemplates } from "../credentials/resolve-templates.js";
+import { hasCredentialTemplates, isSendableHeaderValue, resolveCredentialTemplates } from "../credentials/resolve-templates.js";
 import { hasStoredOAuthCredential, resolveClientSecret } from "../oauth/client-secret.js";
 import {
   BridgeOAuthClientProvider,
@@ -22,6 +22,8 @@ function isTransportOwnedHeader(name: string): boolean {
 export interface HttpUpstreamClientOptions extends BaseUpstreamClientOptions {
   config: HttpServerConfig;
   credentialStore?: CredentialStore;
+  /** Makes every request of the connection, OAuth included. Defaults to the global `fetch`. */
+  fetch?: typeof fetch;
 }
 
 export class HttpUpstreamClient extends BaseUpstreamClient {
@@ -34,11 +36,13 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
   private _authShadowWarned = false;
   private _transportOwnedWarned = false;
   private _authProvider: BridgeOAuthClientProvider | undefined;
+  private _fetch: typeof fetch | undefined;
 
   constructor(options: HttpUpstreamClientOptions) {
     super(options);
     this._config = options.config;
     this._credentialStore = options.credentialStore;
+    this._fetch = options.fetch;
   }
 
   protected override async _prepareConnect(): Promise<void> {
@@ -128,6 +132,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
     this._authProvider = authProvider;
 
     const effectiveHeaders = rawHeaders && this._configuredRequestHeaders(rawHeaders, authProvider !== undefined);
+    rejectUnsendableHeaders(effectiveHeaders);
 
     const requestInit: RequestInit | undefined = effectiveHeaders
       ? { headers: effectiveHeaders }
@@ -140,16 +145,18 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
     // wrapper so concurrent 401s coalesce to a single token-endpoint POST
     // (avoids the IdP rotating away under N parallel refresh attempts) and
     // the provider learns which refresh tokens were rejected.
-    // Only installed when OAuth is configured.
+    // Without OAuth, the transport uses the connection's own fetch, when one was given.
     const fetch = authProvider
-      ? authProvider.wrapFetch(makeOriginPinningFetch())
-      : undefined;
+      ? authProvider.wrapFetch(makeOriginPinningFetch(this._fetch))
+      : this._fetch;
 
     // Build options once so the conditional spread isn't duplicated across
     // the two transport types.
-    const transportOpts = authProvider
-      ? { requestInit, authProvider, ...(fetch ? { fetch } : {}) }
-      : { requestInit };
+    const transportOpts = {
+      requestInit,
+      ...(authProvider && { authProvider }),
+      ...(fetch && { fetch }),
+    };
 
     if (this._config.type !== "sse") {
       return new StreamableHTTPClientTransport(url, transportOpts);
@@ -200,5 +207,17 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
       );
     }
     return filtered;
+  }
+}
+
+/**
+ * Throws for a header value fetch would refuse once it trims the value; the
+ * error names the header only, since the value may be a secret.
+ */
+function rejectUnsendableHeaders(headers: Record<string, string> | undefined): void {
+  for (const [header, value] of Object.entries(headers ?? {})) {
+    if (!isSendableHeaderValue(value)) {
+      throw new Error(`the value of header "${header}" contains a line break, a NUL or a character a header can't carry`);
+    }
   }
 }

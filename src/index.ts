@@ -7,7 +7,7 @@ import {
   ConfigWatcher,
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
-import { findSelfReferences, resolveUpstreams, isStdioServer } from "./config/schema.js";
+import { findSelfReferences, resolveUpstreams, isDaemonHosted, isStdioServer } from "./config/schema.js";
 import { warnRemovedSettings } from "./config/removed-settings.js";
 import { launchedByAnotherBridge } from "./upstream/launch-guard.js";
 import type {
@@ -24,6 +24,8 @@ import { renderPassthrough } from "./server/passthrough.js";
 import { ToolSearchService } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
+import { InstanceLink, instanceSourceFor } from "./upstream/instance-link.js";
+import { FOLLOWED_NODE_OPTIONS, instanceEnvFrom, unfollowedNodeOptions } from "./daemon/instance-env.js";
 import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
@@ -147,12 +149,11 @@ program
       const toolRegistry = new ToolRegistry();
       const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
-      // Start the manager daemon early so the first STDIO connects find it
-      // serving, without holding up the client: recovering a wedged daemon
-      // can outlast the client's initialize timeout, and each STDIO upstream
-      // keeps retrying on its own. HTTP-only configs skip this.
-      const hasStdio = Object.values(upstreams).some(isStdioServer);
-      if (hasStdio) {
+      // Start the manager daemon early so the first connects find it serving,
+      // without holding up the client: recovering a wedged daemon can outlast
+      // the client's initialize timeout, and each upstream keeps retrying on
+      // its own.
+      if (Object.keys(upstreams).length > 0) {
         ensureDaemonRunning({ logger }).catch((err: unknown) => {
           logger.error(`failed to start manager daemon: ${err instanceof Error ? err.message : String(err)}`, {
             component: "bridge",
@@ -160,11 +161,28 @@ program
         });
       }
 
+      const unfollowed = unfollowedNodeOptions(process.env);
+      if (unfollowed.length > 0 && Object.values(upstreams).some(isDaemonHosted)) {
+        logger.warn(`the manager doesn't apply ${unfollowed.join(", ")} to the HTTP and SSE upstreams it connects; of the Node options, it follows only ${FOLLOWED_NODE_OPTIONS.join(" and ")}`, {
+          component: "bridge",
+        });
+      }
+
+      const daemonSettings = config._bridge.daemon;
       upstreamManager = new UpstreamManager({
         config,
         toolRegistry,
         logger,
         credentialStore,
+        instanceLink: new InstanceLink({
+          source: instanceSourceFor(explicitPath),
+          env: instanceEnvFrom(process.env),
+          logger,
+          rpcTimeoutMs: daemonSettings.rpcTimeoutMs,
+          heartbeatMs: daemonSettings.heartbeatMs,
+          respawnLockWaitMs: daemonSettings.respawnLockWaitMs,
+          reconnect: config._bridge.reconnect,
+        }),
       });
 
       const serverBridgeConfigs = buildServerBridgeConfigs(upstreams);

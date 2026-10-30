@@ -46,16 +46,17 @@ export interface BridgeLaunch {
   modern?: boolean;
 }
 
+/** `configPath` null starts the bridge without `--config`, on the default config. */
 export async function connectBridgeProcess(
   script: string,
-  configPath: string,
+  configPath: string | null,
   env: NodeJS.ProcessEnv,
   { extraArgs = [], modern = false }: BridgeLaunch = {},
 ): Promise<BridgeProcess> {
   const definedEnv = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [script, "--config", configPath, ...extraArgs],
+    args: [script, ...(configPath === null ? [] : ["--config", configPath]), ...extraArgs],
     env: definedEnv,
     stderr: "pipe",
   });

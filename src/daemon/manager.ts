@@ -30,6 +30,7 @@ import {
   ERROR_CODE_DAEMON_STOPPING,
   ERROR_CODE_TOO_MANY_SESSIONS,
   ERROR_CODE_UNKNOWN_METHOD,
+  ERROR_CODE_RESPONSE_TOO_LARGE,
   INNER_ERROR_CODE_UPSTREAM_RESTARTED,
   INNER_ERROR_CODE_BACKPRESSURE,
   INNER_ERROR_CODE_SESSION_CLOSED,
@@ -37,6 +38,7 @@ import {
   PROTOCOL_VERSION,
   STDERR_BRIDGE_PROTOCOL_VERSION,
   UNREPORTED_BRIDGE_PROTOCOL_VERSION,
+  errorResponse,
   isNotification,
   isRequest,
   type ChildExit,
@@ -68,6 +70,7 @@ import { ChildEra } from "./child-era.js";
 import { StderrForwardLimit } from "./stderr-capture.js";
 import { RateLimitedReport } from "./rate-limited-report.js";
 import { SocketInUseError, type DaemonServer, type FrameChannel, type Transport } from "./transport.js";
+import { InstanceHost, type InstanceHostOptions } from "./instances/instance-host.js";
 
 const PUBLICATION_CHECK_MS = 5_000;
 const PREDECESSOR_POLL_MS = 25;
@@ -265,6 +268,8 @@ export interface ManagerOptions {
   processTracker?: ProcessTracker;
   /** Override for tests: how long a child's close is held back waiting for its exit and the end of its stderr. */
   _stderrDrainMs?: number;
+  /** Overrides for tests: how instances load configs, open credential stores and connect HTTP upstreams. */
+  _instances?: Pick<InstanceHostOptions, "loadConfig" | "createCredentialStore" | "createClient" | "watchDebounceMs">;
   /** Override for tests: skip real spawn. */
   _spawnChild?: (
     spec: OpenParams["spec"],
@@ -319,6 +324,7 @@ export class ManagerDaemon {
   private readonly logger: Logger;
   private readonly tracker: ProcessTracker;
   private readonly telemetry = new Telemetry();
+  private readonly instances: InstanceHost;
   private readonly exitedPromise: Promise<number>;
   private exitedResolve: (code: number) => void = () => {
     /* replaced in constructor */
@@ -344,6 +350,12 @@ export class ManagerDaemon {
       });
     this.exitedPromise = new Promise<number>((resolve) => {
       this.exitedResolve = resolve;
+    });
+    this.instances = new InstanceHost({
+      idleMs: opts.idleMs,
+      logger: this.logger,
+      onIdle: () => this.armIdleTimerIfUnused(),
+      ...opts._instances,
     });
   }
 
@@ -567,6 +579,7 @@ export class ManagerDaemon {
     while (this.pendingTeardowns.size > 0) {
       await Promise.allSettled(Array.from(this.pendingTeardowns));
     }
+    await this.instances.close();
 
     for (const ch of this.connections) {
       try {
@@ -651,6 +664,8 @@ export class ManagerDaemon {
           appVersion: APP_VERSION,
           children: this.statusChildren(),
           sessions: this.statusSessions(),
+          instances: this.instances.statusInstances(),
+          httpUpstreams: this.instances.statusHttpUpstreams(),
           telemetry: this.telemetry.snapshot(),
         };
         return { id: req.id, result };
@@ -670,6 +685,15 @@ export class ManagerDaemon {
       }
       case "CLOSE":
         return this.handleClose(req.id, req.params);
+      case "ATTACH":
+        if (channel === undefined) return errorResponse(req.id, ERROR_CODE_INVALID_REQUEST, "ATTACH requires a channel");
+        return this.instances.handleAttach(req.id, req.params, channel);
+      case "CALL_TOOL":
+        if (channel === undefined) return errorResponse(req.id, ERROR_CODE_INVALID_REQUEST, "CALL_TOOL requires a channel");
+        return this.instances.handleCallTool(req.id, req.params, channel);
+      case "RETRY":
+        if (channel === undefined) return errorResponse(req.id, ERROR_CODE_INVALID_REQUEST, "RETRY requires a channel");
+        return this.instances.handleRetry(req.id, req.params, channel);
       case "RESTART":
         return this.handleRestart(req.id, req.params);
       case "PING": {
@@ -722,6 +746,7 @@ export class ManagerDaemon {
 
     channel.on("close", () => {
       this.connections.delete(channel);
+      this.instances.channelClosed(channel);
       const ownedSessions = this.sessionsByChannel.get(channel);
       this.sessionsByChannel.delete(channel);
       if (ownedSessions) {
@@ -732,9 +757,7 @@ export class ManagerDaemon {
           });
         }
       }
-      if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
-        this.armIdleTimer();
-      }
+      this.armIdleTimerIfUnused();
     });
   }
 
@@ -752,7 +775,9 @@ export class ManagerDaemon {
         this.telemetry.rpcInFlightDec();
       }
       if (res.error !== undefined) this.telemetry.recordRpcError(res.error.code);
-      channel.send(res);
+      if (!channel.send(res)) {
+        channel.send(errorResponse(res.id, ERROR_CODE_RESPONSE_TOO_LARGE, "the reply is too large for the manager to send"));
+      }
       return;
     }
     // Response or malformed — daemon does not initiate requests yet, so a
@@ -761,6 +786,10 @@ export class ManagerDaemon {
   }
 
   private async handleNotification(channel: FrameChannel, notif: DaemonNotification): Promise<void> {
+    if (notif.method === "CANCEL_TOOL") {
+      this.instances.handleCancelTool(notif.params, channel);
+      return;
+    }
     if (notif.method !== "RPC") {
       this.logger.debug(`unknown notification method "${notif.method}"`, { component: "daemon" });
       return;
@@ -1381,9 +1410,7 @@ export class ManagerDaemon {
       if (reason !== "crash") this.logger.info("child stopped", { ...logContext, ...stopOutcome(group.child) });
       if (pid !== null) await this.tracker.unregister(pid).catch(() => {});
     }
-    if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
-      this.armIdleTimer();
-    }
+    this.armIdleTimerIfUnused();
   }
 
   private evictSessionsOf(group: ChildGroup, reason: KilledReason, exit?: ChildExit): void {
@@ -1509,9 +1536,7 @@ export class ManagerDaemon {
       this.armGraceTimer(group);
     }
 
-    if (this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && !this.stopping) {
-      this.armIdleTimer();
-    }
+    this.armIdleTimerIfUnused();
   }
 
   private armGraceTimer(group: ChildGroup): void {
@@ -1617,13 +1642,21 @@ export class ManagerDaemon {
   private armIdleTimer(): void {
     this.cancelIdleTimer();
     this.idleTimer = setTimeout(() => {
-      if (!this.stopping && this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0) {
+      if (!this.stopping && this.isUnused()) {
         void this.stop(0, "idle");
       }
     }, this.opts.idleMs);
     if (typeof this.idleTimer.unref === "function") {
       this.idleTimer.unref();
     }
+  }
+
+  private isUnused(): boolean {
+    return this.connections.size === 0 && this.sessions.size === 0 && this.groups.size === 0 && this.instances.isEmpty;
+  }
+
+  private armIdleTimerIfUnused(): void {
+    if (!this.stopping && this.isUnused()) this.armIdleTimer();
   }
 
   private cancelIdleTimer(): void {
@@ -1647,10 +1680,6 @@ export class ManagerDaemon {
 
 function stopOutcome(child: ChildHandle): Pick<ChildExit, "code" | "signal"> | { lastSignalSent: NodeJS.Signals | null } {
   return child.exitStatus ?? { lastSignalSent: child.lastSignalSent };
-}
-
-function errorResponse(id: string, code: string, message: string): DaemonResponse {
-  return { id, error: { code, message } };
 }
 
 function isProtocolVersionNumber(value: unknown): value is number {

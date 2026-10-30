@@ -1,10 +1,19 @@
 import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
 
-export type ConnectionStatus =
-  | "disconnected"
-  | "connecting"
-  | "connected"
-  | "auth_required";
+export const CONNECTION_STATUSES = ["disconnected", "connecting", "connected", "auth_required"] as const;
+
+export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
+
+const KNOWN_STATUSES: ReadonlySet<unknown> = new Set(CONNECTION_STATUSES);
+
+export function isConnectionStatus(value: unknown): value is ConnectionStatus {
+  return KNOWN_STATUSES.has(value);
+}
+
+/** The warning for an upstream paused for authorization. */
+export function authorizationPausedMessage(error: Error | undefined): string {
+  return `authorization required; paused until the next call or reload: ${error?.message ?? "unknown"}`;
+}
 
 export type HealthState = "unknown" | "healthy" | "unhealthy";
 

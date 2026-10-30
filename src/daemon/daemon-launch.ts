@@ -39,11 +39,20 @@ export async function detachedDaemonLauncher(entryScript?: string): Promise<Daem
   };
 }
 
+/**
+ * The environment the daemon is launched with: the launcher's own, without
+ * `NODE_OPTIONS`, whose TLS and proxy flags would otherwise apply to every
+ * client's connections.
+ */
+export function daemonLaunchEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => name !== "NODE_OPTIONS"));
+}
+
 function spawnDetachedDaemon(entry: string, extraArgs: string[], stdio: StdioOptions): ChildProcess {
   const child = spawn(process.execPath, [entry, ...DAEMON_LAUNCH_ARGS, ...extraArgs], {
     detached: true,
     stdio,
-    env: process.env,
+    env: daemonLaunchEnv(process.env),
   });
   child.unref();
   child.on("error", () => {});

@@ -4,9 +4,20 @@ import {
   clientSecretKey,
   oauthCredentialKey,
   hasStoredOAuthCredential,
+  isClientSecretEnvName,
 } from "../../src/oauth/client-secret.js";
 import type { CredentialStore } from "../../src/credentials/credential-store.js";
 import { makeTestStore } from "../_helpers/credential-store.js";
+
+describe("isClientSecretEnvName", () => {
+  it.each(["OAUTH_SECRET", "NOTION_OAUTH_SECRET", "GOOGLE_OAUTH2_CLIENT_SECRET", "XOAUTH2_BEARER", "OAUTH"])("accepts %s", (name) => {
+    expect(isClientSecretEnvName(name)).toBe(true);
+  });
+
+  it.each(["OAUTHORITY", "MY_OAUTHIBITED", "oauth_secret", "HOME", "MCP_BRIDGE_MASTER_KEY", "OAUTH-SECRET", "1_OAUTH", ""])("rejects %j", (name) => {
+    expect(isClientSecretEnvName(name)).toBe(false);
+  });
+});
 
 describe("resolveClientSecret", () => {
   let store: CredentialStore;

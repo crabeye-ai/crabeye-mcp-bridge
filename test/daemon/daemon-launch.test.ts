@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, successorReport } from "../../src/daemon/daemon-launch.js";
+import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, daemonLaunchEnv, successorReport } from "../../src/daemon/daemon-launch.js";
 import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 import { until } from "../_helpers/daemon-fixtures.js";
@@ -118,6 +118,15 @@ describe("launching a daemon that waits for the one it replaces", () => {
 
       await successorStillRunning(marker);
     }));
+});
+
+describe("the environment a bridge launches the daemon with", () => {
+  it("is the bridge's own without NODE_OPTIONS", () => {
+    expect(daemonLaunchEnv({ NODE_OPTIONS: "--use-system-ca --tls-keylog=/tmp/keys", PATH: "/bin", SSL_CERT_FILE: "/etc/ca.pem" })).toEqual({
+      PATH: "/bin",
+      SSL_CERT_FILE: "/etc/ca.pem",
+    });
+  });
 });
 
 describe("the hidden flag that makes a launched daemon wait", () => {

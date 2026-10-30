@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { EventEmitter } from "node:events";
 import { daemonStatus, ensureDaemonRunning, isDaemonReachable, type EnsureAttemptOptions } from "./bootstrap.js";
 import { daemonFit } from "./daemon-version.js";
-import { DaemonClient, DaemonRpcError } from "./client.js";
+import { DaemonClient, DaemonRpcError, type CallOptions } from "./client.js";
 import { acquireLock, LockBusyError, type LockHandle } from "../process/lockfile.js";
 import { terminateDaemon } from "./daemon-process.js";
 import { readPidFile } from "./pidfile.js";
@@ -90,9 +90,9 @@ export class DaemonLivenessSupervisor extends EventEmitter {
   }
 
   /** Forward an RPC through the wrapped client. */
-  async call(method: string, params?: unknown): Promise<unknown> {
+  async call(method: string, params?: unknown, options?: CallOptions): Promise<unknown> {
     if (this.client === null) throw new Error("supervisor not connected");
-    return this.client.call(method, params);
+    return this.client.call(method, params, options);
   }
 
   get connected(): boolean {

@@ -114,6 +114,12 @@ describe("crabeye auth against a real authorization server", () => {
     });
   }
 
+  it("authorizes again over a stored access token that can't be sent in a header", async () => {
+    await store.set(oauthCredentialKey(SERVER), { type: "oauth2", access_token: "stale\nX-Injected: 1", refresh_token: "rt-stale" });
+
+    await expectAuthorized(await login());
+  });
+
   describe("authorization-response issuer (RFC 9207)", () => {
     const ACCEPTED: [string, boolean, IssFor][] = [
       ["matching iss, support not advertised", false, matching],

@@ -2,12 +2,14 @@ import { describe, it, expect } from "vitest";
 import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
 import {
   hasCredentialTemplates,
+  isSendableHeaderValue,
   resolveCredentialTemplates,
 } from "../src/credentials/resolve-templates.js";
 import { CredentialStore } from "../src/credentials/credential-store.js";
 import { CredentialError } from "../src/credentials/errors.js";
 import type { Credential } from "../src/credentials/types.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
+import { startCountingUpstream } from "./_helpers/counting-http-upstream.js";
 
 // --- Mock credential store ---
 
@@ -175,6 +177,24 @@ describe("resolveCredentialTemplates", () => {
   });
 });
 
+describe("isSendableHeaderValue", () => {
+  it.each(["Bearer token", "token\r\n", "\t token ", "caf\u00e9", "a\tb"])("accepts %j, as fetch sends it", (value) => {
+    expect(isSendableHeaderValue(value)).toBe(true);
+  });
+
+  it.each(["a\nb", "a\rb", "a\u0000b", "a\u0001b", "a\u007fb", "\u20ac"])("refuses %j", (value) => {
+    expect(isSendableHeaderValue(value)).toBe(false);
+  });
+
+  it("checks a value with a long run of spaces inside it at once", () => {
+    const started = performance.now();
+
+    expect(isSendableHeaderValue(`a${" ".repeat(1_000_000)}b`)).toBe(true);
+
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+});
+
 // --- Integration tests (mock transport + credential store) ---
 
 function createMockServer() {
@@ -211,6 +231,68 @@ describe("integration: HTTP client with credential templates", () => {
 
     await expect(client.connect()).rejects.toThrow(CredentialError);
     await client.close();
+  });
+
+  async function connectFailure(headers: Record<string, string>, value: string): Promise<string | undefined> {
+    const client = new HttpUpstreamClient({
+      name: "test-http",
+      config: { type: "streamable-http", url: "http://127.0.0.1:9/mcp", headers },
+      credentialStore: createMockStore({ token: { type: "secret", value } }),
+    });
+    try {
+      await client.connect();
+      return undefined;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    } finally {
+      await client.close();
+    }
+  }
+
+  it.each([
+    ["a credential with a line break inside it", { Authorization: "Bearer ${credential:token}" }, "secret-value\r\nX-Injected: 1"],
+    ["a credential with a character a header can't carry", { Authorization: "Bearer ${credential:token}" }, "secret-\u20ac"],
+    ["a literal value with a line break inside it", { "x-api-key": "literal-secret\nx" }, "unused"],
+    ["a credential with a NUL", { Authorization: "Bearer ${credential:token}" }, "secret\u0000x"],
+  ])("refuses a header value with %s, without the value in the error", async (_label, headers, value) => {
+    const [header] = Object.keys(headers);
+    expect(await connectFailure(headers, value)).toBe(`the value of header "${header}" contains a line break, a NUL or a character a header can't carry`);
+  });
+
+  it.each([
+    ["a credential ending in a line break, which fetch trims", "secret-value\n"],
+    ["a credential ending in CRLF, which fetch trims", "secret-value\r\n"],
+  ])("sends %s", async (_label, value) => {
+    const server = await startCountingUpstream();
+    const client = new HttpUpstreamClient({
+      name: "test-http",
+      config: { type: "streamable-http", url: server.url, headers: { Authorization: "Bearer ${credential:token}" } },
+      credentialStore: createMockStore({ token: { type: "secret", value } }),
+    });
+    try {
+      await client.connect();
+      expect(server.authorizations()).toContain("Bearer secret-value");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it.each([
+    ["an unsendable header the transport sets itself", { type: "streamable-http" as const, url: "http://127.0.0.1:9/mcp", headers: { "mcp-session-id": "bad\nvalue" } }],
+    [
+      "an unsendable Authorization header that OAuth replaces",
+      { type: "streamable-http" as const, url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer bad\nvalue" }, _bridge: { auth: { type: "oauth2" as const, clientId: "c" } } },
+    ],
+  ])("doesn't refuse %s, which is never sent", async (_label, config) => {
+    const client = new HttpUpstreamClient({ name: "test-http", config, credentialStore: createMockStore({}) });
+    const failure = await client.connect().then(
+      () => undefined,
+      (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    );
+    await client.close();
+
+    expect(failure).not.toContain("can't carry");
   });
 
   it("connects normally without templates", async () => {

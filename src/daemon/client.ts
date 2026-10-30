@@ -33,6 +33,11 @@ export interface DaemonClientOpts {
 
 const DEFAULT_RPC_TIMEOUT_MS = 5_000;
 
+export interface CallOptions {
+  /** Overrides the client's RPC timeout for this call; `0` waits until the reply or the connection closes. */
+  timeoutMs?: number;
+}
+
 export class DaemonClient {
   private channel: FrameChannel | null = null;
   private closed = false;
@@ -40,7 +45,7 @@ export class DaemonClient {
   private closeHandlers = new Set<() => void>();
   private pending = new Map<
     string,
-    { resolve: (r: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }
+    { resolve: (r: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout | undefined }
   >();
 
   constructor(private readonly opts: DaemonClientOpts) {
@@ -70,12 +75,7 @@ export class DaemonClient {
     channel.on("message", (msg: unknown) => this._dispatch(msg));
     channel.on("close", () => {
       this.channel = null;
-      const closeErr = new Error(DAEMON_CONNECTION_CLOSED);
-      for (const { reject, timer } of this.pending.values()) {
-        clearTimeout(timer);
-        reject(closeErr);
-      }
-      this.pending.clear();
+      this._failPending();
       for (const handler of this.closeHandlers) {
         try {
           handler();
@@ -90,7 +90,7 @@ export class DaemonClient {
     this.channel = channel;
   }
 
-  async call(method: string, params?: unknown): Promise<unknown> {
+  async call(method: string, params?: unknown, options: CallOptions = {}): Promise<unknown> {
     if (this.closed) throw new Error("daemon client is closed");
     if (this.channel === null) await this.connect();
     const channel = this.channel;
@@ -98,20 +98,23 @@ export class DaemonClient {
 
     const id = randomUUID();
     const req: DaemonRequest = { id, method, ...(params !== undefined ? { params } : {}) };
-    const timeoutMs = this.opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+    const timeoutMs = options.timeoutMs ?? this.opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          reject(
-            new DaemonRpcError(
-              ERROR_CODE_RPC_TIMEOUT,
-              `rpc ${method} timed out after ${timeoutMs}ms`,
-            ),
-          );
-        }
-      }, timeoutMs);
-      if (typeof timer.unref === "function") timer.unref();
+      const timer =
+        timeoutMs === 0
+          ? undefined
+          : setTimeout(() => {
+              if (this.pending.delete(id)) {
+                reject(
+                  new DaemonRpcError(
+                    ERROR_CODE_RPC_TIMEOUT,
+                    `rpc ${method} timed out after ${timeoutMs}ms`,
+                  ),
+                );
+              }
+            }, timeoutMs);
+      timer?.unref();
 
       this.pending.set(id, { resolve, reject, timer });
       const ok = channel.send(req);
@@ -141,11 +144,22 @@ export class DaemonClient {
     return this.channel.send(frame);
   }
 
+  /** Closes the connection; calls still waiting for a reply reject with `DAEMON_CONNECTION_CLOSED`. */
   close(): void {
     this.closed = true;
+    this._failPending();
     if (this.channel === null) return;
     this.channel.close();
     this.channel = null;
+  }
+
+  private _failPending(): void {
+    const closeErr = new Error(DAEMON_CONNECTION_CLOSED);
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(closeErr);
+    }
+    this.pending.clear();
   }
 
   private _dispatch(msg: unknown): void {

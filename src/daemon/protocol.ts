@@ -12,15 +12,22 @@
  * `RPC` notifications without a per-message ack roundtrip.
  */
 
-export const PROTOCOL_VERSION = 2;
+import type { Tool } from "@modelcontextprotocol/client";
+import type { ConnectionStatus } from "../upstream/types.js";
+
+export const PROTOCOL_VERSION = 3;
 export const MIN_BRIDGE_PROTOCOL_VERSION = 1;
-export const MIN_DAEMON_PROTOCOL_VERSION = 1;
+export const MIN_DAEMON_PROTOCOL_VERSION = 3;
 export const UNREPORTED_BRIDGE_PROTOCOL_VERSION = 1;
 export const STDERR_BRIDGE_PROTOCOL_VERSION = 2;
+export const INSTANCE_BRIDGE_PROTOCOL_VERSION = 3;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
+/** Hard cap on requests in flight per session, and on tool calls in flight per attached bridge. */
+export const MAX_INFLIGHT_PER_SESSION = 4096;
 
 export const STDERR_LINE_MAX_CHARS = 1_000;
 export const STDERR_TAIL_LINES = 20;
@@ -47,7 +54,14 @@ export type DaemonMethod =
   | "RESTART"
   | "PING"
   | "SESSION_EVICTED"
-  | "STDERR";
+  | "STDERR"
+  | "ATTACH"
+  | "CALL_TOOL"
+  | "CANCEL_TOOL"
+  | "RETRY"
+  | "UPSTREAM"
+  | "UPSTREAM_REMOVED"
+  | "LOG";
 
 export interface DaemonRequest {
   id: string;
@@ -151,6 +165,90 @@ export interface StatusSession {
   serverName: string;
 }
 
+/**
+ * The config a bridge would load: an explicit file, or the merged default
+ * built from the bridge-owned `config.json` at `path`. Always absolute.
+ */
+export interface InstanceSource {
+  kind: "file" | "merged";
+  path: string;
+}
+
+/** `ATTACH.params`: joins the bridge's socket to the instance for `source` and `env`. */
+export interface AttachParams {
+  bridgeProtocolVersion: number;
+  source: InstanceSource;
+  /**
+   * `MCP_BRIDGE_MASTER_KEY`, the variables a client-secret reference may name,
+   * and the TLS and proxy variables, as the bridge's own Node process applies
+   * them (see `instanceEnvFrom`).
+   */
+  env: Record<string, string>;
+}
+
+/** Sent after one `UPSTREAM` notification per name. */
+export interface AttachResult {
+  upstreams: string[];
+}
+
+/** Why a bridge can't use an upstream the daemon doesn't have. */
+export function notInDaemonConfig(name: string): string {
+  return `"${name}" is not in the configuration the manager loaded`;
+}
+
+/** Body of an `UPSTREAM` notification and of a `RETRY` reply. */
+export interface UpstreamSnapshot {
+  name: string;
+  status: ConnectionStatus;
+  /** Why the last connection attempt failed, while not connected. */
+  error?: string;
+  tools: Tool[];
+  instructions?: string;
+}
+
+export interface CallToolParams {
+  /** Chosen by the bridge, unique on its socket; `CANCEL_TOOL` names it. */
+  callId: string;
+  upstream: string;
+  name: string;
+  arguments?: Record<string, unknown>;
+}
+
+export interface CancelToolParams {
+  callId: string;
+}
+
+export interface RetryParams {
+  upstream: string;
+}
+
+export interface UpstreamRemovedParams {
+  upstream: string;
+}
+
+export type UpstreamLogLevel = "warn" | "error";
+
+export type UpstreamLogContext = Record<string, string | number | boolean>;
+
+export interface UpstreamLogParams {
+  upstream: string;
+  level: UpstreamLogLevel;
+  message: string;
+  context?: UpstreamLogContext;
+}
+
+export interface StatusInstance {
+  source: InstanceSource;
+  bridges: number;
+  upstreams: string[];
+}
+
+export interface StatusHttpUpstream {
+  serverName: string;
+  status: ConnectionStatus;
+  instances: number;
+}
+
 export type {
   KilledReason as TelemetryKilledReason,
   TelemetrySnapshot,
@@ -166,6 +264,8 @@ export interface StatusResult {
   appVersion: string;
   children: StatusChild[];
   sessions: StatusSession[];
+  instances: StatusInstance[];
+  httpUpstreams: StatusHttpUpstream[];
   telemetry: _TelemetrySnapshot;
 }
 
@@ -190,6 +290,14 @@ export const ERROR_CODE_INVALID_PARAMS = "invalid_params";
 export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
 export const ERROR_CODE_DAEMON_STOPPING = "daemon_stopping";
 export const ERROR_CODE_BRIDGE_UNSUPPORTED = "bridge_unsupported";
+export const ERROR_CODE_INSTANCE_LOAD_FAILED = "instance_load_failed";
+export const ERROR_CODE_UNKNOWN_UPSTREAM = "unknown_upstream";
+export const ERROR_CODE_NOT_ATTACHED = "not_attached";
+export const ERROR_CODE_ALREADY_ATTACHED = "already_attached";
+export const ERROR_CODE_UPSTREAM_ERROR = "upstream_error";
+export const ERROR_CODE_TOO_MANY_CALLS = "too_many_calls";
+export const ERROR_CODE_TOO_MANY_INSTANCES = "too_many_instances";
+export const ERROR_CODE_RESPONSE_TOO_LARGE = "response_too_large";
 /** Synthetic JSON-RPC error code emitted to inner requests when the session closes. */
 export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
 /** Synthetic JSON-RPC error code emitted when the per-child stdin queue overflows. */
@@ -260,8 +368,7 @@ export class FrameDecoder {
 
   next(): unknown | null {
     if (this.size < HEADER_BYTES) return null;
-    const buf = this.coalesce();
-    const len = buf.readUInt32BE(0);
+    const len = this.header().readUInt32BE(0);
     if (len > MAX_FRAME_BYTES) {
       // Discard the entire buffer so callers don't get stuck re-throwing on
       // every subsequent `next()`.
@@ -269,7 +376,8 @@ export class FrameDecoder {
       this.size = 0;
       throw new FrameError(`frame too large: ${len} > ${MAX_FRAME_BYTES}`);
     }
-    if (buf.length < HEADER_BYTES + len) return null;
+    if (this.size < HEADER_BYTES + len) return null;
+    const buf = this.coalesce();
     const payload = buf.subarray(HEADER_BYTES, HEADER_BYTES + len);
     const rest = buf.subarray(HEADER_BYTES + len);
     this.chunks = rest.length === 0 ? [] : [rest];
@@ -283,6 +391,11 @@ export class FrameDecoder {
     }
   }
 
+  private header(): Buffer {
+    const first = this.chunks[0]!;
+    return first.length >= HEADER_BYTES ? first : Buffer.concat(this.chunks, HEADER_BYTES);
+  }
+
   private coalesce(): Buffer {
     if (this.chunks.length === 1) return this.chunks[0]!;
     const joined = Buffer.concat(this.chunks, this.size);
@@ -291,14 +404,12 @@ export class FrameDecoder {
   }
 }
 
+export function errorResponse(id: string, code: string, message: string): DaemonResponse {
+  return { id, error: { code, message } };
+}
+
 export function notImplementedResponse(id: string, method: string): DaemonResponse {
-  return {
-    id,
-    error: {
-      code: ERROR_CODE_NOT_IMPLEMENTED,
-      message: `method "${method}" is not implemented in this phase`,
-    },
-  };
+  return errorResponse(id, ERROR_CODE_NOT_IMPLEMENTED, `method "${method}" is not implemented in this phase`);
 }
 
 /**

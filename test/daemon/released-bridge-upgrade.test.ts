@@ -77,7 +77,7 @@ describe.skipIf(isWindows)("upgrading from the released crabeye 1.3.0", { timeou
     await until(async () => isDeepStrictEqual(await callStubTool(releasedBridge).catch(() => null), CALLED), 20_000);
   });
 
-  it("keeps the 1.3.0 daemon a pre-release bridge leaves running, and serves that bridge's calls through it", async () => {
+  it("replaces the 1.3.0 daemon for a pre-release bridge too, since its protocol is too old for that bridge", async () => {
     const releasedScript = await workspace();
     const preReleaseScript = await cliAtVersion(cliScript, home.dir, "99.0.0-beta.1");
     releasedScripts.push(preReleaseScript);
@@ -88,9 +88,9 @@ describe.skipIf(isWindows)("upgrading from the released crabeye 1.3.0", { timeou
     const preReleaseBridge = await home.connectBridge(preReleaseScript);
 
     expect(await callStubTool(preReleaseBridge)).toEqual(CALLED);
-    const kept = await home.status();
-    expect(kept).toMatchObject({ pid: old!.pid });
-    expect(kept!.appVersion).toBeUndefined();
-    expect(kept!.sessions).toHaveLength(1);
+    const replaced = await home.status();
+    expect(replaced).toMatchObject({ appVersion: "99.0.0-beta.1" });
+    expect(processExists(old!.pid)).toBe(false);
+    expect(replaced!.sessions).toHaveLength(1);
   });
 });

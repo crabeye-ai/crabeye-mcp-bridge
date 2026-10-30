@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { GlobalBridgeConfig, ServerConfig } from "../config/schema.js";
 
 /**
  * Reconnect knobs that materially change the client's runtime behavior. When
@@ -44,6 +45,15 @@ export interface UpstreamSpec {
   reconnect?: UpstreamReconnectInputs;
 }
 
+/** The reconnect settings an upstream runs with: its own `_bridge.reconnect`, else the global one. */
+export function resolveReconnectInputs(global: GlobalBridgeConfig, server: ServerConfig): UpstreamReconnectInputs {
+  const own = server._bridge?.reconnect;
+  return {
+    reconnectBaseDelay: own?.reconnectBaseDelay ?? global.reconnect?.reconnectBaseDelay,
+    reconnectMaxDelay: own?.reconnectMaxDelay ?? global.reconnect?.reconnectMaxDelay,
+  };
+}
+
 interface HashedUpstreamSpec {
   command: string;
   args: string[];
@@ -83,7 +93,8 @@ function hasAnyReconnectField(r: UpstreamReconnectInputs): boolean {
   );
 }
 
-function canonicalize(value: unknown): string {
+/** JSON with object keys sorted at every level, so equal values give equal text. */
+export function canonicalize(value: unknown): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }

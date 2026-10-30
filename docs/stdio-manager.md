@@ -2,7 +2,7 @@
 
 The STDIO manager is a per-user background process the bridge spawns automatically. It owns every STDIO upstream MCP server and lets multiple bridges share one subprocess per upstream — so running Claude Desktop, Cursor, and a CLI bridge against the same Linear MCP server doesn't spawn three copies of the Linear MCP server.
 
-The manager is mandatory for STDIO upstreams; there is no inline fallback. HTTP and SSE upstreams are unaffected — each bridge connects to them directly.
+The manager also connects the HTTP and SSE upstreams that have no `_bridge.auth`, once for every bridge that uses them (see [HTTP and SSE upstreams](#http-and-sse-upstreams)). There is no inline fallback for either kind: when the manager can't be started or reached, those upstreams fail to connect and say why, and the bridge keeps trying.
 
 ## Why it exists
 
@@ -24,6 +24,50 @@ A shared child serves all of its bridges at once. A server that keeps state in m
 
 The bridge dedupes config entries by `upstreamHash` locally — duplicate identical entries collapse to one session before reaching the manager.
 
+## HTTP and SSE upstreams
+
+The manager connects every HTTP and SSE upstream without `_bridge.auth`, including servers you authorized with `crabeye-mcp-bridge auth <server>` and no config change. Upstreams with `_bridge.auth` are still connected by each bridge.
+
+Bridges that load the same config share the manager's copy of it: the same `--config` file (or `MCP_BRIDGE_CONFIG`), or, without either, the default set made of `~/.crabeye-mcp-bridge/config.json` and the client config files it lists. A bridge whose MCP entry sets different values for any of these variables gets its own copy, so it never uses another client's credentials or network settings:
+
+* `MCP_BRIDGE_MASTER_KEY`;
+* the variables a `clientSecret` can name (see [the naming rule](auth.md#confidential-clients));
+* the network settings below.
+
+The manager connects each client's HTTP and SSE upstreams with that client's network settings, not with its own:
+
+* it checks certificates unless the client sets `NODE_TLS_REJECT_UNAUTHORIZED=0`;
+* it trusts Node's own certificates, the certificates in the client's `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE`, and the system's certificates when the client sets `NODE_USE_SYSTEM_CA=1` or runs Node with `--use-system-ca`;
+* it goes through the client's `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` (upper or lower case) when the client sets `NODE_USE_ENV_PROXY=1` or runs Node with `--use-env-proxy`.
+
+A setting that makes no difference, such as a proxy variable without `NODE_USE_ENV_PROXY=1`, doesn't give a client its own copy. The manager reads a client's certificate files when it opens that client's connection; after you change one, run `crabeye-mcp-bridge daemon restart`.
+
+The manager runs without `NODE_OPTIONS`. A bridge whose Node options would change its connections in other ways, such as `--use-openssl-ca`, `--tls-min-v1.3` or `--require` for a proxy agent, logs a warning naming them, since the manager doesn't apply them.
+
+The manager's own `OPENSSL_CONF`, from the client whose bridge started it, applies to every client. Its `SSL_CERT_DIR`, on Node builds that read it, applies only to clients whose certificate settings are the same as its own and that set no `SSL_CERT_FILE`. On Linux, the system's certificates are read with the manager's own `SSL_CERT_FILE` and `SSL_CERT_DIR`.
+
+Each upstream gets one connection for all of these bridges. Two entries share a connection, even across configs, if they have the same server name, transport, URL, headers (as written, before `${credential:…}` is filled in), master key and network settings. A server on the 2026-07-28 protocol sees one client, and a server on an earlier protocol sees one session. When a server ends that session, the manager starts one new session for everyone once the connection closes or three health checks in a row fail.
+
+The manager:
+
+* reads the config files, the credential store and the keychain itself, and fills in `${credential:…}` header values on every connect, so a changed credential is used from the next connect on;
+* checks each connection's health once, with the `healthCheckInterval` of the longest-standing config using it and the reconnect settings of the config that first needed it;
+* uses and refreshes stored OAuth tokens for every bridge at once, so clients no longer each refresh an expired token, and pauses an upstream that needs authorization for every bridge at once;
+* follows edits to the files it loaded (the `--config` file, or the client config files), applying a change once for every bridge;
+* reads the config again whenever another bridge starts using it.
+
+When an HTTP or SSE server's URL or headers change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server or gives it `_bridge.auth`, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Everything else in that file takes effect for each client when that client restarts.
+
+What `search_tools` and `run_tool` show doesn't change: each bridge still applies its own tool policy, rate limits and passthrough settings. Cancelling a call cancels it at the server, and each server's instructions reach every client.
+
+The [manager log](#manager-log) records what happens to these upstreams. Their warnings and errors also show in the log of each bridge using them (the AI client's MCP log), tagged with the server name. A warning that is only given once, such as the `"sse"` deprecation, shows in the bridges using the upstream at that moment.
+
+A config's connections stay open while a bridge uses that config, and for `_bridge.daemon.idleMs` after the last such bridge disconnects; a bridge that starts in between reuses them instead of connecting again.
+
+If the manager is stopped or replaced while a call is running, that call fails with `daemon shutdown`, or with `daemon connection closed` when the manager crashes or is killed. The bridge starts a new manager, and later calls go through without restarting the client. A tool result too large for the manager to pass on (over 16 MB) fails with an error saying so.
+
+A bridge from crabeye 1.3.0 or earlier still connects to HTTP and SSE servers itself.
+
 ## Initialize and protocol-version cache
 
 The first bridge session against a child runs a real `initialize` round-trip. The manager caches the result and replays it on every subsequent session's `initialize` for the same child — the call never reaches the child a second time. The cache covers `protocolVersion`, `serverInfo`, `capabilities`, and (when the upstream advertises one) the `instructions` text used by the bridge's [`_bridge.passthrough`](configuration.md#context-passthrough) feature, so all sessions see the same instructions regardless of attach order.
@@ -34,16 +78,31 @@ A server settles on one protocol from the first message it gets other than this 
 
 ## CLI
 
-The manager is started automatically on first bridge connect. The `daemon` subcommand exists for manual control:
+A bridge starts the manager as soon as its config has an upstream, STDIO or HTTP. The `daemon` subcommand exists for manual control:
 
 ```bash
 crabeye-mcp-bridge daemon start      # spawn the manager (no-op if one it doesn't need to replace is running)
 crabeye-mcp-bridge daemon stop       # graceful shutdown; stops an unresponsive manager too
-crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, refused upstream requests, each server's protocol, and the log file
+crabeye-mcp-bridge daemon status     # pid, uptime, crabeye version, refused upstream requests, each server's protocol, the configs and HTTP upstreams in use, and the log file
 crabeye-mcp-bridge daemon restart    # stop + start
 ```
 
 `daemon status` lists the servers bridges are using under `children`, each with its protocol: `modern` (2026-07-28), `legacy` (an earlier version), or `unknown` (not known yet). It shows `null` when the manager can't be asked or doesn't report protocols (managers from crabeye 1.3.0 or earlier don't).
+
+It lists the configs the manager loaded for bridges under `instances`, each with:
+
+* `config`: its file;
+* `kind`: `file` for a `--config` file or `MCP_BRIDGE_CONFIG`, `merged` for the default set read through `~/.crabeye-mcp-bridge/config.json`;
+* `bridges`: the number of bridges attached;
+* `servers`: the HTTP and SSE servers it connects.
+
+The HTTP and SSE upstreams it connects are under `httpUpstreams`, each with:
+
+* `server`: its name;
+* `state`: `connecting`, `connected`, `disconnected` or `auth_required`;
+* `instances`: how many of those configs share it.
+
+Both show `null` when the manager can't be asked or doesn't report them.
 
 `crabeye-mcp-bridge daemon --internal-launch` is a hidden, internal-only entrypoint used by the bridge to fork the manager process. Don't use it directly.
 
@@ -66,12 +125,12 @@ All knobs live under `_bridge.daemon.*` in the bridge config:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `idleMs` | `60000` | The manager self-exits this long after the last bridge disconnects. |
+| `idleMs` | `60000` | The manager self-exits this long after the last bridge disconnects. A config's HTTP connections close this long after the last bridge using it disconnects, unless another config still uses them. |
 | `graceMs` | `60000` | A child stays alive this long after its last session detaches, in case another bridge reattaches. |
 | `rpcTimeoutMs` | `30000` | Per-RPC timeout on outbound bridge→manager calls. Stalled responses past this trigger a force-respawn. |
 | `heartbeatMs` | `5000` | Bridge sends a PING this often. Missed heartbeat (`heartbeatMs * 3`) trips force-respawn even with zero in-flight RPCs. |
 
-The child grace timer and the manager's idle timer compose independently — the manager exits roughly `graceMs + idleMs` (≈2 min by default) after the last bridge disconnects.
+The child grace timer and the manager's idle timer compose independently — the manager exits roughly `graceMs + idleMs` (≈2 min by default) after the last bridge disconnects, or `2 × idleMs` when it only had HTTP upstreams.
 
 ## What happens when I edit my MCP config and save?
 
@@ -87,6 +146,8 @@ Bridge has hot-reload: it reads the saved config and reconciles upstream session
 
    This is the only case where you need to invoke the `daemon` CLI manually.
 
+For HTTP and SSE upstreams the manager connects, it applies the edit itself, once for every bridge: a changed URL or header reconnects the server, and an added or removed server appears or goes away for every client.
+
 ### Where do paths live?
 
 * **Unix:** UDS at `~/.crabeye/run/manager.sock` (mode `0600`), pidfile at `~/.crabeye/run/manager.pid`, lockfile at `~/.crabeye/run/manager.lock`.
@@ -96,7 +157,7 @@ Bridge has hot-reload: it reads the saved config and reconciles upstream session
 
 ## Failure handling
 
-* **Manager crash / SIGKILL.** Bridge detects via socket close and, unless another manager already answers on the socket, force-respawns the manager (lock-first to mitigate recycled-pid hazards), then re-OPENs every session. Read-only in-flight requests (`tools/list`, `prompts/list`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/get`) silently retry; everything else surfaces `ERR_UPSTREAM_RESTARTED { reason: "daemon_respawn" }`. Calls made after the bridge notices the lost connection wait and run once on the new manager; if the respawn fails, they fail with the same restart error.
+* **Manager crash / SIGKILL.** Bridge detects via socket close and, unless another manager already answers on the socket, force-respawns the manager (lock-first to mitigate recycled-pid hazards), then re-OPENs every session. Read-only in-flight requests (`tools/list`, `prompts/list`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/get`) silently retry; everything else surfaces `ERR_UPSTREAM_RESTARTED { reason: "daemon_respawn" }`. Calls made after the bridge notices the lost connection wait and run once on the new manager; if the respawn fails, they fail with the same restart error. For the HTTP and SSE upstreams the manager connects, every call in flight fails with `daemon connection closed` instead, and calls made while the new manager starts wait for it.
 * **Stalled manager (RPC handler sleeps).** Bridge's heartbeat watchdog or per-RPC timeout fires; the bridge SIGKILLs the manager via `manager.pid` and respawns.
 * **Unresponsive manager with no bridge connected.** When the manager recorded in `manager.lock` (or `manager.pid`) is running but doesn't answer, a bridge waits up to a minute in case it is still starting up. If it still doesn't answer, the bridge stops it and starts a fresh one, but only after confirming the process is a crabeye manager, and it replaces it at most once per attempt. When several bridges hit this at once, only one of them does the replacement. If the recorded pid now belongs to an unrelated program, the bridge ignores it and starts a manager. If the process can't be identified, the bridge leaves it running and asks you to run `crabeye-mcp-bridge daemon stop`; if something holds the socket with no manager recorded, it reports the socket so you can stop whatever is holding it.
 * **Two-bridge race.** Loser blocks on `manager.lock` for up to `rpcTimeoutMs * 2` (60s default), then ensures a manager anyway and connects to whichever manager process ended up bound to the socket. Only one manager can own the socket; extras exit on their own.
@@ -138,13 +199,15 @@ The log records:
 * a start that fails, with the error, and a start that finds a manager already running and leaves it to serve;
 * waiting for a previous manager to exit, and taking over from one that is no longer running;
 * sessions opening, closing (and why), and being refused (and why);
+* bridges attaching to and detaching from a config, a config that can't be loaded (and why), and servers added, removed or reconnected after an edit;
+* HTTP and SSE upstreams connecting, failing to connect, being paused for authorization, failing health checks, and their other warnings;
 * STDIO servers starting, exiting on their own (with their exit code or signal), and being stopped (idle, not answering pings, restarted, or shutting down).
 
 At debug level it also records what servers write to stderr, tagged with the server name, with the same 100-lines-a-second limit as in bridge logs. Each line starts with the date, the time with its UTC offset, and the manager's process id, so the lines of two managers running at the same time (a new one waiting for the old one) can be told apart.
 
 The level comes from `_bridge.logLevel` in `~/.crabeye-mcp-bridge/config.json` and is read when the manager starts; run `crabeye-mcp-bridge daemon restart` after changing it. The log is always plain text, whatever `_bridge.logFormat` is set to. If that file can't be read or isn't valid, the manager logs a warning and uses the defaults.
 
-The manager doesn't record environment values or command-line arguments. It does record server names, session and process ids, the command of a server that can't be started, the names and locations of invalid settings and why they're invalid (for a URL that can include its host, never its credentials), and, after a crash, the error with its stack. When a server writes something other than protocol messages to its output, the log says how many such lines there were, not what they said. Because servers can echo secrets to stderr, check a debug-level log before sharing it.
+The manager doesn't record environment values or command-line arguments. It does record server names, session and process ids, the command of a server that can't be started, the path of a config file a bridge asked for that can't be loaded, the path of a certificate file it can't read, the names and locations of invalid settings and why they're invalid (for a URL that can include its host, never its credentials), and, after a crash, the error with its stack. When a server writes something other than protocol messages to its output, the log says how many such lines there were, not what they said. Because servers can echo secrets to stderr, check a debug-level log before sharing it.
 
 Before the file would grow past 10 MB, it is renamed to `daemon.log.1`, replacing the previous one, and a new `daemon.log` is started. If it can't be renamed (for example because another program has `daemon.log.1` open on Windows), it is emptied instead. If the log can't be written, the manager keeps running without it.
 
@@ -158,9 +221,9 @@ When an upstream answers a tool call by asking for client input, the call fails 
 
 A manager started by an older crabeye version keeps running after an upgrade for as long as a bridge uses it. When a bridge from the new version finds one, it stops it and starts a manager of its own version in its place. Bridges still using the old manager reconnect to the new one on their own; calls they had in flight fail once. A bridge from crabeye 1.3.0 or earlier sometimes waits up to its `_bridge.daemon.respawnLockWaitMs` setting (one minute by default) before it reconnects. A manager of the same or a newer version is used as is. A bridge from a pre-release version (such as `2.1.0-beta.1`) only replaces an older pre-release manager, never a release one or one that reports no version, unless that manager is too old for the bridge to talk to.
 
-A bridge tries this once. A client that was started before the upgrade and runs the old version from its own install (for example a cached `npx` copy) can start the old manager again whenever it loses its connection. When a new bridge ends up on an old manager that way, or could not replace it, it logs a warning once for that manager; bridges use whichever manager is running until those clients restart.
+A bridge tries this once. A client that was started before the upgrade and runs the old version from its own install (for example a cached `npx` copy) can start the old manager again whenever it loses its connection. When a new bridge ends up on an old manager that way, or could not replace it, it logs a warning once for that manager; bridges use whichever manager is running until those clients restart. A manager from crabeye 1.3.0 or earlier is too old for this version's bridges: when one can't be replaced, their STDIO servers fail to start, and the HTTP servers the manager would connect fail to connect, with the error described below.
 
-If a newer manager no longer accepts bridges as old as this one, the bridge's STDIO servers fail to start with an error saying so. Upgrading crabeye fixes it. The same happens when a manager is too old for the bridge to talk to and can't be replaced; `crabeye-mcp-bridge daemon stop` fixes that.
+If a newer manager no longer accepts bridges as old as this one, the bridge's STDIO servers fail to start, and the HTTP servers the manager would connect fail to connect, with an error saying so. Upgrading crabeye fixes it. The same happens when a manager is too old for the bridge to talk to and can't be replaced; `crabeye-mcp-bridge daemon stop` fixes that.
 
 `crabeye-mcp-bridge daemon start` replaces an older manager the same way. It exits with an error if an older one is still running afterwards, or if the running manager no longer accepts this bridge or is too old for the bridge to talk to.
 
@@ -172,10 +235,12 @@ The manager's `STATUS` RPC returns a `telemetry` object alongside the existing `
 {
   "uptime": 1234567,
   "pid": 8412,
-  "version": 2,
+  "version": 3,
   "appVersion": "2.0.0",                 // crabeye version of this manager
   "children": [ /* ... */ ],
   "sessions": [ /* ... */ ],
+  "instances": [ /* ... */ ],            // configs loaded for bridges
+  "httpUpstreams": [ /* ... */ ],        // HTTP and SSE upstreams the manager connects
   "telemetry": {
     "children": {
       "total": 3,                        // gauge: live children right now

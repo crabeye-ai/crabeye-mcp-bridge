@@ -69,6 +69,7 @@ export class ConfigWatcher {
             this._scheduleReload();
           }
         });
+        watcher.on("error", (err) => this._stopWatching(watcher, dir, err));
         this._watchers.push(watcher);
       } catch (err) {
         this._logger.warn("failed to watch directory", {
@@ -78,6 +79,16 @@ export class ConfigWatcher {
         });
       }
     }
+  }
+
+  /** Reloads after the debounce, as if a watched file changed; a config that didn't change isn't passed on. */
+  checkNow(): void {
+    if (this._listener !== undefined) this._scheduleReload();
+  }
+
+  /** Records a config applied without this watcher, so that a later edit back to the earlier one still counts as a change. */
+  markApplied(config: BridgeConfig): void {
+    this._lastJson = JSON.stringify(config);
   }
 
   stop(): void {
@@ -92,6 +103,16 @@ export class ConfigWatcher {
     this._listener = undefined;
     this._reloading = false;
     this._pendingReload = false;
+  }
+
+  private _stopWatching(watcher: FSWatcher, dir: string, err: Error): void {
+    watcher.close();
+    this._watchers = this._watchers.filter((candidate) => candidate !== watcher);
+    this._logger.warn("stopped watching config directory", {
+      component: "config-watcher",
+      path: dir,
+      error: err.message,
+    });
   }
 
   private _scheduleReload(): void {
