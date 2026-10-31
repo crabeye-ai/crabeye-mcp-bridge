@@ -15,6 +15,10 @@ import { DAEMON_LAUNCH_ARGS } from "../../src/daemon/daemon-identity.js";
 import { AWAIT_PREDECESSOR_FLAG, successorReport } from "../../src/daemon/daemon-launch.js";
 import { processExists } from "../../src/process/process-utils.js";
 import { APP_VERSION, BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR } from "../../src/constants.js";
+import { MIN_BRIDGE_PROTOCOL_VERSION, type UpstreamLogParams } from "../../src/daemon/protocol.js";
+
+const definedEnv = (): Record<string, string> =>
+  Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
 
 const execFileAsync = promisify(execFile);
 const isWindows = process.platform === "win32";
@@ -24,7 +28,6 @@ const STAMP_ANYWHERE = new RegExp(String.raw`${STAMP} \[\d+\]`, "g");
 const HOME_VARS = ["HOME", "USERPROFILE", "LOCALAPPDATA"] as const;
 const SECRET = "marker-7d3a1f";
 const QUICK_KILL = { daemon: { killGraceMs: 0 } };
-const BRIDGE_PROTOCOL_VERSION = 2;
 
 describe("the daemon's log file", { timeout: 60_000 }, () => {
   let cliScript: string;
@@ -33,8 +36,7 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
   const savedEnv: Partial<Record<(typeof HOME_VARS)[number], string>> = {};
   const clients: DaemonClient[] = [];
   const startedPids = new Set<number>();
-  let nextSession = 1;
-  let nextRpc = 1;
+  let nextCall = 1;
 
   beforeAll(async () => {
     if (isWindows && (await isServing(getDaemonSocketPath()))) {
@@ -126,42 +128,22 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
     return pid;
   }
 
-  function spec(overrides: { command?: string; args?: string[]; resolvedEnv?: Record<string, string> } = {}) {
-    return {
-      serverName: "stub",
-      command: overrides.command ?? process.execPath,
-      args: overrides.args ?? [stub],
-      resolvedEnv: overrides.resolvedEnv ?? {},
-      cwd: "",
-      clientInfo: { name: "test-bridge", version: "0" },
-      clientCapabilities: {},
-      protocolVersion: "2025-06-18",
-    };
-  }
-
-  function nextSessionId(): string {
-    return `${String(nextSession++).padStart(8, "0")}-2222-2222-2222-222222222222`;
-  }
-
-  async function openStub(client: DaemonClient, overrides: Parameters<typeof spec>[0] = {}, sessionId = nextSessionId()): Promise<string> {
-    await client.call("OPEN", { sessionId, bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION, spec: spec(overrides) });
-    return sessionId;
-  }
-
-  function sendTool(client: DaemonClient, sessionId: string, name: string, args: Record<string, unknown>): number {
-    const id = nextRpc++;
-    client.sendNotification("RPC", { sessionId, payload: { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } } });
-    return id;
-  }
-
-  async function callTool(client: DaemonClient, sessionId: string, name: string, args: Record<string, unknown>): Promise<void> {
-    const answered = new Set<unknown>();
+  async function attachStub(client: DaemonClient, server: Record<string, unknown> = {}, childEnv: Record<string, string> = definedEnv()): Promise<UpstreamLogParams[]> {
+    const config = join(home, "client.json");
+    await writeFile(config, JSON.stringify({ mcpServers: { stub: { command: process.execPath, args: [stub], ...server } } }));
+    let state: string | undefined;
+    const logs: UpstreamLogParams[] = [];
     client.setNotificationHandler((notif) => {
-      const payload = (notif.params as { payload?: { id?: unknown } } | undefined)?.payload;
-      if (notif.method === "RPC") answered.add(payload?.id);
+      if (notif.method === "UPSTREAM") state = (notif.params as { status: string }).status;
+      if (notif.method === "LOG") logs.push(notif.params as UpstreamLogParams);
     });
-    const id = sendTool(client, sessionId, name, args);
-    await until(() => answered.has(id), 10_000);
+    await client.call("ATTACH", { bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION, source: { kind: "file", path: config }, env: {}, childEnv });
+    if (server.command === undefined) await until(() => state === "connected", 10_000);
+    return logs;
+  }
+
+  function callStub(client: DaemonClient, name: string, args: Record<string, unknown> = {}): Promise<unknown> {
+    return client.call("CALL_TOOL", { callId: String(nextCall++), upstream: "stub", name, arguments: args }, { timeoutMs: 0 });
   }
 
   async function shutDown(pid: number): Promise<void> {
@@ -184,16 +166,16 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
     await until(async () => (await logLines()).some((line) => line.includes(`[${pid}]`) && line.endsWith("[daemon] serving")), 10_000);
   }
 
-  it("records the daemon starting with its version and socket, a session opening and a child starting", async () => {
+  it("records the daemon starting with its version and socket, a bridge attaching and a child starting", async () => {
     const pid = await startDaemon();
-    await openStub(await connect());
+    await attachStub(await connect());
 
     await until(() => logged("child started"), 10_000);
     const start = await lineWith("daemon starting");
     expect(start).toContain(`[${pid}]`);
     expect(start).toContain(`version=${APP_VERSION}`);
     expect(start).toContain(`socket=${getDaemonSocketPath()}`);
-    expect(await lineWith("session opened")).toMatch(new RegExp(`\\[daemon:stub\\] session opened .*bridgeProtocolVersion=${BRIDGE_PROTOCOL_VERSION}`));
+    expect(await lineWith("bridge attached")).toMatch(/\[instance\] bridge attached config=file bridges=1/);
     expect(await lineWith("child started")).toMatch(/\[daemon:stub\] child started pid=\d+/);
     for (const line of await logLines()) expectWhole(line);
   });
@@ -201,30 +183,30 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
   it("records a child that exits on its own with its exit code", async () => {
     await startDaemon();
     const client = await connect();
-    const sessionId = await openStub(client);
+    await attachStub(client);
 
-    sendTool(client, sessionId, "crash", { lines: [], code: 7 });
+    void callStub(client, "crash", { lines: [], code: 7 }).catch(() => {});
 
     await until(() => logged("child exited"), 10_000);
     expect(await lineWith("child exited")).toMatch(/\[daemon:stub\] child exited .*code=7/);
   });
 
-  it("records a refused session with the reason", async () => {
+  it("records a session refused to a bridge from crabeye-mcp-bridge 1.3.0 or earlier", async () => {
     await startDaemon();
 
     await expect((await connect()).call("OPEN", {})).rejects.toThrow();
 
     await until(() => logged("session refused"), 10_000);
-    expect(await lineWith("session refused")).toContain("reason=OPEN params malformed");
+    expect(await lineWith("session refused")).toContain("restart the AI client");
   });
 
   it("records child stderr with the server name at debug level", async () => {
     await writeBridgeConfig({ _bridge: { logLevel: "debug", ...QUICK_KILL } });
     await startDaemon();
     const client = await connect();
-    const sessionId = await openStub(client);
+    await attachStub(client);
 
-    await callTool(client, sessionId, "stderr", { text: "warming the cache" });
+    await callStub(client, "stderr", { text: "warming the cache" });
 
     await until(() => logged("warming the cache"), 10_000);
     expect(await lineWith("warming the cache")).toMatch(/DEBUG \[stderr:stub\] warming the cache$/);
@@ -233,14 +215,10 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
   it("leaves child stderr out at the default level", async () => {
     const pid = await startDaemon();
     const client = await connect();
-    const sessionId = await openStub(client);
-    let forwarded = false;
-    client.setNotificationHandler((notif) => {
-      if (notif.method === "STDERR" && (notif.params as { line?: string }).line === "cache ready") forwarded = true;
-    });
-    sendTool(client, sessionId, "stderr", { text: "cache ready" });
+    const logs = await attachStub(client);
+    await callStub(client, "stderr", { text: "cache ready" });
 
-    await until(() => forwarded, 10_000);
+    await until(() => logs.some((log) => log.level === "debug" && log.message === "cache ready"), 10_000);
     await shutDown(pid);
     expect(await logged("cache ready")).toBe(false);
   });
@@ -249,7 +227,7 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
     await writeBridgeConfig("{ not json");
 
     await startDaemon();
-    await openStub(await connect());
+    await attachStub(await connect());
 
     await until(() => logged("child started"), 10_000);
     expect(await lineWith("could not load")).toMatch(/WARN {2}\[daemon\] could not load .*using defaults/);
@@ -257,7 +235,7 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
 
   it("keeps both daemons' lines whole and apart while a successor waits for its predecessor", async () => {
     const predecessor = await startDaemon();
-    await openStub(await connect());
+    await attachStub(await connect());
     const successor = launch(AWAIT_PREDECESSOR_FLAG, "20000");
     expect(await successorReport(successor)).toBe("waiting");
 
@@ -307,7 +285,7 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
 
     await startDaemon();
     const client = await connect();
-    await openStub(client);
+    await attachStub(client);
 
     expect(((await client.call("STATUS")) as { children: unknown[] }).children).toHaveLength(1);
   });
@@ -372,16 +350,14 @@ describe("the daemon's log file", { timeout: 60_000 }, () => {
     await writeBridgeConfig({ _bridge: { logLevel: "debug", ...QUICK_KILL } });
     await startDaemon();
     const client = await connect();
-    const secretSpec = { resolvedEnv: { API_TOKEN: SECRET }, args: [stub, `--token=${SECRET}`] };
-    const sessionId = await openStub(client, secretSpec);
-    await callTool(client, sessionId, "plain", {});
-    await expect(openStub(client, secretSpec, sessionId)).rejects.toThrow();
-    await expect(openStub(client, { resolvedEnv: { API_TOKEN: `${SECRET}\0` } })).rejects.toThrow();
-    await openStub(client, { command: join(home, "missing-command"), args: [`--token=${SECRET}`], resolvedEnv: { API_TOKEN: SECRET } }).catch(() => {});
-    sendTool(client, sessionId, "crash", { lines: [], code: 2 });
-
+    await attachStub(client, { args: [stub, `--token=${SECRET}`], env: { API_TOKEN: SECRET } }, { ...definedEnv(), CLIENT_TOKEN: SECRET });
+    await callStub(client, "plain");
+    void callStub(client, "crash", { lines: [], code: 2 }).catch(() => {});
     await until(async () => (await logLines()).some((line) => line.includes("child exited") && line.includes("code=2")), 10_000);
-    expect(await logged("session refused")).toBe(true);
+    const other = await connect();
+    await attachStub(other, { command: join(home, "missing-command"), args: [`--token=${SECRET}`], env: { API_TOKEN: SECRET } }).catch(() => {});
+
+    await until(async () => (await logLines()).some((line) => line.includes("cause=failed_to_start")), 10_000);
     expect(await readLog()).not.toContain(SECRET);
     expect(await readLog()).not.toMatch(/[0-9a-f]{64}|upstreamHash|groupId/);
   });

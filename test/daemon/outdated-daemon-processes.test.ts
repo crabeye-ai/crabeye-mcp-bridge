@@ -101,7 +101,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       expect(replaced).toMatchObject({ appVersion: APP_VERSION });
       expect(replaced!.pid).not.toBe(old.pid);
       expect(processExists(old.pid)).toBe(false);
-      await until(async () => (await home.status())?.sessions.length === 2, 20_000);
+      await until(async () => (await home.status())?.instances[0]?.bridges === 2, 20_000);
       expect(await callStubTool(oldBridge)).toEqual(CALLED);
       expect(await home.status()).toMatchObject({ pid: replaced!.pid });
       expect(newBridge.stderr()).not.toContain(STILL_RUNNING);
@@ -166,8 +166,8 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
 
       const bridge = await connectBridge();
       await until(async () => bridge.stderr().includes(STILL_RUNNING_WARNING), 20_000);
-      const opensAfterReplacement = (await old.requests("OPEN")).length;
-      await until(async () => (await old.requests("OPEN")).length >= opensAfterReplacement + 2, 20_000);
+      const attachesAfterReplacement = (await old.requests("ATTACH")).length;
+      await until(async () => (await old.requests("ATTACH")).length >= attachesAfterReplacement + 2, 20_000);
 
       expect(await old.requests("SHUTDOWN")).toEqual(["SHUTDOWN"]);
       const running = await home.status();
@@ -278,7 +278,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
   });
 
   describe("daemon status", () => {
-    it("shows the daemon's version and an empty set of refused requests", async () => {
+    it("shows the daemon's version, and no children, instances or upstreams", async () => {
       await workspace();
       const running = await startDaemon(cliScript);
 
@@ -291,24 +291,23 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         pid: running.pid,
         uptime: expect.any(Number),
         appVersion: APP_VERSION,
-        refusedUpstreamRequests: {},
         children: [],
         instances: [],
-        httpUpstreams: [],
+        upstreams: [],
       });
     });
 
-    it("shows each instance's config and attached bridges, and each HTTP upstream's state, sorted and escaped", async () => {
+    it("shows each instance's config and attached bridges, and each upstream's type and state, sorted and escaped", async () => {
       await workspace();
       const instances = [
         { source: { kind: "merged", path: "/home/u/.crabeye-mcp-bridge/config.json" }, bridges: 2, upstreams: ["b", "a"] },
         { source: { kind: "file", path: "/home/u/z\u001b[2J.json" }, bridges: 0, upstreams: [] },
       ];
-      const httpUpstreams = [
-        { serverName: "notion", status: "auth_required", instances: 1 },
-        { serverName: "linear\u202e", status: "connected", instances: 2 },
+      const upstreams = [
+        { serverName: "notion", type: "streamable-http", status: "auth_required", instances: 1 },
+        { serverName: "linear\u202e", type: "stdio", status: "connected", instances: 2 },
       ];
-      await startOlderDaemon("--status-extra-json", JSON.stringify({ instances, httpUpstreams }));
+      await startOlderDaemon("--status-extra-json", JSON.stringify({ instances, upstreams }));
 
       const status = JSON.parse((await runCli(cliScript, "daemon", "status")).stdout);
 
@@ -316,9 +315,9 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         { config: "/home/u/.crabeye-mcp-bridge/config.json", kind: "merged", bridges: 2, servers: ["a", "b"] },
         { config: "/home/u/z\\x1b[2J.json", kind: "file", bridges: 0, servers: [] },
       ]);
-      expect(status.httpUpstreams).toEqual([
-        { server: "linear\\u202e", state: "connected", instances: 2 },
-        { server: "notion", state: "auth_required", instances: 1 },
+      expect(status.upstreams).toEqual([
+        { server: "linear\\u202e", type: "stdio", state: "connected", instances: 2 },
+        { server: "notion", type: "streamable-http", state: "auth_required", instances: 1 },
       ]);
     });
 
@@ -326,9 +325,10 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       ["instances", { instances: [{ source: { kind: "url", path: "/x" }, bridges: 1 }] }],
       ["instances", { instances: [{ source: { kind: "file", path: "/x" }, bridges: -1, upstreams: [] }] }],
       ["instances", { instances: [{ source: { kind: "file", path: "/x" }, bridges: 1 }] }],
-      ["httpUpstreams", { httpUpstreams: [{ serverName: "x", status: "sleeping", instances: 1 }] }],
-      ["httpUpstreams", { httpUpstreams: [{ serverName: "x", status: "connected", instances: -1 }] }],
-      ["httpUpstreams", { httpUpstreams: "none" }],
+      ["upstreams", { upstreams: [{ serverName: "x", type: "stdio", status: "sleeping", instances: 1 }] }],
+      ["upstreams", { upstreams: [{ serverName: "x", type: "stdio", status: "connected", instances: -1 }] }],
+      ["upstreams", { upstreams: [{ serverName: "x", type: "carrier-pigeon", status: "connected", instances: 1 }] }],
+      ["upstreams", { upstreams: "none" }],
     ])("shows %s as null when the daemon reports them in a shape it can't read", async (field, extra) => {
       await workspace();
       await startOlderDaemon("--status-extra-json", JSON.stringify(extra));
@@ -336,14 +336,24 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       expect(JSON.parse((await runCli(cliScript, "daemon", "status")).stdout)[field]).toBeNull();
     });
 
-    it("shows the protocol era of each server a bridge is using", async () => {
+    it("fails restart-upstream --all, saying why, when the daemon doesn't list its upstreams", async () => {
+      await workspace();
+      await startOlderDaemon();
+
+      const result = await runCli(cliScript, "daemon", "restart-upstream", "--all");
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("restart-upstream: the manager did not list its upstreams");
+    });
+
+    it("shows the protocol era of each server a bridge is using, and the hash restart-upstream takes", async () => {
       await workspace();
       const bridge = await connectBridge();
       expect(await callStubTool(bridge)).toEqual(CALLED);
 
       const result = await runCli(cliScript, "daemon", "status");
 
-      expect(JSON.parse(result.stdout).children).toEqual([{ server: "stub", era: "legacy" }]);
+      expect(JSON.parse(result.stdout).children).toEqual([{ server: "stub", era: "legacy", upstreamHash: expect.stringMatching(/^[0-9a-f]{64}$/) }]);
     });
 
     it("shows each server's era sorted by name, with control and format characters in names escaped", async () => {
@@ -365,6 +375,15 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       ]);
     });
 
+    it("leaves out a hash that isn't one, keeping the server", async () => {
+      await workspace();
+      await startOlderDaemon("--status-children-json", JSON.stringify([{ serverName: "linear", era: "legacy", upstreamHash: `${String.fromCodePoint(0x1b)}[2J` }]));
+
+      const result = await runCli(cliScript, "daemon", "status");
+
+      expect(JSON.parse(result.stdout).children).toEqual([{ server: "linear", era: "legacy" }]);
+    });
+
     it.each([
       ["children without a name or era, as daemons before eras report them", [{ pid: 1, upstreamHash: "h" }]],
       ["an era the bridge doesn't know", [{ serverName: "linear", era: "future" }]],
@@ -376,58 +395,6 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       const result = await runCli(cliScript, "daemon", "status");
 
       expect(JSON.parse(result.stdout).children).toBeNull();
-    });
-
-    it("shows a refused-request count of 0 as it is", async () => {
-      await workspace();
-      await startOlderDaemon("--status-version", "0.8.0", "--status-refused-json", JSON.stringify({ "roots/list": 0 }));
-
-      const result = await runCli(cliScript, "daemon", "status");
-
-      expect(JSON.parse(result.stdout).refusedUpstreamRequests).toEqual({ "roots/list": 0 });
-    });
-
-    it("shows the requests a daemon refused, by method", async () => {
-      await workspace();
-      const old = await startOlderDaemon("--status-version", "0.8.0", "--status-refused-json", JSON.stringify({ "roots/list": 1 }));
-
-      const result = await runCli(cliScript, "daemon", "status");
-
-      expect(JSON.parse(result.stdout)).toEqual({
-        running: true,
-        logFile: daemonLogPath(),
-        pid: old.pid,
-        uptime: 1,
-        appVersion: "0.8.0",
-        refusedUpstreamRequests: { "roots/list": 1 },
-        children: [],
-        instances: null,
-        httpUpstreams: null,
-      });
-    });
-
-    it("escapes control and format characters in the refused method names a daemon reports", async () => {
-      await workspace();
-      const hostile = `a${String.fromCodePoint(0x1b)}[2J${String.fromCodePoint(0x202e)}b`;
-      await startOlderDaemon("--status-version", "0.8.0", "--status-refused-json", JSON.stringify({ [hostile]: 2 }));
-
-      const result = await runCli(cliScript, "daemon", "status");
-
-      expect(JSON.parse(result.stdout).refusedUpstreamRequests).toEqual({ "a\\x1b[2J\\u202eb": 2 });
-    });
-
-    it.each([
-      ["a count that is not a number", { "roots/list": "1" }],
-      ["a fractional count", { "roots/list": 1.5 }],
-      ["a negative count", { "roots/list": -1 }],
-      ["a list instead of counts by method", [1]],
-    ])("shows no refused requests for %s", async (_case, refused) => {
-      await workspace();
-      await startOlderDaemon("--status-version", "0.8.0", "--status-refused-json", JSON.stringify(refused));
-
-      const result = await runCli(cliScript, "daemon", "status");
-
-      expect(JSON.parse(result.stdout).refusedUpstreamRequests).toBeNull();
     });
 
     it.each([
@@ -444,7 +411,7 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
       expect(JSON.parse(result.stdout)).toMatchObject({ running: true, ...shown });
     });
 
-    it("shows a daemon too old to report its version or refused requests", async () => {
+    it("shows a daemon too old to report its version", async () => {
       await workspace();
       const old = await startOlderDaemon();
 
@@ -456,10 +423,9 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         pid: old.pid,
         uptime: 1,
         appVersion: "unknown",
-        refusedUpstreamRequests: null,
         children: [],
         instances: null,
-        httpUpstreams: null,
+        upstreams: null,
       });
     });
 
@@ -477,10 +443,9 @@ describe.skipIf(isWindows)("bridges and daemons from different crabeye versions"
         pid: process.pid,
         uptime: null,
         appVersion: "unknown",
-        refusedUpstreamRequests: null,
         children: null,
         instances: null,
-        httpUpstreams: null,
+        upstreams: null,
       });
     });
   });

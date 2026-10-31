@@ -4,7 +4,7 @@ import type { GlobalBridgeConfig, ServerConfig } from "../config/schema.js";
 /**
  * Reconnect knobs that materially change the client's runtime behavior. When
  * two upstream entries have identical specs but different reconnect settings,
- * we must NOT collapse them — the second alias's settings would be silently
+ * they must not share a client — the second entry's settings would be silently
  * dropped because `BaseUpstreamClient` bakes them in at construction.
  */
 export interface UpstreamReconnectInputs {
@@ -13,33 +13,24 @@ export interface UpstreamReconnectInputs {
 }
 
 /**
- * Inputs to `upstreamHash`. `resolvedEnv` is the env after credential-template
- * expansion on the bridge side; `cwd` is empty string when the upstream has
- * no explicit working directory (daemon will inherit its own).
+ * Inputs to `upstreamHash`. `env` is the server's `env` as configured; `cwd`
+ * is empty string when the upstream has no explicit working directory (the
+ * daemon's own then applies).
  *
  * Hash inputs are deliberately narrow: only fields that, if changed, must
  * produce a different child process or surface different runtime behavior.
- * The daemon's own `process.env` is NOT in the hash so two bridges started
- * under different shells still share a child.
- *
- * `serverName` is intentionally **not** part of the hash. Two upstreams
- * mounted under different names that resolve to the same spec collapse to a
- * single child (with a warning at the bridge layer); the daemon treats them
- * as the same identity for sharing.
+ * The environment of the client that starts the child is not in the hash, so
+ * two clients started under different shells still share a child, and
+ * neither is the server's name, so two names for the same spec share one.
  */
 export interface UpstreamSpec {
-  /**
-   * Logical name used by the bridge for diagnostics and alias logging. Not
-   * part of the hash — see comment above.
-   */
-  serverName?: string;
   command: string;
   args: string[];
-  resolvedEnv: Record<string, string>;
+  env: Record<string, string>;
   cwd: string;
   /**
    * Resolved reconnect settings. Included in the hash so two configs that
-   * differ only in reconnect knobs produce separate sessions instead of one
+   * differ only in reconnect knobs get separate children instead of one
    * silently inheriting the other's settings.
    */
   reconnect?: UpstreamReconnectInputs;
@@ -54,14 +45,6 @@ export function resolveReconnectInputs(global: GlobalBridgeConfig, server: Serve
   };
 }
 
-interface HashedUpstreamSpec {
-  command: string;
-  args: string[];
-  resolvedEnv: Record<string, string>;
-  cwd: string;
-  reconnect?: UpstreamReconnectInputs;
-}
-
 /**
  * Stable, content-addressed identifier for an upstream child process.
  *
@@ -71,10 +54,10 @@ interface HashedUpstreamSpec {
  * positional.
  */
 export function upstreamHash(spec: UpstreamSpec): string {
-  const hashed: HashedUpstreamSpec = {
+  const hashed: UpstreamSpec = {
     command: spec.command,
     args: spec.args,
-    resolvedEnv: spec.resolvedEnv,
+    env: spec.env,
     cwd: spec.cwd,
   };
   if (spec.reconnect && hasAnyReconnectField(spec.reconnect)) {

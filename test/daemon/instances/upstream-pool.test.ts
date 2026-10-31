@@ -3,27 +3,40 @@ import { HttpServerConfigSchema } from "../../../src/config/schema.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
 import type { Logger } from "../../../src/logging/index.js";
 import { networkSettings } from "../../../src/daemon/instance-env.js";
-import { HttpUpstreamPool, PooledUpstream, STOP_SAVE_WAIT_MS, type CreateHttpClient, type PooledUpstreamListener, type PooledUpstreamSpec } from "../../../src/daemon/instances/http-upstream-pool.js";
+import type { CreateHttpClient } from "../../../src/daemon/instances/http-connection.js";
+import { PooledUpstream, type PooledUpstreamListener } from "../../../src/daemon/instances/pooled-upstream.js";
+import { STOP_SAVE_WAIT_MS, UpstreamPool, type PoolSpec } from "../../../src/daemon/instances/upstream-pool.js";
 import { ConnectionSupersededError } from "../../../src/upstream/types.js";
 import { settledWithin } from "../../_helpers/processes.js";
-import { ScriptedUpstreamClient, tool } from "../../_helpers/scripted-upstream-client.js";
+import { ScriptedUpstreamClient, stdioPoolOptions, tool } from "../../_helpers/scripted-upstream-client.js";
 import { spyLogger, type SpyLogger } from "../../_helpers/spy-logger.js";
 
 const store = {} as CredentialStore;
 
-function spec(overrides: Partial<PooledUpstreamSpec> = {}): PooledUpstreamSpec {
+interface SpecOverrides {
+  key?: string;
+  name?: string;
+  healthCheckIntervalSec?: number;
+  env?: Record<string, string>;
+}
+
+function spec(overrides: SpecOverrides = {}): PoolSpec {
+  const name = overrides.name ?? "svc";
   return {
-    key: "k1",
-    name: "svc",
-    config: HttpServerConfigSchema.parse({ url: "https://mcp.example.com/mcp" }),
-    credentialStore: store,
-    reconnect: {},
-    healthCheckIntervalSec: 0,
-    network: networkSettings({}),
-    env: {},
-    ...overrides,
+    kind: "http",
+    key: overrides.key ?? "k1",
+    name,
+    healthCheckIntervalSec: overrides.healthCheckIntervalSec ?? 0,
+    http: {
+      config: HttpServerConfigSchema.parse({ url: "https://mcp.example.com/mcp" }),
+      credentialStore: store,
+      reconnect: {},
+      network: networkSettings({}),
+      env: overrides.env ?? {},
+    },
   };
 }
+
 
 function listener(): PooledUpstreamListener & { snapshots: unknown[]; logs: unknown[] } {
   const snapshots: unknown[] = [];
@@ -36,21 +49,22 @@ function listener(): PooledUpstreamListener & { snapshots: unknown[]; logs: unkn
   };
 }
 
-describe("HttpUpstreamPool", () => {
+describe("UpstreamPool with HTTP connections", () => {
   let daemonLog: SpyLogger;
   let created: ScriptedUpstreamClient[];
   let clientLoggers: Logger[];
   let clientDeps: Array<Parameters<CreateHttpClient>[2]>;
-  let pool: HttpUpstreamPool;
+  let pool: UpstreamPool;
 
   beforeEach(() => {
     daemonLog = spyLogger();
     created = [];
     clientLoggers = [];
     clientDeps = [];
-    pool = new HttpUpstreamPool({
+    pool = new UpstreamPool({
       logger: daemonLog,
-      createClient: (name, _config, deps) => {
+      stdio: stdioPoolOptions(),
+      createHttpClient: (name, _config, deps) => {
         const client = new ScriptedUpstreamClient(name);
         created.push(client);
         clientLoggers.push(deps.logger);
@@ -175,9 +189,10 @@ describe("HttpUpstreamPool", () => {
   });
 
   it("doesn't log a first connect that a reconnect or close replaced as failing", async () => {
-    pool = new HttpUpstreamPool({
+    pool = new UpstreamPool({
       logger: daemonLog,
-      createClient: (name) => {
+      stdio: stdioPoolOptions(),
+      createHttpClient: (name) => {
         const client = new ScriptedUpstreamClient(name);
         client.attempt = () => Promise.reject(new ConnectionSupersededError(name));
         created.push(client);
@@ -193,9 +208,10 @@ describe("HttpUpstreamPool", () => {
   });
 
   it("keeps its own connect failures and authorization pauses in the daemon log, since each bridge logs them itself", async () => {
-    pool = new HttpUpstreamPool({
+    pool = new UpstreamPool({
       logger: daemonLog,
-      createClient: (name) => {
+      stdio: stdioPoolOptions(),
+      createHttpClient: (name) => {
         const client = new ScriptedUpstreamClient(name);
         client.attempt = () => Promise.reject(new Error("refused"));
         created.push(client);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { join } from "node:path";
-import { instanceEnvFrom, isInstanceEnvName, networkSettings, unfollowedNodeOptions } from "../../src/daemon/instance-env.js";
+import { childEnvFrom, instanceEnvFrom, isInstanceEnvName, networkSettings, unfollowedNodeOptions } from "../../src/daemon/instance-env.js";
 
 describe("isInstanceEnvName", () => {
   it.each([
@@ -87,5 +87,20 @@ describe("unfollowedNodeOptions", () => {
 
   it("is empty without such options", () => {
     expect(unfollowedNodeOptions({ NODE_OPTIONS: "--max-old-space-size=512 --use-env-proxy" }, [])).toEqual([]);
+  });
+});
+
+describe("childEnvFrom", () => {
+  it("passes on the bridge's whole environment but the master key", () => {
+    expect(childEnvFrom({ PATH: "/bin", HOME: "/home/u", MCP_BRIDGE_MASTER_KEY: "k", EMPTY: "" }, "darwin")).toEqual({ PATH: "/bin", HOME: "/home/u", EMPTY: "" });
+  });
+
+  it("leaves out the master key in any case on Windows, and only its exact name elsewhere", () => {
+    expect(childEnvFrom({ Mcp_Bridge_Master_Key: "k", Path: "C:\\bin" }, "win32")).toEqual({ Path: "C:\\bin" });
+    expect(childEnvFrom({ Mcp_Bridge_Master_Key: "k" }, "linux")).toEqual({ Mcp_Bridge_Master_Key: "k" });
+  });
+
+  it("leaves out what a process can't be started with, keeping a Windows drive variable", () => {
+    expect(childEnvFrom({ "": "x", "A=B": "x", "NUL\0NAME": "x", VALUE: "a\0b", "=C:": "C:\\work", UNSET: undefined }, "win32")).toEqual({ "=C:": "C:\\work" });
   });
 });

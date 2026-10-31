@@ -15,35 +15,37 @@ import {
   ERROR_CODE_TOO_MANY_INSTANCES,
   ERROR_CODE_UNKNOWN_UPSTREAM,
   ERROR_CODE_UPSTREAM_ERROR,
-  INSTANCE_BRIDGE_PROTOCOL_VERSION,
-  MAX_INFLIGHT_PER_SESSION,
+  MIN_BRIDGE_PROTOCOL_VERSION,
+  MAX_CALLS_PER_BRIDGE,
   errorResponse,
   notInDaemonConfig,
   type AttachResult,
   type AuthChangedResult,
   type DaemonResponse,
   type InstanceSource,
-  type StatusHttpUpstream,
+  type StatusChild,
   type StatusInstance,
+  type StatusUpstream,
 } from "../protocol.js";
 import type { FrameChannel } from "../transport.js";
-import { HttpUpstreamPool, type CreateHttpClient } from "./http-upstream-pool.js";
+import type { CreateHttpClient } from "./http-connection.js";
 import { instanceKey } from "./identity.js";
-import { Instance, type InstanceAttachment, type InstanceDeps, type InstanceNotification, type LoadedConfig } from "./instance.js";
-import { parseAttachParams, parseAuthChangedParams, parseCallToolParams, parseCancelToolParams, parseRetryParams } from "./params.js";
+import { Instance, type InstanceAttachment, type InstanceDeps, type InstanceEnv, type InstanceNotification, type LoadedConfig } from "./instance.js";
+import { UpstreamPool, type UpstreamPoolOptions } from "./upstream-pool.js";
+import { bridgeProtocolVersionOf, parseAttachParams, parseAuthChangedParams, parseCallToolParams, parseCancelToolParams, parseRetryParams } from "./params.js";
 
 const MAX_INSTANCES = 64;
-const MAX_CALLS_PER_BRIDGE = MAX_INFLIGHT_PER_SESSION;
 
 export interface InstanceHostOptions {
   /** How long an instance outlives its last attached bridge. */
   idleMs: number;
   logger: Logger;
-  /** Called when the last instance closes. */
+  /** Called when the last instance closes, and when the last STDIO server it left running stops. */
   onIdle: () => void;
+  stdio: UpstreamPoolOptions["stdio"];
   loadConfig?: (source: InstanceSource) => Promise<LoadedConfig>;
   createCredentialStore?: (env: Record<string, string>) => CredentialStore;
-  createClient?: CreateHttpClient;
+  createHttpClient?: CreateHttpClient;
   watchDebounceMs?: number;
 }
 
@@ -63,7 +65,7 @@ interface InstanceEntry {
 export class InstanceHost {
   private readonly _opts: InstanceHostOptions;
   private readonly _log: Logger;
-  private readonly _pool: HttpUpstreamPool;
+  private readonly _pool: UpstreamPool;
   private readonly _deps: InstanceDeps;
   private readonly _entries = new Map<string, InstanceEntry>();
   private readonly _attachments = new Map<FrameChannel, Attachment>();
@@ -74,7 +76,12 @@ export class InstanceHost {
   constructor(opts: InstanceHostOptions) {
     this._opts = opts;
     this._log = opts.logger.child({ component: "instance" });
-    this._pool = new HttpUpstreamPool({ logger: opts.logger, createClient: opts.createClient });
+    this._pool = new UpstreamPool({
+      logger: opts.logger,
+      createHttpClient: opts.createHttpClient,
+      stdio: opts.stdio,
+      onEmpty: () => this._idleIfEmpty(),
+    });
     this._deps = {
       pool: this._pool,
       logger: opts.logger,
@@ -86,17 +93,19 @@ export class InstanceHost {
     };
   }
 
+  /** No instance is open and no connection is open or closing. */
   get isEmpty(): boolean {
-    return this._entries.size === 0;
+    return this._entries.size === 0 && this._pool.isEmpty;
   }
 
   async handleAttach(id: string, raw: unknown, channel: FrameChannel): Promise<DaemonResponse> {
     if (this._stopping) return errorResponse(id, ERROR_CODE_DAEMON_STOPPING, "manager is shutting down");
+    const version = bridgeProtocolVersionOf(raw);
+    if (version !== null && version < MIN_BRIDGE_PROTOCOL_VERSION) {
+      return errorResponse(id, ERROR_CODE_BRIDGE_UNSUPPORTED, `ATTACH needs bridge protocol version ${MIN_BRIDGE_PROTOCOL_VERSION} or newer`);
+    }
     const params = parseAttachParams(raw);
     if (params === null) return errorResponse(id, ERROR_CODE_INVALID_PARAMS, "ATTACH params malformed");
-    if (params.bridgeProtocolVersion < INSTANCE_BRIDGE_PROTOCOL_VERSION) {
-      return errorResponse(id, ERROR_CODE_BRIDGE_UNSUPPORTED, `ATTACH needs bridge protocol version ${INSTANCE_BRIDGE_PROTOCOL_VERSION} or newer`);
-    }
     if (this._attachments.has(channel) || this._attaching.has(channel)) {
       return errorResponse(id, ERROR_CODE_ALREADY_ATTACHED, "this connection is already attached");
     }
@@ -107,7 +116,7 @@ export class InstanceHost {
     this._attaching.add(channel);
     let opened: { instance: Instance; fresh: boolean };
     try {
-      opened = await this._open(key, params.source, params.env);
+      opened = await this._open(key, params.source, { env: params.env, childEnv: params.childEnv });
     } catch (err) {
       const reason = describeLoadError(err);
       this._log.warn("could not load config for bridge", { config: params.source.kind, error: reason });
@@ -205,11 +214,27 @@ export class InstanceHost {
     return out;
   }
 
-  statusHttpUpstreams(): StatusHttpUpstream[] {
+  statusUpstreams(): StatusUpstream[] {
     return this._pool
       .upstreams()
-      .map((upstream) => ({ serverName: upstream.name, status: upstream.status, instances: upstream.ownerCount }))
+      .map((upstream): StatusUpstream => {
+        const row = { serverName: upstream.name, status: upstream.status, instances: upstream.instanceCount };
+        const { type } = upstream.connection;
+        return type === "stdio" ? { ...row, type, upstreamHash: upstream.key } : { ...row, type };
+      })
       .sort((a, b) => a.serverName.localeCompare(b.serverName));
+  }
+
+  statusChildren(): StatusChild[] {
+    return this._pool
+      .children()
+      .map(({ pid, key, serverName, era, startedAt, instances }) => ({ pid, upstreamHash: key, serverName, era, startedAt, instances }))
+      .sort((a, b) => a.serverName.localeCompare(b.serverName));
+  }
+
+  /** Starts the STDIO server with this `upstreamHash` again; returns how many were. */
+  restartChild(upstreamHash: string): number {
+    return this._pool.restart(upstreamHash);
   }
 
   /** Closes every instance and connection, letting refreshes save their tokens for a moment, never longer than `maxSaveWaitMs`. */
@@ -227,13 +252,13 @@ export class InstanceHost {
   }
 
   /** `fresh` when the config was loaded for this open, so it needn't be read again. */
-  private async _open(key: string, source: InstanceSource, env: Record<string, string>): Promise<{ instance: Instance; fresh: boolean }> {
+  private async _open(key: string, source: InstanceSource, env: InstanceEnv): Promise<{ instance: Instance; fresh: boolean }> {
     const existing = this._entries.get(key);
     if (existing?.instance !== undefined) return { instance: existing.instance, fresh: false };
     return { instance: await (existing?.opening ?? this._startOpening(key, source, env)), fresh: true };
   }
 
-  private _startOpening(key: string, source: InstanceSource, env: Record<string, string>): Promise<Instance> {
+  private _startOpening(key: string, source: InstanceSource, env: InstanceEnv): Promise<Instance> {
     const entry: InstanceEntry = { opening: Instance.open(source, env, this._deps) };
     this._entries.set(key, entry);
     entry.opening.then(
@@ -243,10 +268,14 @@ export class InstanceHost {
       },
       () => {
         if (this._entries.get(key) === entry) this._entries.delete(key);
-        if (this.isEmpty) this._opts.onIdle();
+        this._idleIfEmpty();
       },
     );
     return entry.opening;
+  }
+
+  private _idleIfEmpty(): void {
+    if (this.isEmpty) this._opts.onIdle();
   }
 
   private _cancelIdle(key: string): void {
@@ -265,9 +294,7 @@ export class InstanceHost {
       if (this._entries.get(key) !== entry || instance.attachmentCount > 0) return;
       this._entries.delete(key);
       this._log.info("instance closed", { config: instance.source.kind, reason: "idle" });
-      void instance.close().finally(() => {
-        if (this.isEmpty) this._opts.onIdle();
-      });
+      void instance.close().finally(() => this._idleIfEmpty());
     }, this._opts.idleMs);
     entry.idleTimer.unref();
   }

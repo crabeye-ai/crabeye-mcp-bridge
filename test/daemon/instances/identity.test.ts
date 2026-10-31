@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { HttpServerConfigSchema, type HttpServerConfig } from "../../../src/config/schema.js";
-import { httpUpstreamIdentity, instanceKey } from "../../../src/daemon/instances/identity.js";
+import { HttpServerConfigSchema, StdioServerConfigSchema, type HttpServerConfig, type StdioServerConfig } from "../../../src/config/schema.js";
+import { httpUpstreamIdentity, instanceKey, stdioUpstreamKey } from "../../../src/daemon/instances/identity.js";
+import { upstreamHash } from "../../../src/upstream/upstream-hash.js";
 
 const merged = { kind: "merged" as const, path: "/home/u/.crabeye-mcp-bridge/config.json" };
 const http = (server: Record<string, unknown>): HttpServerConfig => HttpServerConfigSchema.parse(server);
@@ -116,5 +117,35 @@ describe("httpUpstreamIdentity", () => {
     ["_bridge.auth", "svc", http({ ...base, _bridge: { auth: { type: "oauth2" } } }), masterKeyEnv("k")],
   ])("differs for %s", (_label, name, config, env) => {
     expect(httpUpstreamKey(name, config as HttpServerConfig, env)).not.toBe(httpUpstreamKey("svc", base, masterKeyEnv("k")));
+  });
+});
+
+describe("stdioUpstreamKey", () => {
+  const stdio = (server: Record<string, unknown>): StdioServerConfig => StdioServerConfigSchema.parse(server);
+  const base = stdio({ command: "node", args: ["server.js"], env: { MODE: "x" }, cwd: "/srv" });
+
+  it("is the upstream hash of the command, arguments, env as written, cwd and reconnect settings", () => {
+    expect(stdioUpstreamKey(base, {}, {})).toBe(upstreamHash({ command: "node", args: ["server.js"], env: { MODE: "x" }, cwd: "/srv" }));
+  });
+
+  it("doesn't depend on the server's name, the master key or anything else in the environment, without stored credentials", () => {
+    expect(stdioUpstreamKey(base, {}, { MCP_BRIDGE_MASTER_KEY: "k", PATH: "/bin" })).toBe(stdioUpstreamKey(base, {}, {}));
+  });
+
+  it.each([
+    ["the command", stdio({ ...base, command: "python" }), {}],
+    ["an argument", stdio({ ...base, args: ["other.js"] }), {}],
+    ["the env", stdio({ ...base, env: { MODE: "y" } }), {}],
+    ["the cwd", stdio({ ...base, cwd: "/other" }), {}],
+    ["the reconnect settings", base, { reconnectBaseDelay: 500 }],
+  ])("differs for %s", (_label, config, reconnect) => {
+    expect(stdioUpstreamKey(config, reconnect, {})).not.toBe(stdioUpstreamKey(base, {}, {}));
+  });
+
+  it("counts the master key when the env reads stored credentials", () => {
+    const reading = stdio({ ...base, env: { TOKEN: "${credential:token}" } });
+
+    expect(stdioUpstreamKey(reading, {}, masterKeyEnv("a"))).not.toBe(stdioUpstreamKey(reading, {}, masterKeyEnv("b")));
+    expect(stdioUpstreamKey(reading, {}, masterKeyEnv("a"))).toBe(stdioUpstreamKey(reading, {}, masterKeyEnv("a")));
   });
 });

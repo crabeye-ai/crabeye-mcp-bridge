@@ -3,7 +3,6 @@ import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
 import type { Tool, CallToolResult, Transport } from "@modelcontextprotocol/server";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
-import { DaemonStdioClient } from "../src/upstream/daemon-stdio-client.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import type { StatusChangeEvent } from "../src/upstream/types.js";
@@ -59,29 +58,6 @@ function createLinkedClient(
       type: "streamable-http",
       url: "http://localhost:9999",
     },
-    ...options,
-    _transportFactory: () => {
-      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-      serverTransport = serverSide;
-      mockServer.connect(serverSide);
-      return clientSide;
-    },
-  });
-
-  return { client, get serverTransport() { return serverTransport!; } };
-}
-
-function createLinkedStdioClient(
-  name: string,
-  mockServer: Server,
-  options?: Partial<ConstructorParameters<typeof DaemonStdioClient>[0]>,
-): { client: DaemonStdioClient; serverTransport: Transport } {
-  let serverTransport: Transport;
-
-  const client = new DaemonStdioClient({
-    name,
-    config: { command: "node", args: ["server.js"] },
-    resolvedEnv: {},
     ...options,
     _transportFactory: () => {
       const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -468,7 +444,7 @@ describe("UpstreamManager", () => {
     const manager = new UpstreamManager({
       config,
       toolRegistry,
-      _clientFactory: (name) => createLinkedStdioClient(name, mockServer.server).client,
+      _clientFactory: (name) => createLinkedClient(name, mockServer.server).client,
     });
 
     await manager.connectAll();
@@ -497,7 +473,7 @@ describe("UpstreamManager", () => {
         if (name === "remote") {
           return createLinkedClient(name, httpServer.server).client;
         }
-        return createLinkedStdioClient(name, stdioServer.server).client;
+        return createLinkedClient(name, stdioServer.server).client;
       },
     });
 
@@ -606,7 +582,7 @@ describe("UpstreamManager", () => {
 
     await manager.closeAll();
 
-    expect(manager.getStatuses()).toEqual([]);
+    expect(manager.getClient("my-server")).toBeUndefined();
     expect(toolRegistry.listTools()).toHaveLength(0);
 
     await mockServer.server.close();
@@ -644,7 +620,7 @@ describe("UpstreamManager", () => {
     await serverB.server.close();
   });
 
-  it("getStatuses returns name, status, and toolCount for all upstreams", async () => {
+  it("connectAll leaves every upstream connected with its tools", async () => {
     const serverA = createMockServer([makeTool("t1"), makeTool("t2")]);
     const serverB = createMockServer([makeTool("t3")]);
     const servers: Record<string, ReturnType<typeof createMockServer>> = {
@@ -665,18 +641,13 @@ describe("UpstreamManager", () => {
 
     await manager.connectAll();
 
-    const statuses = manager.getStatuses();
-    expect(statuses).toHaveLength(2);
+    const clientA = manager.getClient("srv-a")!;
+    expect(clientA.status).toBe("connected");
+    expect(clientA.tools).toHaveLength(2);
 
-    const statusA = statuses.find((s) => s.name === "srv-a")!;
-    expect(statusA.status).toBe("connected");
-    expect(statusA.health).toBe("unknown");
-    expect(statusA.toolCount).toBe(2);
-
-    const statusB = statuses.find((s) => s.name === "srv-b")!;
-    expect(statusB.status).toBe("connected");
-    expect(statusB.health).toBe("unknown");
-    expect(statusB.toolCount).toBe(1);
+    const clientB = manager.getClient("srv-b")!;
+    expect(clientB.status).toBe("connected");
+    expect(clientB.tools).toHaveLength(1);
 
     await manager.closeAll();
     await serverA.server.close();
@@ -781,268 +752,5 @@ describe("UpstreamManager", () => {
     await manager.closeAll();
     await serverA.server.close();
     await serverB.server.close();
-  });
-});
-
-// --- DaemonStdioClient ---
-
-describe("DaemonStdioClient", () => {
-  let mockServerHandle: ReturnType<typeof createMockServer>;
-  let upstreamClient: DaemonStdioClient;
-
-  beforeEach(() => {
-    mockServerHandle = createMockServer([
-      makeTool("tool-a", "First tool"),
-      makeTool("tool-b", "Second tool"),
-    ]);
-  });
-
-  afterEach(async () => {
-    await upstreamClient?.close().catch(() => {});
-    await mockServerHandle?.server.close().catch(() => {});
-  });
-
-  it("connects and discovers tools from mock server", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    await client.connect();
-
-    expect(client.status).toBe("connected");
-    expect(client.tools).toHaveLength(2);
-    expect(client.tools.map((t) => t.name).sort()).toEqual(["tool-a", "tool-b"]);
-  });
-
-  it("callTool delegates to upstream and returns result", async () => {
-    mockServerHandle = createMockServer(
-      [makeTool("echo")],
-      (name, args) => ({
-        content: [{ type: "text", text: `echo: ${JSON.stringify(args)}` }],
-      }),
-    );
-
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-    await client.connect();
-
-    const result = await client.callTool({
-      name: "echo",
-      arguments: { msg: "hello" },
-    });
-
-    expect(result.content).toEqual([
-      { type: "text", text: 'echo: {"msg":"hello"}' },
-    ]);
-  });
-
-  it("callTool throws when disconnected", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    await expect(
-      client.callTool({ name: "tool-a" }),
-    ).rejects.toThrow(/not connected/);
-  });
-
-  it("close() sets status to disconnected and clears tools", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    await client.connect();
-    expect(client.tools).toHaveLength(2);
-
-    await client.close();
-
-    expect(client.status).toBe("disconnected");
-    expect(client.tools).toHaveLength(0);
-  });
-
-  it("onStatusChange fires on connecting → connected → disconnected transitions", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    const events: StatusChangeEvent[] = [];
-    client.onStatusChange((event) => events.push({ ...event }));
-
-    await client.connect();
-    await client.close();
-
-    expect(events).toHaveLength(3);
-    expect(events[0]).toEqual({ previous: "disconnected", current: "connecting" });
-    expect(events[1]).toEqual({ previous: "connecting", current: "connected" });
-    expect(events[2]).toEqual({ previous: "connected", current: "disconnected" });
-  });
-
-  it("onToolsChanged fires on connect with initial tools", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    const toolSets: Tool[][] = [];
-    client.onToolsChanged((tools) => toolSets.push([...tools]));
-
-    await client.connect();
-
-    expect(toolSets).toHaveLength(1);
-    expect(toolSets[0]).toHaveLength(2);
-  });
-
-  it("reconnects on disconnect with exponential backoff", async () => {
-    vi.useFakeTimers();
-    let connectCount = 0;
-
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server, {
-      reconnectBaseDelay: 100,
-      reconnectMaxDelay: 1000,
-    });
-    upstreamClient = client;
-
-    client.onStatusChange((event) => {
-      if (event.current === "connecting") connectCount++;
-    });
-
-    await client.connect();
-    expect(connectCount).toBe(1);
-
-    // Simulate upstream disconnect by closing the server
-    await mockServerHandle.server.close();
-
-    // Wait for the onclose callback to fire
-    await vi.advanceTimersByTimeAsync(0);
-
-    // First reconnect: delay = 100ms * 2^0 = 100ms
-    await vi.advanceTimersByTimeAsync(100);
-
-    // Second reconnect: delay = 100ms * 2^1 = 200ms
-    await vi.advanceTimersByTimeAsync(200);
-
-    expect(connectCount).toBeGreaterThan(1);
-
-    vi.useRealTimers();
-  });
-
-  it("keeps retrying after many consecutive connection failures", async () => {
-    vi.useFakeTimers();
-
-    let shouldFail = false;
-    let clientTransport: Transport | undefined;
-
-    const client = new DaemonStdioClient({
-      name: "test",
-      config: { command: "node", args: ["server.js"] },
-      resolvedEnv: {},
-      reconnectBaseDelay: 50,
-      reconnectMaxDelay: 200,
-      _transportFactory: () => {
-        if (shouldFail) {
-          return {
-            async start() { throw new Error("Connection refused"); },
-            async send() {},
-            async close() {},
-          };
-        }
-        const [cSide, sSide] = InMemoryTransport.createLinkedPair();
-        const srv = new Server(
-          { name: "temp", version: "1.0.0" },
-          { capabilities: { tools: {} } },
-        );
-        srv.setRequestHandler("tools/list", () => ({ tools: [] }));
-        srv.connect(sSide);
-        clientTransport = cSide;
-        return cSide;
-      },
-    });
-    upstreamClient = client;
-
-    const statusHistory: string[] = [];
-    client.onStatusChange((event) => statusHistory.push(event.current));
-
-    await client.connect();
-    expect(client.status).toBe("connected");
-
-    shouldFail = true;
-
-    clientTransport!.onclose?.();
-    await vi.advanceTimersByTimeAsync(0);
-
-    await vi.advanceTimersByTimeAsync(5_000);
-    const attemptsAfterFiveSeconds = statusHistory.filter((status) => status === "connecting").length;
-    await vi.advanceTimersByTimeAsync(5_000);
-    const attemptsAfterTenSeconds = statusHistory.filter((status) => status === "connecting").length;
-
-    expect(attemptsAfterFiveSeconds).toBeGreaterThan(6);
-    expect(attemptsAfterTenSeconds).toBeGreaterThan(attemptsAfterFiveSeconds);
-    expect(["disconnected", "connecting"]).toContain(client.status);
-
-    vi.useRealTimers();
-  });
-
-  it("concurrent connect() calls coalesce into a single connection", async () => {
-    let factoryCalls = 0;
-
-    const client = new DaemonStdioClient({
-      name: "test",
-      config: { command: "node", args: ["server.js"] },
-      resolvedEnv: {},
-      _transportFactory: () => {
-        factoryCalls++;
-        const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-        mockServerHandle.server.connect(serverSide);
-        return clientSide;
-      },
-    });
-    upstreamClient = client;
-
-    const p1 = client.connect();
-    const p2 = client.connect();
-
-    await Promise.all([p1, p2]);
-
-    expect(factoryCalls).toBe(1);
-    expect(client.status).toBe("connected");
-  });
-
-  it("connect() failure sets status to disconnected, not stuck on connecting", async () => {
-    const client = new DaemonStdioClient({
-      name: "test",
-      config: { command: "node", args: ["server.js"] },
-      resolvedEnv: {},
-      _transportFactory: () => ({
-        async start() { throw new Error("Connection refused"); },
-        async send() {},
-        async close() {},
-      }),
-    });
-    upstreamClient = client;
-
-    await client.connect().catch(() => {});
-
-    expect(client.status).toBe("disconnected");
-  });
-
-  it("ping() throws when not connected", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    await expect(client.ping()).rejects.toThrow(/not connected/);
-  });
-
-  it("ping() succeeds when connected", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    await client.connect();
-    await expect(client.ping()).resolves.toBeUndefined();
-  });
-
-  it("reconnect() resets state and reconnects", async () => {
-    const { client } = createLinkedStdioClient("test", mockServerHandle.server);
-    upstreamClient = client;
-
-    await client.connect();
-    expect(client.status).toBe("connected");
-
-    await client.reconnect();
-    expect(client.status).toBe("connected");
-    expect(client.tools).toHaveLength(2);
   });
 });

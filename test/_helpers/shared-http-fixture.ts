@@ -187,10 +187,10 @@ export function useSharedHttpFixture(): SharedHttpFixture {
         config,
         toolRegistry: registry,
         logger,
-        credentialStore: storeFor(env),
         instanceLink: new InstanceLink({
           source: { kind, path },
           env,
+          childEnv: {},
           logger,
           rpcTimeoutMs: 30_000,
           heartbeatMs: 60_000,

@@ -34,7 +34,7 @@ import { LockBusyError, processExists } from "../process/index.js";
 import { escapeLabel, type Logger } from "../logging/index.js";
 import { getBridgeConfigPath, loadDaemonSettings, loadDaemonShutdownWaitMs } from "../config/bridge-config.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
-import type { InstanceSource } from "../daemon/protocol.js";
+import type { InstanceSource, RestartResult, UpstreamType } from "../daemon/protocol.js";
 import { isConnectionStatus, type ConnectionStatus } from "../upstream/types.js";
 
 export type DaemonAction = "start" | "stop" | "status" | "restart";
@@ -43,11 +43,20 @@ interface StatusReply extends DaemonStatus {
   uptime?: unknown;
   children?: unknown;
   instances?: unknown;
-  httpUpstreams?: unknown;
-  telemetry?: { upstreamRequests?: { refusedTotal?: unknown } };
+  upstreams?: unknown;
 }
 
-const CHILD_ERAS: ReadonlySet<string> = new Set<ChildEraLabel>(["modern", "legacy", "unknown"]);
+const CHILD_ERAS: ReadonlySet<unknown> = new Set<ChildEraLabel>(["modern", "legacy", "unknown"]);
+const UPSTREAM_TYPES: ReadonlySet<unknown> = new Set<UpstreamType>(["stdio", "streamable-http", "sse"]);
+const UPSTREAM_HASH = /^[0-9a-f]{64}$/;
+
+function isChildEra(value: unknown): value is ChildEraLabel {
+  return CHILD_ERAS.has(value);
+}
+
+function isUpstreamType(value: unknown): value is UpstreamType {
+  return UPSTREAM_TYPES.has(value);
+}
 
 export interface RestartUpstreamOpts {
   hash?: string;
@@ -247,10 +256,9 @@ async function runStatus(): Promise<number> {
       pid: reportedDaemonPid(status),
       uptime: nonNegativeIntegerOrNull(status.uptime),
       appVersion: daemonVersionLabel(status),
-      refusedUpstreamRequests: refusedRequestCounts(status.telemetry?.upstreamRequests?.refusedTotal),
-      children: childEras(status.children),
+      children: childRows(status.children),
       instances: instanceRows(status.instances),
-      httpUpstreams: httpUpstreamRows(status.httpUpstreams),
+      upstreams: upstreamRows(status.upstreams),
     });
     return 0;
   } catch (err) {
@@ -266,10 +274,9 @@ async function runStatus(): Promise<number> {
       pid,
       uptime: null,
       appVersion: UNKNOWN_DAEMON_VERSION,
-      refusedUpstreamRequests: null,
       children: null,
       instances: null,
-      httpUpstreams: null,
+      upstreams: null,
     });
     return 0;
   }
@@ -286,24 +293,21 @@ function nonNegativeIntegerOrNull(value: unknown): number | null {
   return isNonNegativeInteger(value) ? value : null;
 }
 
-function refusedRequestCounts(value: unknown): Record<string, number> | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const counts: [string, number][] = [];
-  for (const [method, count] of Object.entries(value)) {
-    if (!isNonNegativeInteger(count)) return null;
-    counts.push([escapeLabel(method), count]);
-  }
-  return Object.fromEntries(counts);
+interface ChildRow {
+  server: string;
+  era: ChildEraLabel;
+  /** What `daemon restart-upstream` takes to restart it. */
+  upstreamHash?: string;
 }
 
-function childEras(value: unknown): { server: string; era: ChildEraLabel }[] | null {
+function childRows(value: unknown): ChildRow[] | null {
   if (!Array.isArray(value)) return null;
-  const children: { server: string; era: ChildEraLabel }[] = [];
+  const children: ChildRow[] = [];
   for (const child of value) {
     if (typeof child !== "object" || child === null) return null;
-    const { serverName, era } = child as { serverName?: unknown; era?: unknown };
-    if (typeof serverName !== "string" || typeof era !== "string" || !CHILD_ERAS.has(era)) return null;
-    children.push({ server: escapeLabel(serverName), era: era as ChildEraLabel });
+    const { serverName, era, upstreamHash } = child as { serverName?: unknown; era?: unknown; upstreamHash?: unknown };
+    if (typeof serverName !== "string" || !isChildEra(era)) return null;
+    children.push({ server: escapeLabel(serverName), era, ...upstreamHashField(upstreamHash) });
   }
   return children.sort((a, b) => a.server.localeCompare(b.server));
 }
@@ -315,10 +319,13 @@ interface InstanceRow {
   servers: string[];
 }
 
-interface HttpUpstreamRow {
+interface UpstreamRow {
   server: string;
+  type: UpstreamType;
   state: ConnectionStatus;
   instances: number;
+  /** What `daemon restart-upstream` takes to restart a STDIO server. */
+  upstreamHash?: string;
 }
 
 function instanceRows(value: unknown): InstanceRow[] | null {
@@ -336,16 +343,32 @@ function instanceRows(value: unknown): InstanceRow[] | null {
   return rows.sort((a, b) => a.config.localeCompare(b.config));
 }
 
-function httpUpstreamRows(value: unknown): HttpUpstreamRow[] | null {
+function upstreamRows(value: unknown): UpstreamRow[] | null {
   if (!Array.isArray(value)) return null;
-  const rows: HttpUpstreamRow[] = [];
+  const rows: UpstreamRow[] = [];
   for (const upstream of value) {
     if (typeof upstream !== "object" || upstream === null) return null;
-    const { serverName, status, instances } = upstream as { serverName?: unknown; status?: unknown; instances?: unknown };
-    if (typeof serverName !== "string" || !isConnectionStatus(status) || !isNonNegativeInteger(instances)) return null;
-    rows.push({ server: escapeLabel(serverName), state: status, instances });
+    const { serverName, type, status, instances, upstreamHash } = upstream as {
+      serverName?: unknown;
+      type?: unknown;
+      status?: unknown;
+      instances?: unknown;
+      upstreamHash?: unknown;
+    };
+    if (typeof serverName !== "string" || !isUpstreamType(type) || !isConnectionStatus(status) || !isNonNegativeInteger(instances)) return null;
+    rows.push({ server: escapeLabel(serverName), type, state: status, instances, ...upstreamHashField(upstreamHash) });
   }
   return rows.sort((a, b) => a.server.localeCompare(b.server));
+}
+
+function upstreamHashField(value: unknown): { upstreamHash?: string } {
+  return typeof value === "string" && UPSTREAM_HASH.test(value) ? { upstreamHash: value } : {};
+}
+
+async function stdioUpstreamHashes(client: DaemonClient): Promise<string[]> {
+  const rows = upstreamRows(((await client.call("STATUS")) as { upstreams?: unknown }).upstreams);
+  if (rows === null) throw new Error("the manager did not list its upstreams");
+  return rows.flatMap(({ upstreamHash }) => (upstreamHash === undefined ? [] : [upstreamHash]));
 }
 
 function writeStatus(status: Record<string, unknown>): void {
@@ -390,20 +413,14 @@ export async function runRestartUpstream(opts: RestartUpstreamOpts): Promise<num
       process.stderr.write("daemon not running; nothing to restart\n");
       return 0;
     }
-    const hashes: string[] = opts.all
-      ? ((await client.call("STATUS")) as { children: { upstreamHash: string }[] }).children.map(
-          (c) => c.upstreamHash,
-        )
-      : [opts.hash as string];
+    const hashes = opts.all ? await stdioUpstreamHashes(client) : [opts.hash as string];
     const unique = Array.from(new Set(hashes));
-    let killedTotal = 0;
+    let restarted = 0;
     for (const upstreamHash of unique) {
-      const r = (await client.call("RESTART", { upstreamHash })) as { killed: number };
-      killedTotal += r.killed;
+      const r = (await client.call("RESTART", { upstreamHash })) as Partial<RestartResult>;
+      restarted += r.restarted ?? 0;
     }
-    process.stderr.write(
-      `restart-upstream: killed ${killedTotal} child group${killedTotal === 1 ? "" : "s"}\n`,
-    );
+    process.stderr.write(`restart-upstream: restarted ${restarted} STDIO server${restarted === 1 ? "" : "s"}\n`);
     return 0;
   } catch (err) {
     process.stderr.write(`restart-upstream: ${errMsg(err)}\n`);

@@ -109,3 +109,24 @@ export function networkSettings(env: Record<string, string | undefined>): Networ
         : null,
   };
 }
+
+/** The environment a bridge passes on to the STDIO servers its instance starts: all of its own that a process can be started with, without the master key. */
+export function childEnvFrom(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): Record<string, string> {
+  const masterKey = envNameFor(MASTER_KEY_ENV, platform);
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined || !isSpawnableEntry(name, value) || envNameFor(name, platform) === masterKey) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+/** Whether a process can be started with `name=value` in its environment. */
+export function isSpawnableEntry(name: string, value: string): boolean {
+  return name.length > 0 && !name.includes("\0") && !name.includes("=", 1) && !value.includes("\0");
+}
+
+/** How the system tells variable names apart: ignoring case on Windows. */
+export function envNameFor(name: string, platform: NodeJS.Platform): string {
+  return platform === "win32" ? name.toUpperCase() : name;
+}

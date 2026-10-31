@@ -11,11 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { DaemonLivenessSupervisor } from "../../src/daemon/liveness-supervisor.js";
-import {
-  spawnTestManager,
-  OpenSessionFixture,
-  type DaemonFixture,
-} from "../_helpers/daemon-fixtures.js";
+import { spawnTestManager, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 
 const isWindows = process.platform === "win32";
 
@@ -72,42 +68,6 @@ describe.skipIf(isWindows)("AIT-249 integration — daemon kill / stall / race",
     expect(onFail).toHaveBeenCalled();
     expect(onFail.mock.calls[0]![0]).toMatchObject({ kind: "heartbeat_miss" });
     await sup.close();
-  });
-
-  it("admin-restart test: RESTART RPC kills the group and surfaces upstream_restarted to attached sessions", async () => {
-    const session = await OpenSessionFixture.open(fx);
-    // Stage an in-flight bridge→daemon RPC so the daemon allocates an outer id.
-    session.sendNotification("RPC", {
-      sessionId: session.sessionId,
-      payload: { jsonrpc: "2.0", id: 99, method: "tools/list" },
-    });
-    await new Promise((r) => setTimeout(r, 50));
-
-    const status = (await fx.client.call("STATUS")) as {
-      children: { upstreamHash: string }[];
-    };
-    expect(status.children.length).toBeGreaterThan(0);
-    const hash = status.children[0]!.upstreamHash;
-
-    const restartResult = (await fx.client.call("RESTART", { upstreamHash: hash })) as {
-      ok: true;
-      killed: number;
-    };
-    expect(restartResult).toEqual({ ok: true, killed: 1 });
-
-    // Bridge sees the upstream-restarted inner error frame.
-    const frame = await session.waitForFrame((p) => {
-      const r = p as {
-        error?: { code?: number; data?: { reason?: string } };
-      };
-      return (
-        r?.error?.code === -32004 &&
-        r?.error?.data?.reason === "admin_restart"
-      );
-    }, 1_000);
-    expect(frame).toBeDefined();
-
-    await session.close();
   });
 
   it("PING/PONG round-trip exercises the heartbeat protocol against a real daemon", async () => {

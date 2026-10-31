@@ -10,6 +10,7 @@ import {
   getDaemonSocketPath,
   type DaemonNotification,
   type EnsureAttemptOptions,
+  type LivenessFailureKind,
 } from "../daemon/index.js";
 import {
   PROTOCOL_VERSION,
@@ -50,6 +51,8 @@ export interface UpstreamView {
 export interface InstanceLinkOptions {
   source: InstanceSource;
   env: Record<string, string>;
+  /** The environment for the STDIO servers the instance starts (see `childEnvFrom`). */
+  childEnv: Record<string, string>;
   logger?: Logger;
   rpcTimeoutMs: number;
   heartbeatMs: number;
@@ -62,7 +65,7 @@ export interface InstanceLinkOptions {
 
 /**
  * A bridge's one connection to its daemon instance, shared by the stand-ins
- * of every HTTP and SSE upstream. Attaches on first use, attaches again
+ * of every upstream. Attaches on first use, attaches again
  * after the daemon is replaced, and backs off while it can't be reached.
  */
 export class InstanceLink {
@@ -218,7 +221,8 @@ export class InstanceLink {
     supervisor.on("livenessFailure", () => {
       if (this._supervisor === supervisor) this._onInterrupted();
     });
-    supervisor.on("respawned", () => {
+    supervisor.on("respawned", (reason: LivenessFailureKind) => {
+      this._logger.info("force_respawn", { component: "daemon", event: "force_respawn", reason });
       if (this._supervisor === supervisor) void this._attachAgain(supervisor);
     });
     supervisor.on("respawnFailed", (err: unknown) => {
@@ -237,7 +241,12 @@ export class InstanceLink {
   }
 
   private async _sendAttach(supervisor: DaemonLivenessSupervisor): Promise<void> {
-    const params: AttachParams = { bridgeProtocolVersion: PROTOCOL_VERSION, source: this._opts.source, env: this._opts.env };
+    const params: AttachParams = {
+      bridgeProtocolVersion: PROTOCOL_VERSION,
+      source: this._opts.source,
+      env: this._opts.env,
+      childEnv: this._opts.childEnv,
+    };
     const result = (await supervisor.call("ATTACH", params)) as AttachResult;
     if (this._closed || this._supervisor !== supervisor) throw new Error(LINK_CLOSED);
     const hosted = new Set(result.upstreams);
@@ -272,7 +281,10 @@ export class InstanceLink {
     const snapshot = method === "UPSTREAM" ? snapshotOf(params) : null;
     if (snapshot !== null) this._onSnapshot(snapshot);
     else if (method === "UPSTREAM_REMOVED" && isRemoval(params)) this._onRemoved(params.upstream);
-    else if (method === "LOG" && isLog(params)) this._writeLog(params);
+    else if (method === "LOG") {
+      const log = logOf(params);
+      if (log !== null) this._writeLog(log);
+    }
   }
 
   private _onSnapshot(snapshot: UpstreamSnapshot): void {
@@ -332,10 +344,11 @@ export class InstanceLink {
     for (const fail of [...this._pendingCalls]) fail(error);
   }
 
-  private _writeLog({ upstream, level, message, context }: UpstreamLogParams): void {
+  private _writeLog({ upstream, level, message, context, stderr }: UpstreamLogParams): void {
     const { component, ...rest } = context ?? {};
     const log = this._logger.child({ component: typeof component === "string" ? component : "upstream", server: upstream });
-    log[level](message, Object.keys(rest).length > 0 ? rest : undefined);
+    const details = { ...rest, ...(stderr !== undefined && { stderr }) };
+    log[level](message, Object.keys(details).length > 0 ? details : undefined);
   }
 }
 
@@ -369,10 +382,14 @@ function isRemoval(value: unknown): value is UpstreamRemovedParams {
   return typeof value === "object" && value !== null && typeof (value as Partial<UpstreamRemovedParams>).upstream === "string";
 }
 
-function isLog(value: unknown): value is UpstreamLogParams {
-  if (typeof value !== "object" || value === null) return false;
-  const { upstream, level, message } = value as Partial<UpstreamLogParams>;
-  return typeof upstream === "string" && typeof message === "string" && (level === "warn" || level === "error");
+/** The log line in `value`, or null when it isn't one; a level this bridge doesn't know logs at debug. */
+function logOf(value: unknown): UpstreamLogParams | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { upstream, level, message, stderr } = value as Partial<Record<keyof UpstreamLogParams, unknown>>;
+  if (stderr !== undefined && !(Array.isArray(stderr) && stderr.every((line) => typeof line === "string"))) return null;
+  if (typeof upstream !== "string" || typeof message !== "string") return null;
+  const known = level === "debug" || level === "warn" || level === "error";
+  return { ...(value as UpstreamLogParams), level: known ? level : "debug" };
 }
 
 function toError(err: unknown): Error {

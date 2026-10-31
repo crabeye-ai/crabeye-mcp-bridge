@@ -8,11 +8,11 @@ import { DaemonClient } from "../../../src/daemon/client.js";
 import { InstanceHost } from "../../../src/daemon/instances/instance-host.js";
 import { ManagerDaemon } from "../../../src/daemon/manager.js";
 import { netTransport } from "../../../src/daemon/net-transport.js";
-import { INSTANCE_BRIDGE_PROTOCOL_VERSION, type DaemonNotification, type StatusResult } from "../../../src/daemon/protocol.js";
+import { MIN_BRIDGE_PROTOCOL_VERSION, type DaemonNotification, type StatusResult } from "../../../src/daemon/protocol.js";
 import { ScriptedUpstreamClient } from "../../_helpers/scripted-upstream-client.js";
 
 const source = { kind: "file" as const, path: "/home/u/bridge.json" };
-const attachParams = { bridgeProtocolVersion: INSTANCE_BRIDGE_PROTOCOL_VERSION, source, env: {} };
+const attachParams = { bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION, source, env: {}, childEnv: {} };
 
 describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", () => {
   let dir: string;
@@ -34,7 +34,7 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
           watchPaths: [],
         }),
         createCredentialStore: () => ({}) as CredentialStore,
-        createClient: (name) => {
+        createHttpClient: (name) => {
           const client = new ScriptedUpstreamClient(name);
           clients.push(client);
           return client;
@@ -77,7 +77,7 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
     expect(notifications).toEqual([{ method: "UPSTREAM", params: { name: "svc", status: "connected", tools: [] } }]);
     const status = (await client.call("STATUS")) as StatusResult;
     expect(status.instances).toEqual([{ source, bridges: 1, upstreams: ["svc"] }]);
-    expect(status.httpUpstreams).toEqual([{ serverName: "svc", status: "connected", instances: 1 }]);
+    expect(status.upstreams).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 1 }]);
   });
 
   it("routes tool calls, retries and cancellations to the instance", async () => {

@@ -25,7 +25,7 @@ import { ToolSearchService } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { InstanceLink, instanceSourceFor } from "./upstream/instance-link.js";
-import { FOLLOWED_NODE_OPTIONS, instanceEnvFrom, unfollowedNodeOptions } from "./daemon/instance-env.js";
+import { childEnvFrom, FOLLOWED_NODE_OPTIONS, instanceEnvFrom, unfollowedNodeOptions } from "./daemon/instance-env.js";
 import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning, tellManagerAuthChanged } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
@@ -147,7 +147,6 @@ program
       }
       logSelfReferences(config, logger);
       const toolRegistry = new ToolRegistry();
-      const credentialStore = new CredentialStore({ keychain: createKeychainAdapter() });
 
       // Start the manager daemon early so the first connects find it serving,
       // without holding up the client: recovering a wedged daemon can outlast
@@ -173,10 +172,10 @@ program
         config,
         toolRegistry,
         logger,
-        credentialStore,
         instanceLink: new InstanceLink({
           source: instanceSourceFor(explicitPath),
           env: instanceEnvFrom(process.env),
+          childEnv: childEnvFrom(process.env),
           logger,
           rpcTimeoutMs: daemonSettings.rpcTimeoutMs,
           heartbeatMs: daemonSettings.heartbeatMs,
@@ -207,7 +206,6 @@ program
         policyEngine,
         logger,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
-        whenUpstreamRegistered: (name) => upstreamManager!.whenRegistered(name),
         getRateLimiter: (name) => rateLimiters.get(name),
         onClientsChanged: (listener) => upstreamManager!.onClientsChanged(listener),
         showStats: options.stats === true,
@@ -249,11 +247,6 @@ program
         warnRemovedSettings(newConfig, logger);
         logSelfReferences(newConfig, logger);
 
-        if (diff.bridge.healthCheckInterval !== undefined) {
-          upstreamManager!.restartHealthChecks(diff.bridge.healthCheckInterval);
-          logger.info(`health check interval changed to ${diff.bridge.healthCheckInterval}s`, { component: "reload" });
-        }
-
         if (diff.bridge.requiresRestart.length > 0) {
           logger.warn(
             `config changed for ${diff.bridge.requiresRestart.join(", ")} — restart required`,
@@ -284,8 +277,7 @@ program
         const hasServerChanges =
           diff.servers.added.length > 0 ||
           diff.servers.removed.length > 0 ||
-          diff.servers.reconnect.length > 0 ||
-          diff.servers.updated.length > 0;
+          diff.servers.changed.length > 0;
 
         if (hasServerChanges) {
           await upstreamManager!.applyConfigDiff(diff, newConfig);
@@ -311,7 +303,6 @@ program
             logger.error(`${f.name}: ${f.error}`, { component: "bridge" });
           }
         }
-        upstreamManager?.startHealthChecks();
       }).catch(() => {
         // Individual failures already logged by UpstreamManager.
       }).finally(() => {
@@ -372,8 +363,6 @@ program
     process.on("SIGTERM", () => void shutdown(0));
     process.on("SIGHUP", () => void shutdown(0));
     onClientDisconnect(process.stdin, process.stdout, () => void shutdown(0));
-    // If we crash, still try to cleanly shut down — at the very least the
-    // process tracker reap will kill orphaned subprocesses on the way out.
     process.on("uncaughtException", (err) => {
       try {
         process.stderr.write(`uncaughtException: ${err?.stack ?? err}\n`);

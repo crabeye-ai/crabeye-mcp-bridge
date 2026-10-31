@@ -16,7 +16,9 @@ Servers that run as local subprocesses:
 }
 ```
 
-STDIO upstreams are routed through the [STDIO manager](stdio-manager.md) so multiple bridges can share a single subprocess per upstream.
+STDIO servers are started by the per-user [manager](stdio-manager.md), once for every bridge that uses them, so several AI clients share one process per server. A server starts with the environment of the AI client whose bridge first loaded the config, with its `env` on top, and never gets `MCP_BRIDGE_MASTER_KEY`; see [A STDIO server's environment](stdio-manager.md#a-stdio-servers-environment). `${credential:…}` values in `env` are filled in by the manager each time it starts the server. `cwd`, when set, must be an absolute path.
+
+Each bridge talks to the manager over one connection, whatever servers it uses. `_bridge.daemon.heartbeatMs` (default `5000`) sets how often the bridge checks that the manager still answers, and `_bridge.daemon.rpcTimeoutMs` (default `30000`) how long it waits for the manager to answer when it connects and checks on it; a manager that misses three checks in a row or doesn't answer a check in time is replaced. See [Configuration knobs](stdio-manager.md#configuration-knobs).
 
 ## HTTP servers
 

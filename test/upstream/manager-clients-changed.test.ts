@@ -1,30 +1,30 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
-import { BridgeConfigSchema, type BridgeConfig, type ServerConfig } from "../../src/config/schema.js";
+import type { Transport } from "@modelcontextprotocol/client";
+import { BridgeConfigSchema, type BridgeConfig } from "../../src/config/schema.js";
 import { diffConfigs } from "../../src/config/config-diff.js";
 import { UpstreamManager } from "../../src/upstream/upstream-manager.js";
-import { HttpUpstreamClient } from "../../src/upstream/http-client.js";
-import { DaemonStdioClient } from "../../src/upstream/daemon-stdio-client.js";
+import { BaseUpstreamClient } from "../../src/upstream/base-client.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { createNoopLogger } from "../../src/logging/index.js";
 import type { ConnectionStatus, UpstreamClient } from "../../src/upstream/types.js";
 
-function inMemoryUpstream(name: string) {
-  return () => {
-    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-    const server = new Server({ name, version: "1.0.0" }, { capabilities: { tools: {} } });
-    server.setRequestHandler("tools/list", () => ({ tools: [] }));
-    void server.connect(serverSide);
-    return clientSide;
-  };
+function inMemoryUpstream(name: string): Transport {
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  const server = new Server({ name, version: "1.0.0" }, { capabilities: { tools: {} } });
+  server.setRequestHandler("tools/list", () => ({ tools: [] }));
+  void server.connect(serverSide);
+  return clientSide;
 }
 
-function clientFactory(name: string, config: ServerConfig): UpstreamClient {
-  if ("command" in config) {
-    return new DaemonStdioClient({ name, config, resolvedEnv: {}, _transportFactory: inMemoryUpstream(name) });
+class InMemoryUpstreamClient extends BaseUpstreamClient {
+  protected _buildTransport(): Transport {
+    return inMemoryUpstream(this.name);
   }
-  if (config.url.includes("broken")) throw new Error("cannot build client");
-  return new HttpUpstreamClient({ name, config, _transportFactory: inMemoryUpstream(name) });
+}
+
+function clientFactory(name: string): UpstreamClient {
+  return new InMemoryUpstreamClient({ name });
 }
 
 const http = (url: string) => ({ type: "streamable-http", url });
@@ -72,34 +72,14 @@ describe("UpstreamManager clients-changed events", () => {
   it.each([
     ["an HTTP", http("http://localhost:1000"), http("http://localhost:1001")],
     ["a STDIO", stdio("server.js"), stdio("server.js", "--changed")],
-  ])("fires once when a reload replaces %s server, with the new client registered before it connects", async (_label, before, after) => {
+  ])("keeps the client and fires nothing when a reload changes how %s server connects", async (_label, before, after) => {
     const { initial, seen } = await startWith({ alpha: before });
     const old = manager!.getClient("alpha");
 
     await reload(initial, { alpha: after });
 
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.client).toBeDefined();
-    expect(seen[0]!.client).not.toBe(old);
-    expect(seen[0]!.client).toBe(manager!.getClient("alpha"));
-    expect(seen[0]!.status).not.toBe("connected");
-  });
-
-  it("fires once when a reload turns a STDIO server into an alias of another, with the shared client registered", async () => {
-    const { initial, seen } = await startWith({ alpha: stdio("own.js"), beta: stdio("shared.js") });
-
-    await reload(initial, { alpha: stdio("shared.js"), beta: stdio("shared.js") });
-
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.client).toBe(manager!.getClient("beta"));
-  });
-
-  it("fires when a reload replaces a server whose new client cannot be built, leaving the name unregistered", async () => {
-    const { initial, seen } = await startWith({ alpha: http("http://localhost:1000") });
-
-    await reload(initial, { alpha: http("http://broken:1000") });
-
-    expect(seen).toEqual([{ client: undefined, status: undefined }]);
+    expect(seen).toEqual([]);
+    expect(manager!.getClient("alpha")).toBe(old);
   });
 
   it("fires when a reload adds a server", async () => {

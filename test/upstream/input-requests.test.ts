@@ -4,7 +4,6 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { HttpUpstreamClient } from "../../src/upstream/http-client.js";
-import { DaemonStdioClient } from "../../src/upstream/daemon-stdio-client.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { ToolSearchService } from "../../src/search/index.js";
@@ -12,7 +11,7 @@ import { createTestPair } from "../_helpers/bridge-test-pair.js";
 import { INPUT_ASKING_TOOLS, inputAskingServer } from "../_helpers/input-asking-server.js";
 import { readBody, sendWebResponse, toWebRequest } from "../_helpers/web-http.js";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
-import { spawnTestManager, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
+import { AttachedBridge, fixtureSource, servingConfigs, spawnTestManager, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { APP_NAME } from "../../src/constants.js";
 import { errorResult } from "../_helpers/run-tool.js";
 
@@ -156,15 +155,15 @@ describe("an upstream that asks the client for input", () => {
   describe.skipIf(isWindows)("over STDIO through the daemon", () => {
     let serverScript: string;
     let fx: DaemonFixture | undefined;
-    let client: DaemonStdioClient | undefined;
+    let bridge: AttachedBridge | undefined;
 
     beforeAll(async () => {
       serverScript = await bundleForSubprocess("test/_helpers/subprocess/input-asking-stdio-server.ts", "input-asking-stdio");
     });
 
     afterEach(async () => {
-      await client?.close();
-      client = undefined;
+      bridge?.close();
+      bridge = undefined;
       await fx?.stop();
       fx = undefined;
     });
@@ -174,18 +173,13 @@ describe("an upstream that asks the client for input", () => {
       ["sample", "sampling"],
       ["roots", "roots"],
     ])("fails a call to %s with an error naming the %s capability, and keeps serving", async (tool, capability) => {
-      const f = (fx = await spawnTestManager({ manager: { childPingMs: 0 } }));
-      client = new DaemonStdioClient({
-        name: "asker",
-        config: { command: process.execPath, args: [serverScript] },
-        resolvedEnv: {},
-        _socketPath: f.socketPath,
-        _ensureDaemon: async () => {},
-      });
-      await client.connect();
+      const asker = { command: process.execPath, args: [serverScript] };
+      fx = await spawnTestManager({ manager: { childPingMs: 0, ...servingConfigs({ [fixtureSource.path]: { asker } }) } });
+      bridge = await AttachedBridge.attach(fx);
+      await bridge.connected("asker");
 
-      await expect(client.callTool({ name: tool })).rejects.toThrow(new Error(refusal(capability)));
-      expect((await client.callTool({ name: "resume" })).content).toEqual([{ type: "text", text: "resumed" }]);
+      await expect(bridge.callTool("asker", tool)).rejects.toThrow(refusal(capability));
+      expect(await bridge.calledText("asker", "resume")).toBe("resumed");
     });
   });
 });

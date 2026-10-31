@@ -8,31 +8,27 @@
  *   response:     { id, result | error }        reply to request
  *   notification: { method, params? }           no `id`, no reply expected
  *
- * Notification frames let daemon and bridge pipe MCP JSON-RPC messages over
- * `RPC` notifications without a per-message ack roundtrip.
+ * Notification frames carry what needs no reply: upstream snapshots and
+ * logs to bridges, and cancellations to the daemon.
  */
 
 import type { Tool } from "@modelcontextprotocol/client";
 import type { ConnectionStatus } from "../upstream/types.js";
 
-export const PROTOCOL_VERSION = 3;
-export const MIN_BRIDGE_PROTOCOL_VERSION = 1;
-export const MIN_DAEMON_PROTOCOL_VERSION = 3;
-export const UNREPORTED_BRIDGE_PROTOCOL_VERSION = 1;
-export const STDERR_BRIDGE_PROTOCOL_VERSION = 2;
-export const INSTANCE_BRIDGE_PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
+export const MIN_BRIDGE_PROTOCOL_VERSION = 4;
+export const MIN_DAEMON_PROTOCOL_VERSION = 4;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
-/** Hard cap on requests in flight per session, and on tool calls in flight per attached bridge. */
-export const MAX_INFLIGHT_PER_SESSION = 4096;
+/** Hard cap on tool calls in flight per attached bridge. */
+export const MAX_CALLS_PER_BRIDGE = 4096;
 
 export const STDERR_LINE_MAX_CHARS = 1_000;
 export const STDERR_TAIL_LINES = 20;
 const STDERR_TRUNCATED_SUFFIX = " [truncated]";
-export const STDERR_LINE_MAX_SENT_CHARS = STDERR_LINE_MAX_CHARS + STDERR_TRUNCATED_SUFFIX.length;
 
 function isHighSurrogate(charCode: number): boolean {
   return charCode >= 0xd800 && charCode <= 0xdbff;
@@ -49,12 +45,8 @@ export type DaemonMethod =
   | "STATUS"
   | "SHUTDOWN"
   | "OPEN"
-  | "RPC"
-  | "CLOSE"
   | "RESTART"
   | "PING"
-  | "SESSION_EVICTED"
-  | "STDERR"
   | "ATTACH"
   | "CALL_TOOL"
   | "CANCEL_TOOL"
@@ -88,82 +80,18 @@ export interface DaemonResponse {
 
 export type DaemonFrame = DaemonRequest | DaemonResponse | DaemonNotification;
 
-export const SHARING_FOR_OLDER_DAEMONS = "shared";
+export type ChildEraLabel = "modern" | "legacy" | "unknown";
 
-/** Spec passed in `OPEN.params`. `cwd` is empty-string when the bridge has none. */
-export interface OpenParams {
-  sessionId: string;
-  bridgeProtocolVersion?: number;
-  spec: {
-    serverName: string;
-    command: string;
-    args: string[];
-    resolvedEnv: Record<string, string>;
-    cwd: string;
-    sharing?: typeof SHARING_FOR_OLDER_DAEMONS;
-    clientInfo: { name: string; version: string };
-    clientCapabilities: Record<string, unknown>;
-    protocolVersion: string;
-  };
-}
-
-export interface OpenResult {
-  ok: true;
-}
-
-export interface CloseParams {
-  sessionId: string;
-}
-
-export interface CloseResult {
-  ok: true;
-}
-
-/**
- * RPC notification: bridge↔daemon transparent JSON-RPC pipe. `payload` is the
- * raw MCP JSON-RPC message (request, response, or notification) verbatim.
- */
-export interface RpcNotificationParams {
-  sessionId: string;
-  payload: unknown;
-}
-
-export const CHILD_EXIT_CAUSES = ["exited", "failed_to_start", "unresponsive", "output_flood"] as const;
-
-export interface ChildExit {
-  cause: (typeof CHILD_EXIT_CAUSES)[number];
-  code: number | null;
-  signal: string | null;
-}
-
-export interface SessionEvictedParams {
-  sessionId: string;
-  reason: "child_exited" | "upstream_restarted";
-  exit?: ChildExit;
-  stderr?: string[];
-}
-
-export interface StderrParams {
-  sessionId: string;
-  line: string;
-}
-
+/** A STDIO server process the daemon runs. */
 export interface StatusChild {
   pid: number;
+  /** What `daemon restart-upstream` takes to restart it. */
   upstreamHash: string;
   serverName: string;
   era: ChildEraLabel;
   startedAt: number;
-  refcount: number;
-  sessions: string[];
-  subscriptionCount: number;
-  cachedInit: { protocolVersion: string } | null;
-}
-
-export interface StatusSession {
-  sessionId: string;
-  upstreamHash: string;
-  serverName: string;
+  /** How many instances use it. */
+  instances: number;
 }
 
 /**
@@ -185,6 +113,8 @@ export interface AttachParams {
    * them (see `instanceEnvFrom`).
    */
   env: Record<string, string>;
+  /** The bridge's environment for the STDIO servers the instance starts, without the master key (see `childEnvFrom`). */
+  childEnv: Record<string, string>;
 }
 
 /** Sent after one `UPSTREAM` notification per name. */
@@ -238,7 +168,7 @@ export interface AuthChangedResult {
   connections: number;
 }
 
-export type UpstreamLogLevel = "warn" | "error";
+export type UpstreamLogLevel = "debug" | "warn" | "error";
 
 export type UpstreamLogContext = Record<string, string | number | boolean>;
 
@@ -247,6 +177,8 @@ export interface UpstreamLogParams {
   level: UpstreamLogLevel;
   message: string;
   context?: UpstreamLogContext;
+  /** The last lines a STDIO server wrote to stderr before it stopped, at most `STDERR_TAIL_LINES`. */
+  stderr?: string[];
 }
 
 export interface StatusInstance {
@@ -255,18 +187,26 @@ export interface StatusInstance {
   upstreams: string[];
 }
 
-export interface StatusHttpUpstream {
+export type UpstreamType = "stdio" | "streamable-http" | "sse";
+
+export type StatusUpstream = {
   serverName: string;
   status: ConnectionStatus;
   instances: number;
-}
+} & (
+  | {
+      type: "stdio";
+      /** For RESTART, whether or not the server's process is running. */
+      upstreamHash: string;
+    }
+  | { type: Exclude<UpstreamType, "stdio"> }
+);
 
 export type {
   KilledReason as TelemetryKilledReason,
   TelemetrySnapshot,
 } from "./telemetry.js";
 import type { TelemetrySnapshot as _TelemetrySnapshot } from "./telemetry.js";
-import type { ChildEraLabel } from "./child-era.js";
 
 export interface StatusResult {
   uptime: number;
@@ -275,9 +215,8 @@ export interface StatusResult {
   minBridgeProtocolVersion: number;
   appVersion: string;
   children: StatusChild[];
-  sessions: StatusSession[];
   instances: StatusInstance[];
-  httpUpstreams: StatusHttpUpstream[];
+  upstreams: StatusUpstream[];
   telemetry: _TelemetrySnapshot;
 }
 
@@ -291,15 +230,9 @@ export interface DaemonStatus {
 // Typed error codes. Listed here so call sites and tests share the literal.
 export const ERROR_CODE_INVALID_REQUEST = "invalid_request";
 export const ERROR_CODE_UNKNOWN_METHOD = "unknown_method";
-export const ERROR_CODE_NOT_IMPLEMENTED = "not_implemented";
 export const ERROR_CODE_TOO_MANY_CONNECTIONS = "too_many_connections";
 export const ERROR_CODE_RPC_TIMEOUT = "rpc_timeout";
-export const ERROR_CODE_BACKPRESSURE = "backpressure";
-export const ERROR_CODE_SESSION_NOT_FOUND = "session_not_found";
-export const ERROR_CODE_SESSION_IN_USE = "session_in_use";
-export const ERROR_CODE_SPAWN_FAILED = "spawn_failed";
 export const ERROR_CODE_INVALID_PARAMS = "invalid_params";
-export const ERROR_CODE_TOO_MANY_SESSIONS = "too_many_sessions";
 export const ERROR_CODE_DAEMON_STOPPING = "daemon_stopping";
 export const ERROR_CODE_BRIDGE_UNSUPPORTED = "bridge_unsupported";
 export const ERROR_CODE_INSTANCE_LOAD_FAILED = "instance_load_failed";
@@ -310,16 +243,6 @@ export const ERROR_CODE_UPSTREAM_ERROR = "upstream_error";
 export const ERROR_CODE_TOO_MANY_CALLS = "too_many_calls";
 export const ERROR_CODE_TOO_MANY_INSTANCES = "too_many_instances";
 export const ERROR_CODE_RESPONSE_TOO_LARGE = "response_too_large";
-/** Synthetic JSON-RPC error code emitted to inner requests when the session closes. */
-export const INNER_ERROR_CODE_SESSION_CLOSED = -32000;
-/** Synthetic JSON-RPC error code emitted when the per-child stdin queue overflows. */
-export const INNER_ERROR_CODE_BACKPRESSURE = -32001;
-/** Daemon-protocol error: child was killed by an admin RESTART, or daemon was force-respawned. `data.reason` distinguishes the two. */
-export const ERROR_CODE_UPSTREAM_RESTARTED = "upstream_restarted";
-/** Inner JSON-RPC error: child was killed (admin RESTART or daemon respawn). MCP SDK requires numeric `code`; reason is carried in `data.reason`. */
-export const INNER_ERROR_CODE_UPSTREAM_RESTARTED = -32004;
-
-export type UpstreamRestartedReason = "admin_restart" | "daemon_respawn";
 
 export interface RestartParams {
   upstreamHash: string;
@@ -327,8 +250,8 @@ export interface RestartParams {
 
 export interface RestartResult {
   ok: true;
-  /** How many child groups were killed. 0 means the hash was not registered (still ok=true). */
-  killed: number;
+  /** How many STDIO servers were started again. 0 means none has that hash (still ok=true). */
+  restarted: number;
 }
 
 export interface PingParams {
@@ -418,10 +341,6 @@ export class FrameDecoder {
 
 export function errorResponse(id: string, code: string, message: string): DaemonResponse {
   return { id, error: { code, message } };
-}
-
-export function notImplementedResponse(id: string, method: string): DaemonResponse {
-  return errorResponse(id, ERROR_CODE_NOT_IMPLEMENTED, `method "${method}" is not implemented in this phase`);
 }
 
 /**

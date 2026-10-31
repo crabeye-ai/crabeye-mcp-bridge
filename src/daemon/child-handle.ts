@@ -1,5 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { ERROR_CODE_BACKPRESSURE, type ChildExit } from "./protocol.js";
 import { STDERR_DRAIN_MS, StderrCapture } from "./stderr-capture.js";
 import { RateLimitedReport } from "./rate-limited-report.js";
 import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
@@ -21,28 +20,18 @@ const DEFAULT_QUEUE_MAX_BYTES = 1 * 1024 * 1024;
 const DEFAULT_STDOUT_MAX_BYTES = 8 * 1024 * 1024;
 const NON_JSON_REPORT_INTERVAL_MS = 1_000;
 
-export type ProcessExit = ChildExit & { cause: Exclude<ChildExit["cause"], "unresponsive"> };
+/** How a child process ended without being asked to. */
+export interface ProcessExit {
+  cause: "exited" | "failed_to_start" | "output_flood";
+  code: number | null;
+  signal: string | null;
+}
 
 export class BackpressureError extends Error {
-  readonly code = ERROR_CODE_BACKPRESSURE;
   constructor(message: string) {
     super(message);
     this.name = "BackpressureError";
   }
-}
-
-export interface CachedInit {
-  /** Echoed back to subsequent sessions verbatim — daemon does not re-negotiate. */
-  protocolVersion: string;
-  /** From the child's `initialize` response. */
-  serverInfo: { name: string; version: string; [k: string]: unknown };
-  capabilities: Record<string, unknown>;
-  /**
-   * Optional `instructions` field from the child's `initialize` response.
-   * Replayed verbatim by the daemon's initialize short-circuit so subsequent
-   * sessions on a shared child still see it via `Client.getInstructions()`.
-   */
-  instructions?: string;
 }
 
 export interface ChildHandleOptions {
@@ -58,8 +47,10 @@ export interface ChildHandleOptions {
    * when it floods stdout. Not called after the owner calls `kill()`.
    */
   onClose: (exit: ProcessExit) => void;
-  /** Called for unrecoverable errors (spawn failure, parse failure). */
+  /** Called for unrecoverable errors (spawn failure, parse failure, a failed write to stdin). */
   onError: (err: Error) => void;
+  /** Called once, as soon as the child exits or fails to start, before `onClose` waits for the end of its stderr. Not called after the owner calls `kill()`. */
+  onExit?: () => void;
   /** Called once per non-blank stderr line, with trailing whitespace removed and cut like `capStderrLine`; a start failure arrives as its error message. */
   onStderr?: (line: string) => void;
   /** Override stdin queue cap. Defaults to 1 MiB. */
@@ -73,7 +64,7 @@ export interface ChildHandleOptions {
 /**
  * Wraps a spawned child process whose stdio speaks newline-delimited
  * JSON-RPC (the MCP stdio framing). Owns the single-writer stdin queue
- * and the stdout line parser; the daemon reads parsed payloads via the
+ * and the stdout line parser; its owner reads parsed payloads via the
  * `onMessage` callback.
  */
 export class ChildHandle {
@@ -86,9 +77,8 @@ export class ChildHandle {
   private readonly stdoutMaxBytes: number;
   private readonly stderrDrainMs: number;
   private readonly opts: ChildHandleOptions;
-  private _cachedInit: CachedInit | null = null;
   private readonly stderr: StderrCapture;
-  private _exitStatus: Pick<ChildExit, "code" | "signal"> | null = null;
+  private _exitStatus: Pick<ProcessExit, "code" | "signal"> | null = null;
   private _lastSignalSent: NodeJS.Signals | null = null;
   private readonly nonJsonLines = new RateLimitedReport<number>(NON_JSON_REPORT_INTERVAL_MS, (count, latestBytes) =>
     this.opts.onError(
@@ -119,9 +109,7 @@ export class ChildHandle {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
-      throw new Error(
-        `spawn failed for ${opts.command}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      throw new Error(`spawn failed for ${opts.command}: ${describeSpawnError(err)}`);
     }
 
     this.stderr = new StderrCapture((line) => opts.onStderr?.(line));
@@ -134,7 +122,12 @@ export class ChildHandle {
     this.child.once("exit", (code, signal) => {
       this._exitStatus = { code, signal };
       this.resolveExited();
+      this.reportExit();
       this.reportExitWhenDrained();
+    });
+
+    this.child.stdin.on("error", (err) => {
+      if (!this.closed) opts.onError(err);
     });
 
     this.child.stdout.setEncoding("utf-8");
@@ -159,7 +152,7 @@ export class ChildHandle {
     return this.child.pid ?? null;
   }
 
-  get exitStatus(): Pick<ChildExit, "code" | "signal"> | null {
+  get exitStatus(): Pick<ProcessExit, "code" | "signal"> | null {
     return this._exitStatus;
   }
 
@@ -167,23 +160,9 @@ export class ChildHandle {
     return this._lastSignalSent;
   }
 
-  get alive(): boolean {
-    return !this.closed && !hasExited(this.child);
-  }
-
-  get cachedInit(): CachedInit | null {
-    return this._cachedInit;
-  }
-
-  /** First writer wins. Subsequent calls are no-ops. */
-  setCachedInit(init: CachedInit): void {
-    if (this._cachedInit !== null) return;
-    this._cachedInit = init;
-  }
-
   /**
    * Append one MCP JSON-RPC message to the child's stdin. Throws
-   * `BackpressureError` (code: backpressure) when the cumulative outstanding
+   * `BackpressureError` when the cumulative outstanding
    * bytes in the kernel + libuv queues would exceed `queueMaxBytes`.
    */
   send(payload: unknown): void {
@@ -207,7 +186,9 @@ export class ChildHandle {
   /**
    * Kill the child with SIGTERM, then SIGKILL after `killGraceMs`. Resolves once
    * the child has exited or the kill window has elapsed. Later calls return the
-   * first kill, with its grace.
+   * first kill, with its grace. A child that never started gets no signal:
+   * until Node reports its failed start, signalling it would signal pid 0, the
+   * daemon's whole process group.
    */
   kill(killGraceMs = DEFAULT_KILL_GRACE_MS): Promise<void> {
     this.killing ??= this.terminate(killGraceMs);
@@ -217,7 +198,7 @@ export class ChildHandle {
   private async terminate(killGraceMs: number): Promise<void> {
     this.nonJsonLines.flush();
     this.closed = true;
-    if (hasExited(this.child)) return;
+    if (this.child.pid === undefined || hasExited(this.child)) return;
 
     try {
       this._lastSignalSent = "SIGTERM";
@@ -243,7 +224,12 @@ export class ChildHandle {
     this.failedToStart = true;
     this.stderr.push(`${err.message}\n`);
     this.resolveExited();
+    this.reportExit();
     this.reportExitWhenDrained();
+  }
+
+  private reportExit(): void {
+    if (this.killing === null) this.opts.onExit?.();
   }
 
   private reportExitWhenDrained(): void {
@@ -335,4 +321,9 @@ function waitForExit(
 
 function hasExited(child: ChildProcessWithoutNullStreams): boolean {
   return child.exitCode !== null || child.signalCode !== null;
+}
+
+function describeSpawnError(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : "invalid command, arguments or environment";
 }

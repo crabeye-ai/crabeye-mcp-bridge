@@ -67,7 +67,7 @@ describe.skipIf(process.platform === "win32")("authorization failures of HTTP up
 
     expect(await call).toEqual(ECHOED);
     expect(server.tokenRequests()).toBe(1);
-    expect((await status()).httpUpstreams.find((each) => each.serverName === "svc")?.status).toBe("connected");
+    expect((await status()).upstreams.find((each) => each.serverName === "svc")?.status).toBe("connected");
   });
 
   it("keeps the tokens of a refresh in flight when a reload connects that upstream again", async () => {
@@ -82,7 +82,7 @@ describe.skipIf(process.platform === "win32")("authorization failures of HTTP up
     server.holdRefreshResponses(false);
     await call;
 
-    await vi.waitFor(async () => expect((await status()).httpUpstreams).toEqual([{ serverName: "svc", status: "connected", instances: 1 }]));
+    await vi.waitFor(async () => expect((await status()).upstreams).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 1 }]));
     expect(server.tokenRequests()).toBe(1);
     expect(await store().get(oauthCredentialKey("svc"))).toMatchObject({ refresh_token: "rt-1" });
     expect(await client.call("svc")).toEqual(ECHOED);

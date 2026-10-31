@@ -75,9 +75,9 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     expect(separate.count("tools/list")).toBe(1);
     expect(await elsewhere.call("svc")).toEqual(ECHOED);
     expect((await status()).instances).toHaveLength(3);
-    expect((await status()).httpUpstreams).toEqual([
-      { serverName: "svc", status: "connected", instances: 2 },
-      { serverName: "svc", status: "connected", instances: 1 },
+    expect((await status()).upstreams).toEqual([
+      { serverName: "svc", type: "streamable-http", status: "connected", instances: 2 },
+      { serverName: "svc", type: "streamable-http", status: "connected", instances: 1 },
     ]);
   });
 
@@ -152,7 +152,7 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     expect(server.count("tools/list")).toBe(1);
     await again.manager.closeAll();
 
-    await vi.waitFor(async () => expect((await status()).httpUpstreams).toEqual([]), { timeout: 6_000 });
+    await vi.waitFor(async () => expect((await status()).upstreams).toEqual([]), { timeout: 6_000 });
     expect((await status()).instances).toEqual([]);
   });
 
@@ -238,7 +238,7 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
 
     await a.manager.closeAll();
 
-    await vi.waitFor(async () => expect((await status()).httpUpstreams).toEqual([]), { timeout: 5_000 });
+    await vi.waitFor(async () => expect((await status()).upstreams).toEqual([]), { timeout: 5_000 });
     await vi.waitFor(() => expect(server.openSockets()).toBe(0), { timeout: 2_000 });
   });
 });

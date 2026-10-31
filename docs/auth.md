@@ -32,7 +32,7 @@ crabeye-mcp-bridge credential set remote-api-key sk_live_xyz
 }
 ```
 
-Templates are resolved on every connect and reconnect, so rotating a credential takes effect without restarting the bridge.
+Templates are resolved on every connect and reconnect, so rotating a credential takes effect without restarting the bridge. A STDIO server gets its values when it starts, so a running one keeps the old value until it starts again, for example after `crabeye-mcp-bridge daemon restart-upstream <upstreamHash>`.
 
 ## OAuth
 

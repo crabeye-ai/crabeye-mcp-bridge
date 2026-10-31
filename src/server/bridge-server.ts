@@ -69,7 +69,6 @@ export interface BridgeServerOptions {
   toolSearchService?: ToolSearchService;
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
-  whenUpstreamRegistered?: (name: string) => Promise<void>;
   getRateLimiter?: (name: string) => RateLimiter | undefined;
   onClientsChanged?: (listener: () => void) => () => void;
   logger?: Logger;
@@ -282,7 +281,7 @@ export class BridgeServer {
     }
 
     const signal = ctx.mcpReq.signal;
-    if (!getClient(parsed.source)) await this.awaitPendingRegistration(parsed.source, signal);
+    if (!getClient(parsed.source)) await untilSettledOrCancelled(this.sessionStart, signal);
     if (!getClient(parsed.source)) {
       throw new Error(`Upstream server not found: ${parsed.source}`);
     }
@@ -316,13 +315,6 @@ export class BridgeServer {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`Upstream server "${parsed.source}" error: ${message}`);
     }
-  }
-
-  private async awaitPendingRegistration(source: string, signal: AbortSignal): Promise<void> {
-    const whenRegistered = this.options.whenUpstreamRegistered;
-    if (!whenRegistered) return;
-    await this.sessionStart;
-    await untilSettledOrCancelled(whenRegistered(source), signal);
   }
 
   private refuseIfPolicyTightened(

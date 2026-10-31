@@ -1,37 +1,20 @@
 import type { BridgeConfig, ServerConfig, ToolPolicy } from "./schema.js";
-import { resolveUpstreams, isStdioServer } from "./schema.js";
+import { resolveUpstreams } from "./schema.js";
 import type { LogLevel } from "../logging/index.js";
 
-export interface ServerDiff<T extends ServerConfig = ServerConfig> {
-  added: Array<{ name: string; config: T }>;
+export interface ServerDiff {
+  added: Array<{ name: string; config: ServerConfig }>;
   removed: string[];
-  reconnect: Array<{ name: string; config: T }>;
-  updated: Array<{ name: string; config: T }>;
+  /** Servers kept under the same name whose entry changed in any way. */
+  changed: Array<{ name: string; config: ServerConfig }>;
 }
 
 export interface ConfigDiff {
   servers: ServerDiff;
   bridge: {
     logLevel?: LogLevel;
-    healthCheckInterval?: number;
     toolPolicy?: ToolPolicy;
     requiresRestart: string[];
-  };
-}
-
-function connectionFields(config: ServerConfig): Record<string, unknown> {
-  if (isStdioServer(config)) {
-    return {
-      command: config.command,
-      args: config.args,
-      env: config.env,
-    };
-  }
-  return {
-    type: config.type,
-    url: config.url,
-    headers: config.headers,
-    auth: config._bridge?.auth,
   };
 }
 
@@ -70,44 +53,27 @@ export function diffConfigs(oldConfig: BridgeConfig, newConfig: BridgeConfig): C
   };
 }
 
-/** Server changes between two sets of upstreams, by name. */
-export function diffServers<T extends ServerConfig>(
-  oldServers: Record<string, T>,
-  newServers: Record<string, T>,
-): ServerDiff<T> {
+function diffServers(
+  oldServers: Record<string, ServerConfig>,
+  newServers: Record<string, ServerConfig>,
+): ServerDiff {
   const oldNames = new Set(Object.keys(oldServers));
   const newNames = new Set(Object.keys(newServers));
 
-  const added: ServerDiff<T>["added"] = [];
+  const added: ServerDiff["added"] = [];
   const removed: string[] = [];
-  const reconnect: ServerDiff<T>["reconnect"] = [];
-  const updated: ServerDiff<T>["updated"] = [];
+  const changed: ServerDiff["changed"] = [];
 
   for (const name of newNames) {
-    if (!oldNames.has(name)) {
-      added.push({ name, config: newServers[name] });
-    }
+    if (!oldNames.has(name)) added.push({ name, config: newServers[name] });
+    else if (!deepEqual(oldServers[name], newServers[name])) changed.push({ name, config: newServers[name] });
   }
 
   for (const name of oldNames) {
-    if (!newNames.has(name)) {
-      removed.push(name);
-    }
+    if (!newNames.has(name)) removed.push(name);
   }
 
-  for (const name of newNames) {
-    if (!oldNames.has(name)) continue;
-    const oldCfg = oldServers[name];
-    const newCfg = newServers[name];
-
-    if (!deepEqual(connectionFields(oldCfg), connectionFields(newCfg))) {
-      reconnect.push({ name, config: newCfg });
-    } else if (!deepEqual(oldCfg._bridge, newCfg._bridge)) {
-      updated.push({ name, config: newCfg });
-    }
-  }
-
-  return { added, removed, reconnect, updated };
+  return { added, removed, changed };
 }
 
 function diffBridgeSettings(oldConfig: BridgeConfig, newConfig: BridgeConfig): ConfigDiff["bridge"] {
@@ -116,7 +82,6 @@ function diffBridgeSettings(oldConfig: BridgeConfig, newConfig: BridgeConfig): C
   const bridge: ConfigDiff["bridge"] = { requiresRestart: [] };
 
   if (ob.logLevel !== nb.logLevel) bridge.logLevel = nb.logLevel;
-  if (ob.healthCheckInterval !== nb.healthCheckInterval) bridge.healthCheckInterval = nb.healthCheckInterval;
   if (ob.toolPolicy !== nb.toolPolicy) bridge.toolPolicy = nb.toolPolicy;
 
   const restartFields = ["port", "logFormat", "maxUpstreamConnections", "connectionTimeout", "idleTimeout"] as const;

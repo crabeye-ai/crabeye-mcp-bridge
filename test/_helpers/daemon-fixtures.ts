@@ -1,18 +1,25 @@
 /**
- * Test-only helpers for spinning up a real `ManagerDaemon` on a temp socket.
- *
- * Built for AIT-249 integration tests; mirrors the inline pattern used across
- * `test/daemon/*.test.ts` (`tempPaths()` → `new ManagerDaemon(...)` →
- * `DaemonClient`). Exposes a few extra seams (`severIncomingFrames`,
- * `kill`, `writePidfile`) that the LivenessSupervisor tests need.
+ * Test-only helpers for spinning up a real `ManagerDaemon` on a temp socket,
+ * and attaching bridges to its instances.
  */
 
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CallToolResult } from "@modelcontextprotocol/client";
+import { BridgeConfigSchema } from "../../src/config/schema.js";
+import type { CredentialStore } from "../../src/credentials/credential-store.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { ManagerDaemon, type ManagerOptions } from "../../src/daemon/manager.js";
 import { netTransport } from "../../src/daemon/net-transport.js";
-import type { DaemonNotification, OpenParams, SessionEvictedParams, StderrParams } from "../../src/daemon/protocol.js";
+import {
+  MIN_BRIDGE_PROTOCOL_VERSION,
+  type DaemonNotification,
+  type InstanceSource,
+  type UpstreamLogParams,
+  type UpstreamSnapshot,
+} from "../../src/daemon/protocol.js";
+import { STUB_STDIO_SERVER } from "./stub-stdio-server.js";
 
 export async function until(check: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -124,161 +131,98 @@ export async function spawnTestManager(opts: SpawnTestManagerOpts = {}): Promise
   return fx;
 }
 
-export interface OpenSessionOpts {
-  /** Override session UUID. */
-  sessionId?: string;
-  /** Spawned-child command. */
-  command?: string;
-  /** Spawned-child args. */
-  args?: string[];
-  /** serverName override (not part of upstreamHash). */
-  serverName?: string;
-  resolvedEnv?: Record<string, string>;
-  /** The bridge's protocol version; omit to act as a bridge from before protocol versions. */
-  bridgeProtocolVersion?: number;
+export interface AttachOpts {
+  /** The config file the bridge loads; `fixtureSource` by default. */
+  source?: InstanceSource;
+  /** The client variables the bridge sends (`instanceEnvFrom`). */
+  env?: Record<string, string>;
+  /** The environment for the instance's STDIO servers (`childEnvFrom`). */
+  childEnv?: Record<string, string>;
 }
 
-let nextSessionCounter = 0;
-function nextSessionId(): string {
-  // Generate a deterministic UUIDv4 shape per call, derived from an integer
-  // counter so multiple sessions in the same fixture get unique ids.
-  nextSessionCounter += 1;
-  const n = nextSessionCounter.toString(16).padStart(8, "0");
-  return `${n}-1111-1111-1111-111111111111`;
+/** Writes the stub STDIO server to a file of its own; `cleanup` removes it. */
+export async function stubServerFile(): Promise<{ path: string; cleanup(): Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), "cbe-stub-"));
+  const path = join(dir, "stub.cjs");
+  await writeFile(path, STUB_STDIO_SERVER);
+  return { path, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
-export class OpenSessionFixture {
-  readonly sessionId: string;
-  readonly spec: OpenParams["spec"];
-  private inboundRpcHandlers: Array<(payload: unknown) => void> = [];
-  readonly evictions: Array<{ reason: string; framesBefore: number; params: SessionEvictedParams }> = [];
-  readonly stderrLines: string[] = [];
-  private inboundFrames: unknown[] = [];
-  private auxClient: DaemonClient;
+/** The config file bridges attach with unless a test names another. */
+export const fixtureSource: InstanceSource = { kind: "file", path: "/home/u/bridge.json" };
 
-  private constructor(sessionId: string, spec: OpenParams["spec"], auxClient: DaemonClient) {
-    this.sessionId = sessionId;
-    this.spec = spec;
-    this.auxClient = auxClient;
-    auxClient.setNotificationHandler((notif) => this._onNotification(notif));
+/** A manager option that serves `configs`, by config path, to instances, with no credential store or file watching. */
+export function servingConfigs(configs: Record<string, Record<string, unknown>>): Pick<ManagerOptions, "_instances"> {
+  return {
+    _instances: {
+      loadConfig: async (source) => {
+        const servers = configs[source.path];
+        if (servers === undefined) throw new Error(`no test config at ${source.path}`);
+        return { config: BridgeConfigSchema.parse({ mcpServers: servers }), watchPaths: [] };
+      },
+      createCredentialStore: () => new MemoryCredentialStore() as unknown as CredentialStore,
+    },
+  };
+}
+
+/** A credential store holding only what a test puts in it. */
+export class MemoryCredentialStore {
+  readonly values = new Map<string, unknown>();
+
+  async get(key: string): Promise<unknown> {
+    return this.values.get(key);
   }
+}
 
-  static async open(fx: DaemonFixture, opts: OpenSessionOpts = {}): Promise<OpenSessionFixture> {
-    // Open a dedicated client per session so notifications are routed to it.
-    const c = new DaemonClient({
-      socketPath: fx.socketPath,
-      transport: netTransport,
-      rpcTimeoutMs: 2_000,
-      connectTimeoutMs: 2_000,
+/** A bridge attached to an instance over its own connection, recording what the manager tells it. */
+export class AttachedBridge {
+  readonly snapshots = new Map<string, UpstreamSnapshot>();
+  readonly logs: UpstreamLogParams[] = [];
+  readonly removed: string[] = [];
+  private nextCallId = 1;
+
+  private constructor(readonly client: DaemonClient) {}
+
+  static async attach(fx: Pick<DaemonFixture, "socketPath">, opts: AttachOpts = {}): Promise<AttachedBridge> {
+    const client = new DaemonClient({ socketPath: fx.socketPath, transport: netTransport, rpcTimeoutMs: 10_000, connectTimeoutMs: 2_000 });
+    const bridge = new AttachedBridge(client);
+    client.setNotificationHandler((notification) => bridge._onNotification(notification));
+    await client.connect();
+    await client.call("ATTACH", {
+      bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION,
+      source: opts.source ?? fixtureSource,
+      env: opts.env ?? {},
+      childEnv: opts.childEnv ?? (process.env as Record<string, string>),
     });
-    await c.connect();
-
-    const sessionId = opts.sessionId ?? nextSessionId();
-    const spec: OpenParams["spec"] = {
-      serverName: opts.serverName ?? "test-server",
-      command: opts.command ?? "node",
-      args: opts.args ?? ["-e", "process.stdin.on('data', () => {})"],
-      resolvedEnv: opts.resolvedEnv ?? {},
-      cwd: "",
-      clientInfo: { name: "test-bridge", version: "0.0.0" },
-      clientCapabilities: {},
-      protocolVersion: "2025-06-18",
-    };
-    const fixture = new OpenSessionFixture(sessionId, spec, c);
-    await c.call("OPEN", {
-      sessionId,
-      ...(opts.bridgeProtocolVersion !== undefined && { bridgeProtocolVersion: opts.bridgeProtocolVersion }),
-      spec,
-    });
-    return fixture;
+    return bridge;
   }
 
-  /** Add a handler invoked on every inbound RPC notification for THIS session. */
-  onRpcNotification(handler: (payload: unknown) => void): void {
-    this.inboundRpcHandlers.push(handler);
+  /** Waits until `name` is connected, and returns its snapshot. */
+  async connected(name: string, timeoutMs = 10_000): Promise<UpstreamSnapshot> {
+    await until(() => this.snapshots.get(name)?.status === "connected", timeoutMs);
+    return this.snapshots.get(name)!;
   }
 
-  /**
-   * Wait for an inbound RPC notification's `payload` to satisfy `predicate`.
-   * Resolves with the matched payload; rejects on timeout.
-   */
-  async waitForFrame(
-    predicate: (payload: unknown) => boolean,
-    timeoutMs: number,
-  ): Promise<unknown> {
-    // Check already-buffered frames first.
-    for (const p of this.inboundFrames) {
-      if (predicate(p)) return p;
-    }
-    return new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`waitForFrame: timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-      const handler = (p: unknown): void => {
-        if (predicate(p)) {
-          clearTimeout(timer);
-          this.inboundRpcHandlers = this.inboundRpcHandlers.filter((h) => h !== handler);
-          resolve(p);
-        }
-      };
-      this.inboundRpcHandlers.push(handler);
-    });
+  callTool(upstream: string, name: string, args: Record<string, unknown> = {}): Promise<CallToolResult> {
+    const callId = String(this.nextCallId++);
+    return this.client.call("CALL_TOOL", { callId, upstream, name, arguments: args }, { timeoutMs: 0 }) as Promise<CallToolResult>;
   }
 
-  /**
-   * Send a notification to the daemon over the session's owning channel.
-   * Useful for staging in-flight RPCs against the session before triggering
-   * a kill or other failure path.
-   */
-  sendNotification(method: string, params?: unknown): boolean {
-    return this.auxClient.sendNotification(method, params);
+  /** The text of a tool call's first content block. */
+  async calledText(upstream: string, name: string, args: Record<string, unknown> = {}): Promise<string | undefined> {
+    const result = await this.callTool(upstream, name, args);
+    const [first] = result.content as Array<{ text?: string }>;
+    return first?.text;
   }
 
-  sendRpc(payload: unknown): boolean {
-    return this.auxClient.sendNotification("RPC", { sessionId: this.sessionId, payload });
+  close(): void {
+    this.client.close();
   }
 
-  framesMatching(predicate: (payload: unknown) => boolean): unknown[] {
-    return this.inboundFrames.filter(predicate);
-  }
-
-  /** Issue an RPC call over the session's owning channel. */
-  async call(method: string, params?: unknown): Promise<unknown> {
-    return this.auxClient.call(method, params);
-  }
-
-  async close(): Promise<void> {
-    try {
-      this.auxClient.close();
-    } catch {
-      /* ignore */
-    }
-  }
-
-  private _onNotification(notif: DaemonNotification): void {
-    if (notif.method === "SESSION_EVICTED") {
-      const evicted = notif.params as SessionEvictedParams | undefined;
-      if (evicted?.sessionId === this.sessionId) {
-        this.evictions.push({ reason: evicted.reason ?? "", framesBefore: this.inboundFrames.length, params: evicted });
-      }
-      return;
-    }
-    if (notif.method === "STDERR") {
-      const stderr = notif.params as StderrParams | undefined;
-      if (stderr?.sessionId === this.sessionId) this.stderrLines.push(stderr.line);
-      return;
-    }
-    if (notif.method !== "RPC") return;
-    const params = notif.params as { sessionId?: string; payload?: unknown } | undefined;
-    if (params === undefined || params.sessionId !== this.sessionId) return;
-    const payload = params.payload;
-    this.inboundFrames.push(payload);
-    for (const h of this.inboundRpcHandlers) {
-      try {
-        h(payload);
-      } catch {
-        /* listeners must not throw */
-      }
-    }
+  private _onNotification(notification: DaemonNotification): void {
+    const params = notification.params as Record<string, unknown>;
+    if (notification.method === "UPSTREAM") this.snapshots.set(params.name as string, params as unknown as UpstreamSnapshot);
+    else if (notification.method === "LOG") this.logs.push(params as unknown as UpstreamLogParams);
+    else if (notification.method === "UPSTREAM_REMOVED") this.removed.push(params.upstream as string);
   }
 }

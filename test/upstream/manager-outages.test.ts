@@ -123,24 +123,24 @@ describe("UpstreamManager during upstream outages", () => {
     await manager.closeAll();
   });
 
-  it("replaces a paused upstream whose connection settings changed in a reload", async () => {
+  it("keeps a paused upstream that a reload reports as changed, and retries it", async () => {
     const { manager, registry, clients, created } = await managerWith(["jira"]);
     const paused = clients.get("jira")!;
     paused.become("auth_required");
 
     await manager.applyConfigDiff(
       {
-        servers: { added: [], removed: [], reconnect: [{ name: "jira", config: config(["jira"]).mcpServers.jira! }], updated: [] },
+        servers: { added: [], removed: [], changed: [{ name: "jira", config: config(["jira"]).mcpServers.jira! }] },
         bridge: { requiresRestart: [] },
       },
       config(["jira"]),
     );
     manager.retryAuthPaused();
 
-    expect(paused.closed).toBe(true);
-    expect(created).toHaveLength(2);
-    expect(manager.getClient("jira")!.status).toBe("connected");
-    expect(paused.retryNow).not.toHaveBeenCalled();
+    expect(paused.closed).toBe(false);
+    expect(created).toHaveLength(1);
+    expect(manager.getClient("jira")).toBe(paused);
+    expect(paused.retryNow).toHaveBeenCalledTimes(1);
     expect(registry.listTools().map((t) => t.name)).toEqual(["jira__lookup"]);
     await manager.closeAll();
   });
@@ -151,7 +151,7 @@ describe("UpstreamManager during upstream outages", () => {
 
     await manager.applyConfigDiff(
       {
-        servers: { added: [], removed: ["jira"], reconnect: [], updated: [] },
+        servers: { added: [], removed: ["jira"], changed: [] },
         bridge: { requiresRestart: [] },
       },
       config(["notes"]),

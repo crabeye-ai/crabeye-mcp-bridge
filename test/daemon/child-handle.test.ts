@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { ChildHandle } from "../../src/daemon/child-handle.js";
 import { STDERR_DRAIN_MS } from "../../src/daemon/stderr-capture.js";
-import type { ChildExit } from "../../src/daemon/protocol.js";
+import type { ProcessExit } from "../../src/daemon/child-handle.js";
 import { processExists } from "../../src/process/process-utils.js";
 import { until } from "../_helpers/daemon-fixtures.js";
+import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 
+const CLOSES_STDIN = `require("node:fs").closeSync(0); process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "ready" }) + "\\n"); setInterval(() => {}, 1_000)`;
 const IGNORES_SIGTERM = "process.on('SIGTERM', () => {}); process.stdout.write('{\"ready\":true}\\n'); setInterval(() => {}, 1e6)";
 const FLOODS_STDOUT = "process.stdout.write('x'.repeat(4096)); setInterval(() => {}, 1e6)";
 const CLOSES_STDOUT = "require('node:fs').closeSync(1); setInterval(() => {}, 1e6)";
@@ -38,7 +42,7 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
   });
 
   function spawnChild(script: string, stdoutMaxBytes?: number) {
-    const events = { closes: 0, messages: 0, exits: [] as ChildExit[], stderr: [] as string[], stderrAtClose: [] as string[], errors: [] as string[], errorsAtClose: [] as string[] };
+    const events = { closes: 0, messages: 0, exits: [] as ProcessExit[], stderr: [] as string[], stderrAtClose: [] as string[], errors: [] as string[], errorsAtClose: [] as string[] };
     const handle = new ChildHandle({
       command: process.execPath,
       args: ["-e", script],
@@ -57,6 +61,23 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
     handles.push(handle);
     return { handle, events };
   }
+
+  it("reports a write to a child that closed its stdin as an error instead of crashing, and still stops it", async () => {
+    const { handle, events } = spawnChild(CLOSES_STDIN);
+    await until(() => events.messages > 0);
+
+    await until(() => {
+      try {
+        handle.send({ jsonrpc: "2.0", method: "notifications/ping" });
+      } catch {
+        /* stdin already closed */
+      }
+      return events.errors.some((error) => error.includes("EPIPE"));
+    });
+
+    await handle.kill(1_000);
+    expect(processExists(handle.pid!)).toBe(false);
+  });
 
   it("returns the kill already in progress to a second caller and SIGKILLs a SIGTERM-ignoring child", async () => {
     const { handle, events } = spawnChild(IGNORES_SIGTERM);
@@ -141,7 +162,7 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
 
   it("reports an ordinary exit as soon as stderr has closed, without waiting out the drain", async () => {
     const { handle, events } = spawnChild(WRITES_A_LINE_THEN_EXITS);
-    await until(() => !handle.alive);
+    await until(() => handle.exitStatus !== null);
     const exitedAt = Date.now();
 
     await until(() => events.closes > 0);
@@ -172,7 +193,7 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
   });
 
   it("reports a command that can't be started at once, with the reason as its last stderr line", async () => {
-    const events = { exits: [] as ChildExit[], stderr: [] as string[], errors: [] as string[] };
+    const events = { exits: [] as ProcessExit[], stderr: [] as string[], errors: [] as string[] };
     const handle = new ChildHandle({
       command: "/nonexistent/cbe-no-such-server",
       args: [],
@@ -217,7 +238,7 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
     const { handle, events } = spawnChild(LEAVES_GRANDCHILD_ON_STDERR);
     await until(() => events.stderr.length > 0);
     trackGrandchild(events.stderr);
-    await until(() => !handle.alive);
+    await until(() => handle.exitStatus !== null);
 
     void handle.kill(0);
     await new Promise((r) => setTimeout(r, STDERR_DRAIN_MS + 200));
@@ -243,5 +264,26 @@ describe.skipIf(process.platform === "win32")("ChildHandle", { timeout: 15_000 }
     await handle.kill(300);
 
     expect(processExists(handle.pid!)).toBe(false);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("ChildHandle for a command that can't start", () => {
+  it("sends no signal when killed before Node reports the failed start, which would reach its whole process group", { timeout: 30_000 }, async () => {
+    const entry = await bundleForSubprocess("test/_helpers/subprocess/failed-spawn-kill.ts", "failed-spawn-kill");
+    const probe = spawn(process.execPath, [entry], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    probe.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+
+    const [code, signal] = (await once(probe, "exit")) as [number | null, NodeJS.Signals | null];
+
+    expect({ code, signal, stdout }).toEqual({ code: 0, signal: null, stdout: "survived\n" });
+  });
+
+  it("refuses to spawn with a value Node rejects, naming only the error code", () => {
+    const start = () =>
+      new ChildHandle({ command: process.execPath, args: [], env: { X: "secret-value\u0000" }, onMessage: () => {}, onClose: () => {}, onError: () => {}, onStderr: () => {} });
+
+    expect(start).toThrow(`spawn failed for ${process.execPath}: ERR_INVALID_ARG_VALUE`);
+    expect(start).not.toThrow(/secret-value/);
   });
 });

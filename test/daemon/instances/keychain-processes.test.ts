@@ -67,7 +67,7 @@ describe("credentials read by the detached daemon", { timeout: 90_000 }, () => {
     return bridge;
   }
 
-  async function daemonStatus(): Promise<{ httpUpstreams?: Array<{ server: string; state: string }> }> {
+  async function daemonStatus(): Promise<{ upstreams?: Array<{ server: string; state: string }> }> {
     const { stdout } = await run(process.execPath, [cliScript, "daemon", "status"], { env: env() });
     return JSON.parse(stdout);
   }
@@ -79,7 +79,7 @@ describe("credentials read by the detached daemon", { timeout: 90_000 }, () => {
 
     expect(result).toMatchObject({ content: [{ type: "text", text: "called echo {}" }] });
     expect(server.authorizations()).toContain("Bearer from-the-store");
-    expect(await daemonStatus()).toMatchObject({ httpUpstreams: [{ server: "svc", state: "connected" }] });
+    expect(await daemonStatus()).toMatchObject({ upstreams: [{ server: "svc", state: "connected" }] });
   });
 
   it("refreshes the tokens of an upstream with _bridge.auth with the client secret the CLI stored, read through the keychain in the daemon process", async () => {
@@ -97,7 +97,7 @@ describe("credentials read by the detached daemon", { timeout: 90_000 }, () => {
 
       expect(await bridge.client.callTool(viaRunTool("svc__echo"))).toMatchObject({ content: [{ type: "text", text: "called echo {}" }] });
       expect(authorizing.tokenRequestLog()).toEqual([{ grantType: "refresh_token", clientId: "client-1", clientSecret: "secret-from-the-store", refreshToken: "rt-0" }]);
-      expect(await daemonStatus()).toMatchObject({ httpUpstreams: [{ server: "svc", state: "connected" }] });
+      expect(await daemonStatus()).toMatchObject({ upstreams: [{ server: "svc", state: "connected" }] });
       expect(authorizing.count("tools/list")).toBe(1);
     } finally {
       await authorizing.close();
@@ -111,7 +111,7 @@ describe("credentials read by the detached daemon", { timeout: 90_000 }, () => {
 
     const other = await connect(configPath, { ...env(), MCP_BRIDGE_MASTER_KEY: randomBytes(32).toString("hex") });
 
-    const states = async () => (await daemonStatus()).httpUpstreams?.map((row) => row.state).sort();
+    const states = async () => (await daemonStatus()).upstreams?.map((row) => row.state).sort();
     await until(async () => JSON.stringify(await states()) === JSON.stringify(["connected", "disconnected"]), 20_000);
     await until(() => other.stderr().includes("[upstream:svc] failed to connect"), 10_000);
     expect(new Set(server.authorizations().filter((value) => value !== undefined))).toEqual(new Set(["Bearer from-the-store"]));

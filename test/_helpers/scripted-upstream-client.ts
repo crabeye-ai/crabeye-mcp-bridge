@@ -1,4 +1,7 @@
 import type { CallToolResult, Tool } from "@modelcontextprotocol/client";
+import type { ChildRestartReason, ChildStopReason, RunningProcess } from "../../src/daemon/instances/child-transport.js";
+import type { StdioPoolClient } from "../../src/daemon/instances/stdio-connection.js";
+import type { UpstreamPoolOptions } from "../../src/daemon/instances/upstream-pool.js";
 import type {
   ConnectionStatus,
   StatusChangeCallback,
@@ -98,6 +101,36 @@ export class ScriptedUpstreamClient implements UpstreamClient {
     this._tools.add(callback);
     return () => this._tools.delete(callback);
   }
+}
+
+/** A STDIO server's client whose state a test drives by hand, with a running child. */
+export class ScriptedStdioClient extends ScriptedUpstreamClient implements StdioPoolClient {
+  readonly stops: ChildStopReason[] = [];
+  readonly restarts: ChildRestartReason[] = [];
+  child: RunningProcess | undefined = { pid: 4242, startedAt: 1, exitStatus: null, lastSignalSent: null, stderrTail: () => [], send: () => {}, kill: async () => {} };
+
+  protocolEra(): "legacy" {
+    return "legacy";
+  }
+
+  async restart(reason: ChildRestartReason): Promise<void> {
+    this.restarts.push(reason);
+  }
+
+  async stop(reason: ChildStopReason): Promise<void> {
+    this.stops.push(reason);
+    await this.close();
+  }
+}
+
+/** STDIO pool options with child pings off, nothing recorded and no grace, unless overridden. */
+export function stdioPoolOptions(overrides: Partial<UpstreamPoolOptions["stdio"]> = {}): UpstreamPoolOptions["stdio"] {
+  return {
+    graceMs: 0,
+    childPing: { intervalMs: 0, timeoutMs: 1_000, maxConsecutiveFailures: 3 },
+    recorder: { register: async () => {}, unregister: async () => {} },
+    ...overrides,
+  };
 }
 
 export function tool(name: string): Tool {

@@ -42,42 +42,24 @@ describe("UpstreamManager with a daemon instance", () => {
     expect(registry.listRegisteredTools().map((t) => t.tool.name).sort()).toEqual(["oauth__oauth_tool", "plain__plain_tool"]);
   });
 
-  it("reports the missing link as a connect failure instead of connecting in-process", async () => {
-    manager = new UpstreamManager({ config: config({ plain: PLAIN }), toolRegistry: new ToolRegistry() });
-
-    const result = await manager.connectAll();
-
-    expect(result.failed).toEqual([{ name: "plain", error: "no daemon instance link to connect this upstream through" }]);
-    expect(manager.getClient("plain")).toBeUndefined();
-  });
-
-  it("leaves health checks of HTTP and SSE upstreams to the daemon", async () => {
-    vi.useFakeTimers();
-    const ping = vi.spyOn(InstanceUpstreamClient.prototype, "ping");
-    manager = new UpstreamManager({ config: config({ plain: PLAIN }, { healthCheckInterval: 1 }), toolRegistry: new ToolRegistry(), instanceLink: fakeLink() });
-    await manager.connectAll();
-    manager.startHealthChecks();
-
-    await vi.advanceTimersByTimeAsync(3_000);
-
-    expect(ping).not.toHaveBeenCalled();
-  });
-
-  it("connects a server again through the link when a reload changes its _bridge.auth", async () => {
+  it("keeps a server's stand-in when a reload changes how it connects, leaving the change to the manager", async () => {
     const link = fakeLink();
     const before = config({ svc: { ...PLAIN, _bridge: { auth: { type: "oauth2", scopes: ["read"] } } } });
-    const after = config({ svc: { ...PLAIN, _bridge: { auth: { type: "oauth2", scopes: ["write"] } } } });
-    manager = new UpstreamManager({ config: before, toolRegistry: new ToolRegistry(), instanceLink: link });
+    const after = config({ svc: { ...PLAIN, _bridge: { auth: { type: "oauth2", scopes: ["write"] }, category: "tracker" } } });
+    const registry = new ToolRegistry();
+    manager = new UpstreamManager({ config: before, toolRegistry: registry, instanceLink: link });
     await manager.connectAll();
     const first = manager.getClient("svc");
+    const clientsChanged = vi.fn();
+    manager.onClientsChanged(clientsChanged);
 
     await manager.applyConfigDiff(diffConfigs(before, after), after);
 
-    const second = manager.getClient("svc");
-    expect(second).toBeInstanceOf(InstanceUpstreamClient);
-    expect(second).not.toBe(first);
-    expect(second!.status).toBe("connected");
+    expect(manager.getClient("svc")).toBe(first);
+    expect(first!.status).toBe("connected");
     expect(link.viewsOf("svc")).toHaveLength(1);
+    expect(registry.getCategoryForSource("svc")).toBe("tracker");
+    expect(clientsChanged).not.toHaveBeenCalled();
   });
 
   it("closes the link with the upstreams", async () => {

@@ -256,7 +256,7 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
       const successor = daemonPidsRunning(cliScript).find((pid) => pid !== firstDaemon);
       return successor !== undefined && childCommands(successor).some((cmd) => cmd.includes(stub));
     };
-    const respawnLogged = () => /\[daemon-stdio:alpha\] force_respawn .*sessionsReopened=1/.test(stderr);
+    const respawnLogged = () => /\[daemon\] force_respawn .*reason=socket_close/.test(stderr);
     await waitUntil(() => servedByNewDaemon() && respawnLogged(), 20_000);
 
     expect(respawnLogged()).toBe(true);

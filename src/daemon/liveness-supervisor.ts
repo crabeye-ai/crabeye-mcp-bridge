@@ -39,7 +39,7 @@ export interface DaemonLivenessSupervisorOpts {
   pidPath: string;
   /** Bound on lock-wait during a two-bridge race. */
   respawnLockWaitMs: number;
-  /** Inbound notification handler (passes RPC + SESSION_EVICTED frames through to the transport). */
+  /** Inbound notification handler (passes the daemon's notifications on to the link). */
   onNotification?: (notif: DaemonNotification) => void;
   /** Test seam: disable the force-respawn flow so we can unit-test detection alone. */
   _disableForceRespawnForTest?: boolean;

@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import type { HttpServerConfig } from "../../config/schema.js";
+import type { HttpServerConfig, StdioServerConfig } from "../../config/schema.js";
 import { MASTER_KEY_ENV } from "../../credentials/keychain.js";
+import { hasCredentialTemplates } from "../../credentials/resolve-templates.js";
 import { clientSecretEnvName } from "../../oauth/client-secret.js";
-import { canonicalize } from "../../upstream/upstream-hash.js";
+import { canonicalize, upstreamHash, type UpstreamReconnectInputs } from "../../upstream/upstream-hash.js";
 import { credentialEnv, networkSettings, type NetworkSettings } from "../instance-env.js";
 import type { InstanceSource } from "../protocol.js";
 
@@ -32,7 +33,7 @@ export function httpUpstreamIdentity(name: string, config: HttpServerConfig, env
   const clientSecretEnv = secretName !== undefined && env[secretName] !== undefined ? { [secretName]: env[secretName] } : {};
   const key = digest({
     name,
-    transport: config.type === "sse" ? "sse" : "streamable-http",
+    transport: httpUpstreamType(config),
     url: config.url,
     headers: config.headers ?? {},
     auth: config._bridge?.auth ?? null,
@@ -41,6 +42,24 @@ export function httpUpstreamIdentity(name: string, config: HttpServerConfig, env
     network,
   });
   return { key, network, env: clientSecretEnv };
+}
+
+/**
+ * STDIO servers with the same key share one child across the daemon, whatever
+ * their names. `env` is compared as configured, with the master key when it
+ * reads stored credentials: within one daemon, the same templates and master
+ * key resolve to the same values.
+ */
+export function stdioUpstreamKey(config: StdioServerConfig, reconnect: UpstreamReconnectInputs, env: Record<string, string>): string {
+  const serverEnv = config.env ?? {};
+  const hash = upstreamHash({ command: config.command, args: config.args ?? [], env: serverEnv, cwd: config.cwd ?? "", reconnect });
+  if (!hasCredentialTemplates(serverEnv)) return hash;
+  return digest({ hash, masterKey: env[MASTER_KEY_ENV] ?? null });
+}
+
+/** How an HTTP upstream is connected: the configured type, with its aliases for Streamable HTTP folded together. */
+export function httpUpstreamType(config: HttpServerConfig): "sse" | "streamable-http" {
+  return config.type === "sse" ? "sse" : "streamable-http";
 }
 
 function digest(value: unknown): string {

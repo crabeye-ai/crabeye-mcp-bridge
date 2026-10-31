@@ -206,22 +206,21 @@ export const ServerConfigSchema = z.union([
 export const DaemonConfigSchema = z
   .object({
     idleMs: z.number().int().positive().default(60_000),
-    /** Idle-child grace before SIGTERM. Starts when a child's refcount drops to 0. Cancelled on new attach. */
+    /** How long a STDIO server outlives its last instance before SIGTERM. Cancelled when an instance uses it again. */
     graceMs: z.number().int().nonnegative().default(60_000),
     /** SIGTERM→SIGKILL window once kill is dispatched. */
     killGraceMs: z.number().int().nonnegative().default(DEFAULT_KILL_GRACE_MS),
     autoForkDrainTimeoutMs: z.unknown().optional(),
     autoForkInitializeTimeoutMs: z.unknown().optional(),
-    /** Per-RPC timeout the bridge applies to outbound daemon calls. Was hardcoded 10000 in DaemonStdioTransport. */
+    /** Per-RPC timeout the bridge applies to its calls to the daemon, other than tool calls. */
     rpcTimeoutMs: z.number().int().positive().default(30_000),
     /** Bridge sends `PING` on this cadence. Missed `PONG` for `heartbeatMs * 3` triggers a liveness failure. */
     heartbeatMs: z.number().int().positive().default(5_000),
-    /** How long a losing bridge waits on `manager.lock` after detecting a dead daemon before surfacing `ERR_UPSTREAM_RESTARTED`. */
+    /** How long a bridge waits on `manager.lock` to start a new daemon after its daemon stopped answering. */
     respawnLockWaitMs: z.number().int().positive().default(60_000),
     /**
      * Cadence for the daemon-side MCP `ping` against each spawned stdio child.
-     * `0` disables the supervisor (bridge end-to-end ping then becomes the
-     * only liveness signal for the upstream).
+     * `0` disables these pings (`healthCheckInterval` pings still run).
      */
     childPingMs: z.number().int().nonnegative().default(15_000),
     /** Per-ping deadline for the daemon-side child ping. */

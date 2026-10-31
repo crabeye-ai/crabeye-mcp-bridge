@@ -3,6 +3,7 @@ import type {
   Transport,
   Tool,
   CallToolResult,
+  ConnectOptions,
   Implementation,
   ProtocolEra,
 } from "@modelcontextprotocol/client";
@@ -30,7 +31,7 @@ const CLIENT_INPUT_CAPABILITIES = new Set(CLIENT_INPUT_CAPABILITY_BY_METHOD.valu
 export const DEFAULT_RECONNECT_BASE_DELAY_MS = 1000;
 export const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 
-export function upstreamClientInfo(serverName: string): Implementation {
+function upstreamClientInfo(serverName: string): Implementation {
   return { name: `${APP_NAME}/${serverName}`, version: APP_VERSION };
 }
 
@@ -158,7 +159,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       );
 
       transport.onclose = () => {
-        if (this._isSuperseded(myEpoch)) return;
+        if (this._isSuperseded(myEpoch) || this._client !== client) return;
         this._endConnection();
         this._client = undefined;
         this._currentTransport = undefined;
@@ -167,13 +168,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         this._scheduleReconnect();
       };
 
-      await client.connect(transport);
-
-      // Hook for subclasses to record per-connection state (e.g. spawned PID)
-      // _before_ we make any further calls that could fail and leak the
-      // subprocess. listTools() below can throw — if we record post-listTools
-      // we lose the pid and can't reap on retry.
-      await this._onTransportStarted(transport);
+      await client.connect(transport, this._connectOptions());
 
       const result = await client.listTools();
       if (this._isSuperseded(myEpoch)) {
@@ -204,13 +199,14 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         await failed.close().catch(() => {});
       }
       this._onTransportClosed();
-      if (!this._isSuperseded(myEpoch)) {
-        this._setStatus(
-          this._isAuthFailure(err) ? "auth_required" : "disconnected",
-          err instanceof Error ? err : undefined,
-        );
-      }
-      throw this._isSuperseded(myEpoch) ? this._supersededError() : err;
+      const retry = this._retryConnectAfter(err, failed);
+      if (this._isSuperseded(myEpoch)) throw this._supersededError();
+      if (retry) return this._doConnect();
+      this._setStatus(
+        this._isAuthFailure(err) ? "auth_required" : "disconnected",
+        err instanceof Error ? err : undefined,
+      );
+      throw err;
     }
   }
 
@@ -325,12 +321,19 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   protected async _prepareConnect(): Promise<void> {}
 
   /**
-   * Async hook called immediately after `transport.start()` succeeds, before
-   * the first request. Subclasses use this to record per-connection state
-   * (e.g. spawned PID) so that any subsequent failure can still be cleaned up.
+   * Told of every connect that failed, with its transport, already closed, if
+   * it got that far, even one superseded since; true tries again at once, without reporting
+   * the failure, unless superseded.
    */
-  protected async _onTransportStarted(transport: Transport): Promise<void> {
+  protected _retryConnectAfter(err: unknown, transport: Transport | undefined): boolean {
+    void err;
     void transport;
+    return false;
+  }
+
+  /** Options for the next connect, such as a protocol era already known. */
+  protected _connectOptions(): ConnectOptions | undefined {
+    return undefined;
   }
 
   /** Hook called after a successful connection. Override in subclasses for post-connect setup. */

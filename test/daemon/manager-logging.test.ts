@@ -1,35 +1,37 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { stat, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DaemonStoppedWhileStartingError, ManagerDaemon, type ManagerOptions } from "../../src/daemon/manager.js";
 import { isServing, netTransport } from "../../src/daemon/net-transport.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import type { ProcessTracker } from "../../src/daemon/process-tracker.js";
 import { deadPid } from "../_helpers/processes.js";
-import type { FrameChannel } from "../../src/daemon/transport.js";
-import { OpenSessionFixture, spawnTestManager, until, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
+import { AttachedBridge, fixtureSource, servingConfigs, spawnTestManager, until, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { STUB_STDIO_SERVER } from "../_helpers/stub-stdio-server.js";
 import { recordingLogger, type LoggedLine } from "../_helpers/spy-logger.js";
 
 const isWindows = process.platform === "win32";
 const SECRET = "marker-5f1c9e";
-const BRIDGE_PROTOCOL_VERSION = 2;
+const FAST_RECONNECT = { reconnect: { reconnectBaseDelay: 100, reconnectMaxDelay: 1000 } };
 const TAKEOVER = "took over from a previous daemon that is no longer running";
 
 describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
   let fx: DaemonFixture | undefined;
+  let stubDir: string | undefined;
   let stub: string;
   let entries: LoggedLine[];
-  const sessions: OpenSessionFixture[] = [];
-  let nextId = 1;
+  const bridges: AttachedBridge[] = [];
 
   const extraManagers: ManagerDaemon[] = [];
 
   afterEach(async () => {
-    for (const session of sessions.splice(0)) await session.close();
+    for (const bridge of bridges.splice(0)) bridge.close();
     for (const manager of extraManagers.splice(0)) await manager.stop(0, "test cleanup");
     await fx?.stop();
     fx = undefined;
+    if (stubDir !== undefined) await rm(stubDir, { recursive: true, force: true });
+    stubDir = undefined;
     expect(JSON.stringify(entries ?? [])).not.toMatch(/[0-9a-f]{64}|"upstreamHash"|"groupId"/);
   });
 
@@ -48,183 +50,108 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     return manager;
   }
 
-  async function startManager(manager: Partial<ManagerOptions> = {}): Promise<DaemonFixture> {
+  async function startManager(manager: Partial<ManagerOptions> = {}, server: (stub: string) => Record<string, unknown> = stubServer): Promise<DaemonFixture> {
     entries = [];
-    fx = await spawnTestManager({ manager: { logger: recordingLogger(entries), ...manager } });
-    stub = join(fx.dir, "stub.cjs");
+    stubDir = await mkdtemp(join(tmpdir(), "cbe-log-stub-"));
+    stub = join(stubDir, "stub.cjs");
     await writeFile(stub, STUB_STDIO_SERVER);
+    fx = await spawnTestManager({ manager: { logger: recordingLogger(entries), ...servingConfigs({ [fixtureSource.path]: { stub: server(stub) } }), ...manager } });
     return fx;
   }
 
-  function stubSpec(opts: { serverName?: string; resolvedEnv?: Record<string, string>; args?: string[] } = {}) {
-    return {
-      command: process.execPath,
-      args: [stub, ...(opts.args ?? [])],
-      serverName: opts.serverName ?? "stub",
-      resolvedEnv: opts.resolvedEnv,
-      bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
-    };
+  function stubServer(path: string): Record<string, unknown> {
+    return { command: process.execPath, args: [path], _bridge: FAST_RECONNECT };
   }
 
-  async function openStub(opts: Parameters<typeof stubSpec>[0] = {}) {
-    const session = await OpenSessionFixture.open(fx!, stubSpec(opts));
-    sessions.push(session);
-    return session;
-  }
-
-  async function callTool(session: OpenSessionFixture, name: string, args: Record<string, unknown> = {}) {
-    const id = nextId++;
-    session.sendRpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
-    return session.waitForFrame((p) => (p as { id?: unknown }).id === id, 5_000);
+  async function attachStub(): Promise<AttachedBridge> {
+    const bridge = await AttachedBridge.attach(fx!);
+    bridges.push(bridge);
+    await bridge.connected("stub");
+    return bridge;
   }
 
   const find = (message: string, from: LoggedLine[] = entries) => from.filter((e) => e.message === message);
-  const indexOf = (message: string) => entries.findIndex((e) => e.message === message);
   const appears = (message: string) => until(() => find(message).length > 0);
-  const refusals = () => find("session refused").map((e) => [e.level, e.context.reason, e.context.server, e.context.errorCode]);
-  const closeReasons = () => find("session closed").map((e) => e.context.reason);
 
-  it("logs a session opening with the server, the bridge's protocol version and whether the child was reused", async () => {
+  it("logs each session a bridge from crabeye-mcp-bridge 1.3.0 or earlier asks for as refused, saying to restart the AI client", async () => {
     await startManager();
-    await openStub();
-    await openStub();
 
-    expect(find("session opened")).toEqual([
-      expect.objectContaining({ level: "info", context: expect.objectContaining({ server: "stub", bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION, reusedChild: false }) }),
-      expect.objectContaining({ level: "info", context: expect.objectContaining({ server: "stub", bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION, reusedChild: true }) }),
+    await expect(fx!.client.call("OPEN", { sessionId: "old", spec: {} })).rejects.toThrow("restart the AI client");
+
+    expect(find("session refused")).toEqual([
+      expect.objectContaining({ level: "warn", context: expect.objectContaining({ errorCode: "bridge_unsupported", reason: expect.stringContaining("restart the AI client") }) }),
     ]);
   });
 
-  it("logs each refused session with its reason and error code", async () => {
-    await startManager({ maxSessionsTotal: 1 });
-    const first = await openStub();
-
-    await expect(fx!.client.call("OPEN", {})).rejects.toThrow();
-    await expect(
-      fx!.client.call("OPEN", { sessionId: first.sessionId, bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION, spec: first.spec }),
-    ).rejects.toThrow();
-    await expect(openStub({ serverName: "second" })).rejects.toThrow();
-
-    expect(refusals()).toEqual([
-      ["warn", "OPEN params malformed", undefined, "invalid_params"],
-      ["warn", "sessionId already in use", "stub", "session_in_use"],
-      ["warn", "manager session cap reached (1)", "second", "too_many_sessions"],
-    ]);
-  });
-
-  it("logs a refusal when the child can't be spawned", async () => {
-    await startManager({
-      _spawnChild: () => {
-        throw new Error("spawn failed for stub: nope");
-      },
-    });
-
-    await expect(openStub()).rejects.toThrow();
-
-    expect(refusals()).toEqual([["warn", "spawn failed for stub: nope", "stub", "spawn_failed"]]);
-  });
-
-  it("logs a refusal once the daemon is stopping", async () => {
+  it("logs a child starting with its pid, and exiting on its own with its exit code", async () => {
     await startManager();
-    const stopping = fx!.manager.stop(0, "test");
-
-    await fx!.manager.handleRequest({ id: "r1", method: "OPEN", params: {} }, {} as FrameChannel);
-    await stopping;
-
-    expect(refusals()).toEqual([["warn", "manager is shutting down", undefined, "daemon_stopping"]]);
-  });
-
-  it("refuses a session whose environment holds a NUL byte without logging the value", async () => {
-    await startManager();
-
-    await expect(openStub({ resolvedEnv: { API_TOKEN: `${SECRET}\0x` } })).rejects.toThrow();
-
-    expect(refusals()).toEqual([["warn", "OPEN params malformed", undefined, "invalid_params"]]);
-    expect(JSON.stringify(entries)).not.toContain(SECRET);
-  });
-
-  it("logs why each session closed", async () => {
-    await startManager();
-    const closed = await openStub();
-    const dropped = await openStub();
-
-    await closed.call("CLOSE", { sessionId: closed.sessionId });
-    await dropped.close();
-    await until(() => find("session closed").length === 2);
-
-    expect(find("session closed").map((e) => [e.context.sessionId, e.context.reason, e.context.bridgeProtocolVersion])).toEqual([
-      [closed.sessionId, "closed by bridge", BRIDGE_PROTOCOL_VERSION],
-      [dropped.sessionId, "bridge disconnected", BRIDGE_PROTOCOL_VERSION],
-    ]);
-  });
-
-  it("logs a child starting with its pid, and exiting on its own with its exit code before its sessions close", async () => {
-    await startManager();
-    const session = await openStub();
-    await appears("child started");
+    const bridge = await attachStub();
     const pid = find("child started")[0].context.pid;
     expect(pid).toEqual(expect.any(Number));
 
-    session.sendRpc({ jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name: "crash", arguments: { lines: [], code: 3 } } });
-    await appears("session closed");
+    await bridge.callTool("stub", "crash", { lines: [], code: 3 }).catch(() => {});
+    await appears("child exited");
 
     expect(find("child exited")[0].context).toMatchObject({ server: "stub", pid, cause: "exited", code: 3, signal: null });
-    expect(indexOf("child exited")).toBeLessThan(indexOf("session closed"));
-    expect(closeReasons()).toEqual(["child exited"]);
-    expect(find("child stopping")).toEqual([]);
+    expect(find("child stopped")).toEqual([]);
   });
 
-  it("logs a child killed for failing its pings, with the reason and how it ended", async () => {
+  it("logs a command that can't be started, and why", async () => {
+    await startManager({}, () => ({ command: "/nonexistent/cbe-missing", _bridge: FAST_RECONNECT }));
+    bridges.push(await AttachedBridge.attach(fx!));
+
+    await appears("child exited");
+
+    expect(find("child exited")[0].context).toMatchObject({ server: "stub", cause: "failed_to_start" });
+    expect(entries.find((e) => e.message.startsWith("child error: "))?.message).toContain("ENOENT");
+  });
+
+  it("logs a child stopped for failing its pings, with the reason and how it ended", async () => {
     await startManager({ childPingMs: 50, childPingTimeoutMs: 50, childPingMaxConsecutiveFailures: 1 });
-    const session = await openStub();
-    await callTool(session, "ignore-pings");
+    const bridge = await attachStub();
+    await bridge.callTool("stub", "ignore-pings");
 
     await appears("child stopped");
 
-    expect(find("child stopping")[0].context).toMatchObject({ server: "stub", reason: "not answering pings" });
-    expect(find("child stopped")[0].context).toMatchObject({ server: "stub", signal: "SIGTERM" });
-    expect(closeReasons()).toEqual(["child not answering pings"]);
-    expect(indexOf("child stopping")).toBeLessThan(indexOf("session closed"));
+    expect(find("child stopped")[0].context).toMatchObject({ server: "stub", reason: "not answering pings", signal: "SIGTERM" });
   });
 
-  it("logs an idle child being stopped once its last session leaves", async () => {
-    await startManager({ graceMs: 0 });
-    const session = await openStub();
+  it("logs an idle child being stopped once its last instance closes", async () => {
+    await startManager({ graceMs: 0, idleMs: 50 });
+    const bridge = await attachStub();
 
-    await session.call("CLOSE", { sessionId: session.sessionId });
+    bridge.close();
     await appears("child stopped");
 
-    expect(find("child stopping")[0].context).toMatchObject({ server: "stub", reason: "idle" });
+    expect(find("child stopped")[0].context).toMatchObject({ server: "stub", reason: "idle" });
   });
 
-  it("logs a restart as the reason a child was stopped and its sessions closed", async () => {
+  it("logs a restart as the reason a child was stopped", async () => {
     await startManager();
-    await openStub();
+    await attachStub();
     const hash = ((await fx!.client.call("STATUS")) as { children: { upstreamHash: string }[] }).children[0].upstreamHash;
 
     await fx!.client.call("RESTART", { upstreamHash: hash });
     await appears("child stopped");
 
-    expect(find("child stopping")[0].context).toMatchObject({ server: "stub", reason: "restart" });
-    expect(closeReasons()).toEqual(["child restarted"]);
+    expect(find("child stopped")[0].context).toMatchObject({ server: "stub", reason: "restart" });
   });
 
-  it("logs the daemon shutting down as the reason its children stopped and its sessions closed", async () => {
+  it("logs the daemon shutting down as the reason its children stopped", async () => {
     await startManager();
-    await openStub();
+    await attachStub();
 
     await fx!.client.call("SHUTDOWN");
     await fx!.manager.waitForExit();
 
-    expect(find("child stopping")[0].context).toMatchObject({ server: "stub", reason: "shutdown" });
-    expect(closeReasons()).toEqual(["shutdown"]);
+    expect(find("child stopped")[0].context).toMatchObject({ server: "stub", reason: "shutdown" });
   });
 
   it("logs child stderr at debug level with the server name", async () => {
     await startManager();
-    const session = await openStub();
+    const bridge = await attachStub();
 
-    await callTool(session, "stderr", { text: "cache warmed" });
+    await bridge.callTool("stub", "stderr", { text: "cache warmed" });
     await appears("cache warmed");
 
     expect(find("cache warmed")[0]).toEqual({
@@ -426,21 +353,15 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
   });
 
   it("logs output that isn't JSON by its size, never its content", async () => {
-    await startManager();
-    const session = await OpenSessionFixture.open(fx!, {
-      command: process.execPath,
-      args: ["-e", `process.stdout.write("ghp_${SECRET}\\n"); setInterval(() => {}, 1e6)`],
-      serverName: "chatty",
-      bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
-    });
-    sessions.push(session);
+    await startManager({}, () => ({ command: process.execPath, args: ["-e", `process.stdout.write("ghp_${SECRET}\\n"); setInterval(() => {}, 1e6)`] }));
+    bridges.push(await AttachedBridge.attach(fx!));
 
-    await until(() => entries.some((e) => e.message.startsWith("child error: ")));
+    await until(() => entries.some((e) => e.message.startsWith("child error: ") && e.message.includes("isn't JSON")));
 
-    expect(entries.find((e) => e.message.startsWith("child error: "))).toMatchObject({
+    expect(entries.find((e) => e.message.startsWith("child error: ") && e.message.includes("isn't JSON"))).toMatchObject({
       level: "warn",
       message: `child error: child stdout produced a line that isn't JSON (${4 + SECRET.length} bytes)`,
-      context: expect.objectContaining({ server: "chatty" }),
+      context: expect.objectContaining({ server: "stub" }),
     });
     expect(JSON.stringify(entries)).not.toContain(SECRET);
   });
@@ -466,11 +387,12 @@ describe.skipIf(isWindows)("what the daemon logs", { timeout: 20_000 }, () => {
     await expect(stat(fx!.pidPath)).resolves.toBeDefined();
   });
 
-  it("never logs a child's resolved environment or its arguments", async () => {
-    await startManager({ graceMs: 0 });
-    const session = await openStub({ resolvedEnv: { API_TOKEN: SECRET }, args: [`--token=${SECRET}`] });
-    await callTool(session, "plain");
-    await session.call("CLOSE", { sessionId: session.sessionId });
+  it("never logs a child's environment or its arguments", async () => {
+    await startManager({ graceMs: 0, idleMs: 50 }, (path) => ({ command: process.execPath, args: [path, `--token=${SECRET}`], env: { API_TOKEN: SECRET } }));
+    const bridge = await AttachedBridge.attach(fx!, { childEnv: { ...(process.env as Record<string, string>), OTHER_TOKEN: SECRET } });
+    await bridge.connected("stub");
+    await bridge.callTool("stub", "plain");
+    bridge.close();
     await appears("child stopped");
 
     expect(entries.length).toBeGreaterThan(0);

@@ -9,7 +9,6 @@
 export type KilledReason = "grace" | "restart" | "crash" | "wedged";
 
 const RPC_ERROR_CODE_CAP = 64;
-const REFUSED_METHOD_CAP = 64;
 
 export interface TelemetrySnapshot {
   children: {
@@ -17,17 +16,9 @@ export interface TelemetrySnapshot {
     spawnedTotal: number;
     killedTotal: Record<KilledReason, number>;
   };
-  sessions: {
-    total: number;
-    openedTotal: number;
-    closedTotal: number;
-  };
   rpc: {
     inFlight: number;
     errorsTotal: Record<string, number>;
-  };
-  upstreamRequests: {
-    refusedTotal: Record<string, number>;
   };
 }
 
@@ -41,32 +32,18 @@ export class Telemetry {
     wedged: 0,
   };
 
-  private sessionsTotal = 0;
-  private sessionsOpenedTotal = 0;
-  private sessionsClosedTotal = 0;
-
   private rpcInFlight = 0;
   private rpcErrorsTotal = new Map<string, number>();
-  private refusedUpstreamRequests = new Map<string, number>();
 
   recordSpawn(): void {
     this.childrenTotal += 1;
     this.childrenSpawnedTotal += 1;
   }
 
-  recordKill(reason: KilledReason): void {
+  /** A child is gone; `reason` is why the daemon stopped it, or null when it doesn't count as a kill. */
+  recordStop(reason: KilledReason | null): void {
     if (this.childrenTotal > 0) this.childrenTotal -= 1;
-    this.childrenKilledTotal[reason] += 1;
-  }
-
-  recordSessionOpen(): void {
-    this.sessionsTotal += 1;
-    this.sessionsOpenedTotal += 1;
-  }
-
-  recordSessionClose(): void {
-    if (this.sessionsTotal > 0) this.sessionsTotal -= 1;
-    this.sessionsClosedTotal += 1;
+    if (reason !== null) this.childrenKilledTotal[reason] += 1;
   }
 
   rpcInFlightInc(): void {
@@ -88,11 +65,6 @@ export class Telemetry {
     this.rpcErrorsTotal.set(code, (this.rpcErrorsTotal.get(code) ?? 0) + 1);
   }
 
-  recordRefusedUpstreamRequest(methodLabel: string): void {
-    if (!this.refusedUpstreamRequests.has(methodLabel) && this.refusedUpstreamRequests.size >= REFUSED_METHOD_CAP) return;
-    this.refusedUpstreamRequests.set(methodLabel, (this.refusedUpstreamRequests.get(methodLabel) ?? 0) + 1);
-  }
-
   snapshot(): TelemetrySnapshot {
     const errorsTotal: Record<string, number> = {};
     for (const [code, count] of this.rpcErrorsTotal) errorsTotal[code] = count;
@@ -102,13 +74,7 @@ export class Telemetry {
         spawnedTotal: this.childrenSpawnedTotal,
         killedTotal: { ...this.childrenKilledTotal },
       },
-      sessions: {
-        total: this.sessionsTotal,
-        openedTotal: this.sessionsOpenedTotal,
-        closedTotal: this.sessionsClosedTotal,
-      },
       rpc: { inFlight: this.rpcInFlight, errorsTotal },
-      upstreamRequests: { refusedTotal: Object.fromEntries(this.refusedUpstreamRequests) },
     };
   }
 }

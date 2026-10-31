@@ -8,12 +8,12 @@ import { BridgeConfigSchema } from "../../../src/config/schema.js";
 import { ConfigError } from "../../../src/config/loader.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
 import type { Logger } from "../../../src/logging/index.js";
-import { HttpUpstreamPool } from "../../../src/daemon/instances/http-upstream-pool.js";
+import { UpstreamPool } from "../../../src/daemon/instances/upstream-pool.js";
 import { InstanceHost } from "../../../src/daemon/instances/instance-host.js";
 import type { DaemonResponse, InstanceSource } from "../../../src/daemon/protocol.js";
 import type { FrameChannel } from "../../../src/daemon/transport.js";
-import { MAX_INFLIGHT_PER_SESSION } from "../../../src/daemon/protocol.js";
-import { ScriptedUpstreamClient, tool } from "../../_helpers/scripted-upstream-client.js";
+import { MIN_BRIDGE_PROTOCOL_VERSION, MAX_CALLS_PER_BRIDGE } from "../../../src/daemon/protocol.js";
+import { ScriptedUpstreamClient, stdioPoolOptions, tool } from "../../_helpers/scripted-upstream-client.js";
 import { spyLogger } from "../../_helpers/spy-logger.js";
 
 interface FakeChannel extends FrameChannel {
@@ -21,19 +21,16 @@ interface FakeChannel extends FrameChannel {
 }
 
 function fakeChannel(): FakeChannel {
-  const channel = new EventEmitter() as FakeChannel;
-  channel.sent = [];
+  const channel = Object.assign(new EventEmitter(), { sent: [] as unknown[], remote: "test", close: () => {} }) as unknown as FakeChannel;
   channel.send = (payload) => {
     channel.sent.push(payload);
     return true;
   };
-  channel.close = () => {};
-  Object.defineProperty(channel, "remote", { value: "test" });
   return channel;
 }
 
 const fileSource: InstanceSource = { kind: "file", path: "/home/u/bridge.json" };
-const attachParams = (overrides: Record<string, unknown> = {}) => ({ bridgeProtocolVersion: 3, source: fileSource, env: {}, ...overrides });
+const attachParams = (overrides: Record<string, unknown> = {}) => ({ bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION, source: fileSource, env: {}, childEnv: {}, ...overrides });
 
 describe("InstanceHost", () => {
   let configs: Map<string, unknown>;
@@ -48,6 +45,7 @@ describe("InstanceHost", () => {
       idleMs,
       logger,
       onIdle,
+      stdio: stdioPoolOptions(),
       loadConfig: async (source) => {
         loads++;
         await loadGate;
@@ -57,7 +55,7 @@ describe("InstanceHost", () => {
         return { config: BridgeConfigSchema.parse(config), watchPaths: [] };
       },
       createCredentialStore: () => ({}) as CredentialStore,
-      createClient: (name) => {
+      createHttpClient: (name) => {
         const client = new ScriptedUpstreamClient(name);
         client.tools = [tool(`${name}_tool`)];
         clients.push(client);
@@ -78,7 +76,7 @@ describe("InstanceHost", () => {
   }
 
   beforeEach(() => {
-    configs = new Map([[fileSource.path, { mcpServers: { svc: { url: "https://svc.example.com/mcp" }, local: { command: "node" } } }]]);
+    configs = new Map([[fileSource.path, { mcpServers: { svc: { url: "https://svc.example.com/mcp" } } }]]);
     loads = 0;
     loadGate = Promise.resolve();
     clients = [];
@@ -93,7 +91,7 @@ describe("InstanceHost", () => {
   });
 
   it("gives connections no longer than it was given to save their refreshes' tokens when it closes", async () => {
-    const closing = vi.spyOn(HttpUpstreamPool.prototype, "close");
+    const closing = vi.spyOn(UpstreamPool.prototype, "close");
 
     await host.close(300);
 
@@ -101,7 +99,7 @@ describe("InstanceHost", () => {
   });
 
   describe("ATTACH", () => {
-    it("sends a snapshot of each HTTP and SSE server, then answers with their names", async () => {
+    it("sends a snapshot of each server, then answers with their names", async () => {
       const channel = fakeChannel();
 
       expect(await attach(channel)).toEqual({ id: "a1", result: { upstreams: ["svc"] } });
@@ -109,7 +107,7 @@ describe("InstanceHost", () => {
         { method: "UPSTREAM", params: { name: "svc", status: "connected", tools: [tool("svc_tool")] } },
       ]);
       expect(host.statusInstances()).toEqual([{ source: fileSource, bridges: 1, upstreams: ["svc"] }]);
-      expect(host.statusHttpUpstreams()).toEqual([{ serverName: "svc", status: "connected", instances: 1 }]);
+      expect(host.statusUpstreams()).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 1 }]);
     });
 
     it("creates one instance for two bridges attaching at once", async () => {
@@ -140,12 +138,13 @@ describe("InstanceHost", () => {
 
       expect(host.statusInstances()).toHaveLength(2);
       expect(clients).toHaveLength(1);
-      expect(host.statusHttpUpstreams()).toEqual([{ serverName: "svc", status: "connected", instances: 2 }]);
+      expect(host.statusUpstreams()).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 2 }]);
     });
 
     it.each([
       ["malformed params", { source: fileSource }, "invalid_params"],
-      ["a bridge protocol older than instances", attachParams({ bridgeProtocolVersion: 2 }), "bridge_unsupported"],
+      ["a bridge protocol older than this manager's", { bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION - 1, source: fileSource, env: {} }, "bridge_unsupported"],
+      ["a missing childEnv", { bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION, source: fileSource, env: {} }, "invalid_params"],
     ])("refuses %s", async (_label, params, code) => {
       expect((await attach(fakeChannel(), params)).error?.code).toBe(code);
     });
@@ -375,10 +374,10 @@ describe("InstanceHost", () => {
 
     it("refuses a callId already in flight, and more calls than the in-flight cap", async () => {
       clients[0]!.answer = () => new Promise(() => {});
-      for (let i = 0; i < MAX_INFLIGHT_PER_SESSION; i++) {
+      for (let i = 0; i < MAX_CALLS_PER_BRIDGE; i++) {
         void host.handleCallTool(`c${i}`, { callId: String(i), upstream: "svc", name: "slow" }, channel);
       }
-      await vi.waitFor(() => expect(clients[0]!.calls).toHaveLength(MAX_INFLIGHT_PER_SESSION));
+      await vi.waitFor(() => expect(clients[0]!.calls).toHaveLength(MAX_CALLS_PER_BRIDGE));
 
       expect((await host.handleCallTool("d", { callId: "0", upstream: "svc", name: "slow" }, channel)).error?.code).toBe("invalid_params");
       expect((await host.handleCallTool("e", { callId: "new", upstream: "svc", name: "slow" }, channel)).error?.code).toBe("too_many_calls");
@@ -481,7 +480,7 @@ describe.skipIf(process.platform === "win32")("InstanceHost loading a config its
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "cbe-host-"));
-    host = new InstanceHost({ idleMs: 60_000, logger: spyLogger(), onIdle: () => {} });
+    host = new InstanceHost({ idleMs: 60_000, logger: spyLogger(), onIdle: () => {}, stdio: stdioPoolOptions() });
   });
 
   afterEach(async () => {
@@ -493,7 +492,7 @@ describe.skipIf(process.platform === "win32")("InstanceHost loading a config its
     const fifo = join(dir, "bridge.json");
     execFileSync("mkfifo", [fifo]);
 
-    const response = await host.handleAttach("a1", { bridgeProtocolVersion: 3, source: { kind: "file", path: fifo }, env: {} }, fakeChannel());
+    const response = await host.handleAttach("a1", attachParams({ source: { kind: "file", path: fifo } }), fakeChannel());
 
     expect(response).toEqual({ id: "a1", error: { code: "instance_load_failed", message: `Config file is not a regular file: ${fifo}` } });
   });

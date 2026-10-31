@@ -155,7 +155,7 @@ describe("Config hot-reload integration", () => {
     expect(upstreamManager.getClient("beta")).toBeUndefined();
   });
 
-  it("modify server connection fields — reconnect (old closed, new connected)", async () => {
+  it("modify server connection fields — same client kept with its tools", async () => {
     const config1 = makeConfig({
       alpha: { type: "streamable-http", url: "http://localhost:1000" },
     });
@@ -172,27 +172,20 @@ describe("Config hot-reload integration", () => {
     expect(toolRegistry.getTool("alpha__v1-tool")).toBeDefined();
     const oldClient = upstreamManager.getClient("alpha");
 
-    // Change URL — triggers reconnect
     const config2 = makeConfig({
       alpha: { type: "streamable-http", url: "http://localhost:2000" },
     });
-    // Update mock server with new tools for the reconnected client
-    mockServers.set("alpha", createMockServer([makeTool("v2-tool")]));
-
     const diff = diffConfigs(config1, config2);
-    expect(diff.servers.reconnect).toHaveLength(1);
+    expect(diff.servers.changed).toHaveLength(1);
 
     await upstreamManager.applyConfigDiff(diff, config2);
 
-    const newClient = upstreamManager.getClient("alpha");
-    expect(newClient).toBeDefined();
-    expect(newClient).not.toBe(oldClient);
-    expect(newClient!.status).toBe("connected");
-    expect(toolRegistry.getTool("alpha__v2-tool")).toBeDefined();
-    expect(toolRegistry.getTool("alpha__v1-tool")).toBeUndefined();
+    expect(upstreamManager.getClient("alpha")).toBe(oldClient);
+    expect(oldClient!.status).toBe("connected");
+    expect(toolRegistry.getTool("alpha__v1-tool")).toBeDefined();
   });
 
-  it("modify metadata-only — no reconnect, category updated", async () => {
+  it("a reload that changes a server's category updates it and keeps the client", async () => {
     const config1 = makeConfig({
       alpha: {
         type: "streamable-http",
@@ -213,7 +206,6 @@ describe("Config hot-reload integration", () => {
     const clientBefore = upstreamManager.getClient("alpha");
     expect(toolRegistry.getCategoryForSource("alpha")).toBe("old-category");
 
-    // Change only metadata
     const config2 = makeConfig({
       alpha: {
         type: "streamable-http",
@@ -223,18 +215,16 @@ describe("Config hot-reload integration", () => {
     });
 
     const diff = diffConfigs(config1, config2);
-    expect(diff.servers.updated).toHaveLength(1);
-    expect(diff.servers.reconnect).toHaveLength(0);
+    expect(diff.servers.changed).toHaveLength(1);
 
     await upstreamManager.applyConfigDiff(diff, config2);
 
-    // Same client, no reconnect
     const clientAfter = upstreamManager.getClient("alpha");
     expect(clientAfter).toBe(clientBefore);
     expect(toolRegistry.getCategoryForSource("alpha")).toBe("new-category");
   });
 
-  it("removing category via metadata update clears it from registry", async () => {
+  it("a reload that drops a server's category clears it", async () => {
     const config1 = makeConfig({
       alpha: {
         type: "streamable-http",
@@ -264,7 +254,7 @@ describe("Config hot-reload integration", () => {
     });
 
     const diff = diffConfigs(config1, config2);
-    expect(diff.servers.updated).toHaveLength(1);
+    expect(diff.servers.changed).toHaveLength(1);
 
     await upstreamManager.applyConfigDiff(diff, config2);
     expect(toolRegistry.getCategoryForSource("alpha")).toBeUndefined();
@@ -280,8 +270,7 @@ describe("Config hot-reload integration", () => {
 
     expect(diff.servers.added).toHaveLength(0);
     expect(diff.servers.removed).toHaveLength(0);
-    expect(diff.servers.reconnect).toHaveLength(0);
-    expect(diff.servers.updated).toHaveLength(0);
+    expect(diff.servers.changed).toHaveLength(0);
     expect(diff.bridge.requiresRestart).toHaveLength(0);
   });
 
@@ -299,27 +288,6 @@ describe("Config hot-reload integration", () => {
     expect(stderrSpy).toHaveBeenCalledTimes(1);
 
     stderrSpy.mockRestore();
-  });
-
-  it("bridge healthCheckInterval change restarts health checks", async () => {
-    const config1 = makeConfig({}, { healthCheckInterval: 30 });
-    mockServers.set("alpha", createMockServer([makeTool("tool")]));
-
-    upstreamManager = new UpstreamManager({
-      config: config1,
-      toolRegistry,
-      logger,
-      _clientFactory: clientFactory,
-    });
-
-    await upstreamManager.connectAll();
-    upstreamManager.startHealthChecks();
-
-    // Restart with new interval
-    upstreamManager.restartHealthChecks(60);
-
-    // Just verify it doesn't throw and we can stop cleanly
-    upstreamManager.stopHealthChecks();
   });
 
   it("bridge toolPolicy change updates PolicyEngine", () => {

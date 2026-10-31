@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { diffConfigs, diffServers } from "../src/config/config-diff.js";
+import { diffConfigs } from "../src/config/config-diff.js";
 import type { BridgeConfig } from "../src/config/schema.js";
 import { BridgeConfigSchema } from "../src/config/schema.js";
 
@@ -15,220 +15,40 @@ function makeConfig(
 
 describe("diffConfigs", () => {
   describe("server changes", () => {
-    it("detects added servers", () => {
-      const oldCfg = makeConfig({});
-      const newCfg = makeConfig({
-        linear: { type: "streamable-http", url: "http://localhost:3000" },
-      });
+    const http = (url: string, extra: Record<string, unknown> = {}) => ({ type: "streamable-http", url, ...extra });
 
-      const diff = diffConfigs(oldCfg, newCfg);
+    it("detects added and removed servers", () => {
+      const kept = http("http://localhost:3000");
+      const diff = diffConfigs(makeConfig({ kept, gone: http("http://localhost:1000") }), makeConfig({ kept, fresh: http("http://localhost:2000") }));
 
-      expect(diff.servers.added).toHaveLength(1);
-      expect(diff.servers.added[0].name).toBe("linear");
-      expect(diff.servers.removed).toHaveLength(0);
-      expect(diff.servers.reconnect).toHaveLength(0);
-      expect(diff.servers.updated).toHaveLength(0);
-    });
-
-    it("detects removed servers", () => {
-      const oldCfg = makeConfig({
-        linear: { type: "streamable-http", url: "http://localhost:3000" },
-      });
-      const newCfg = makeConfig({});
-
-      const diff = diffConfigs(oldCfg, newCfg);
-
-      expect(diff.servers.removed).toEqual(["linear"]);
-      expect(diff.servers.added).toHaveLength(0);
-    });
-
-    it("detects reconnect when HTTP url changes", () => {
-      const oldCfg = makeConfig({
-        linear: { type: "streamable-http", url: "http://localhost:3000" },
-      });
-      const newCfg = makeConfig({
-        linear: { type: "streamable-http", url: "http://localhost:4000" },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-
-      expect(diff.servers.reconnect).toHaveLength(1);
-      expect(diff.servers.reconnect[0].name).toBe("linear");
-    });
-
-    it("detects reconnect when HTTP headers change", () => {
-      const oldCfg = makeConfig({
-        svc: { type: "streamable-http", url: "http://localhost:3000" },
-      });
-      const newCfg = makeConfig({
-        svc: { type: "streamable-http", url: "http://localhost:3000", headers: { "Authorization": "Bearer abc" } },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-      expect(diff.servers.reconnect).toHaveLength(1);
+      expect(diff.servers.added.map((a) => a.name)).toEqual(["fresh"]);
+      expect(diff.servers.removed).toEqual(["gone"]);
+      expect(diff.servers.changed).toEqual([]);
     });
 
     it.each([
-      ["gains _bridge.auth", undefined, { type: "oauth2" }],
-      ["loses _bridge.auth", { type: "oauth2" }, undefined],
-      ["changes its scopes", { type: "oauth2" }, { type: "oauth2", scopes: ["read"] }],
-      ["changes its client id", { type: "oauth2", clientId: "a" }, { type: "oauth2", clientId: "b" }],
-      ["changes its client secret", { type: "oauth2", clientSecret: "${A_OAUTH}" }, { type: "oauth2", clientSecret: "${B_OAUTH}" }],
-    ])("reconnects an HTTP server that %s", (_label, before, after) => {
-      const server = (auth: unknown) => ({ url: "https://mcp.example.com/mcp", _bridge: { category: "docs", ...(auth !== undefined && { auth }) } });
-      const diff = diffConfigs(makeConfig({ svc: server(before) }), makeConfig({ svc: server(after) }));
+      ["its URL", http("http://localhost:3000"), http("http://localhost:4000")],
+      ["its headers", http("http://localhost:3000"), http("http://localhost:3000", { headers: { Authorization: "Bearer abc" } })],
+      ["its _bridge.auth", http("http://localhost:3000", { _bridge: { auth: { type: "oauth2" } } }), http("http://localhost:3000", { _bridge: { auth: { type: "oauth2", scopes: ["read"] } } })],
+      ["its category", http("http://localhost:3000", { _bridge: { category: "a" } }), http("http://localhost:3000", { _bridge: { category: "b" } })],
+      ["its toolPolicy", http("http://localhost:3000", { _bridge: { toolPolicy: "always" } }), http("http://localhost:3000", { _bridge: { toolPolicy: "prompt" } })],
+      ["a STDIO command", { command: "node", args: ["server.js"] }, { command: "bun", args: ["server.js"] }],
+      ["STDIO args", { command: "node", args: ["server.js"] }, { command: "node", args: ["server.js", "--verbose"] }],
+      ["STDIO env", { command: "node" }, { command: "node", env: { DEBUG: "1" } }],
+      ["STDIO cwd", { command: "node" }, { command: "node", cwd: "/srv" }],
+    ])("reports a server whose %s changed, with its new entry", (_label, before, after) => {
+      const diff = diffConfigs(makeConfig({ svc: before }), makeConfig({ svc: after }));
 
-      expect(diff.servers.reconnect.map((r) => r.name)).toEqual(["svc"]);
-      expect(diff.servers.updated).toEqual([]);
+      expect(diff.servers.changed).toEqual([{ name: "svc", config: makeConfig({ svc: after }).mcpServers.svc }]);
+      expect(diff.servers.added).toEqual([]);
+      expect(diff.servers.removed).toEqual([]);
     });
 
-    it("treats a category change of a server with _bridge.auth as metadata", () => {
-      const oldCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" }, category: "a" } } });
-      const newCfg = makeConfig({ svc: { url: "https://mcp.example.com/mcp", _bridge: { auth: { type: "oauth2" }, category: "b" } } });
+    it("reports no changes for configs that differ only in key order", () => {
+      const before = makeConfig({ linear: { type: "streamable-http", url: "http://localhost:3000", headers: { A: "1", B: "2" } } });
+      const after = makeConfig({ linear: { headers: { B: "2", A: "1" }, url: "http://localhost:3000", type: "streamable-http" } });
 
-      const diff = diffConfigs(oldCfg, newCfg);
-
-      expect(diff.servers.reconnect).toEqual([]);
-      expect(diff.servers.updated.map((u) => u.name)).toEqual(["svc"]);
-    });
-
-    it("diffs two sets of upstreams directly", () => {
-      const before = { kept: { url: "http://localhost:1/mcp" }, gone: { command: "node" } };
-      const after = { kept: { url: "http://localhost:2/mcp" }, fresh: { command: "node" } };
-
-      const diff = diffServers(
-        makeConfig(before).mcpServers,
-        makeConfig(after).mcpServers,
-      );
-
-      expect(diff.added.map((a) => a.name)).toEqual(["fresh"]);
-      expect(diff.removed).toEqual(["gone"]);
-      expect(diff.reconnect.map((r) => r.name)).toEqual(["kept"]);
-    });
-
-    it("detects reconnect when STDIO command changes", () => {
-      const oldCfg = makeConfig({
-        local: { command: "node", args: ["server.js"] },
-      });
-      const newCfg = makeConfig({
-        local: { command: "bun", args: ["server.js"] },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-
-      expect(diff.servers.reconnect).toHaveLength(1);
-      expect(diff.servers.reconnect[0].name).toBe("local");
-    });
-
-    it("detects reconnect when STDIO args change", () => {
-      const oldCfg = makeConfig({
-        local: { command: "node", args: ["server.js"] },
-      });
-      const newCfg = makeConfig({
-        local: { command: "node", args: ["server.js", "--verbose"] },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-      expect(diff.servers.reconnect).toHaveLength(1);
-    });
-
-    it("detects reconnect when STDIO env changes", () => {
-      const oldCfg = makeConfig({
-        local: { command: "node", args: ["server.js"] },
-      });
-      const newCfg = makeConfig({
-        local: { command: "node", args: ["server.js"], env: { DEBUG: "1" } },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-      expect(diff.servers.reconnect).toHaveLength(1);
-    });
-
-    it("detects metadata-only update when _bridge changes", () => {
-      const oldCfg = makeConfig({
-        linear: {
-          type: "streamable-http",
-          url: "http://localhost:3000",
-          _bridge: { category: "project-management" },
-        },
-      });
-      const newCfg = makeConfig({
-        linear: {
-          type: "streamable-http",
-          url: "http://localhost:3000",
-          _bridge: { category: "devtools" },
-        },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-
-      expect(diff.servers.updated).toHaveLength(1);
-      expect(diff.servers.updated[0].name).toBe("linear");
-      expect(diff.servers.reconnect).toHaveLength(0);
-    });
-
-    it("detects metadata-only update when toolPolicy changes", () => {
-      const oldCfg = makeConfig({
-        linear: {
-          type: "streamable-http",
-          url: "http://localhost:3000",
-          _bridge: { toolPolicy: "always" },
-        },
-      });
-      const newCfg = makeConfig({
-        linear: {
-          type: "streamable-http",
-          url: "http://localhost:3000",
-          _bridge: { toolPolicy: "prompt" },
-        },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-      expect(diff.servers.updated).toHaveLength(1);
-      expect(diff.servers.reconnect).toHaveLength(0);
-    });
-
-    it("reports no changes for identical configs", () => {
-      const cfg = makeConfig({
-        linear: { type: "streamable-http", url: "http://localhost:3000" },
-      });
-
-      const diff = diffConfigs(cfg, cfg);
-
-      expect(diff.servers.added).toHaveLength(0);
-      expect(diff.servers.removed).toHaveLength(0);
-      expect(diff.servers.reconnect).toHaveLength(0);
-      expect(diff.servers.updated).toHaveLength(0);
-    });
-
-    it("handles mixed add, remove, reconnect, update simultaneously", () => {
-      const oldCfg = makeConfig({
-        keep: { type: "streamable-http", url: "http://localhost:1000" },
-        remove: { command: "node", args: ["old.js"] },
-        reconnect: { type: "streamable-http", url: "http://localhost:2000" },
-        metaonly: {
-          type: "streamable-http",
-          url: "http://localhost:3000",
-          _bridge: { category: "old" },
-        },
-      });
-      const newCfg = makeConfig({
-        keep: { type: "streamable-http", url: "http://localhost:1000" },
-        add: { command: "node", args: ["new.js"] },
-        reconnect: { type: "streamable-http", url: "http://localhost:2001" },
-        metaonly: {
-          type: "streamable-http",
-          url: "http://localhost:3000",
-          _bridge: { category: "new" },
-        },
-      });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-
-      expect(diff.servers.added.map((s) => s.name)).toEqual(["add"]);
-      expect(diff.servers.removed).toEqual(["remove"]);
-      expect(diff.servers.reconnect.map((s) => s.name)).toEqual(["reconnect"]);
-      expect(diff.servers.updated.map((s) => s.name)).toEqual(["metaonly"]);
+      expect(diffConfigs(before, after).servers).toEqual({ added: [], removed: [], changed: [] });
     });
   });
 
@@ -247,14 +67,6 @@ describe("diffConfigs", () => {
 
       const diff = diffConfigs(oldCfg, newCfg);
       expect(diff.bridge.requiresRestart).toContain("logFormat");
-    });
-
-    it("detects healthCheckInterval change", () => {
-      const oldCfg = makeConfig({}, { healthCheckInterval: 30 });
-      const newCfg = makeConfig({}, { healthCheckInterval: 60 });
-
-      const diff = diffConfigs(oldCfg, newCfg);
-      expect(diff.bridge.healthCheckInterval).toBe(60);
     });
 
     it("detects toolPolicy change", () => {
@@ -302,7 +114,6 @@ describe("diffConfigs", () => {
       const diff = diffConfigs(cfg, cfg);
 
       expect(diff.bridge.logLevel).toBeUndefined();
-      expect(diff.bridge.healthCheckInterval).toBeUndefined();
       expect(diff.bridge.toolPolicy).toBeUndefined();
       expect(diff.bridge.requiresRestart).toHaveLength(0);
     });

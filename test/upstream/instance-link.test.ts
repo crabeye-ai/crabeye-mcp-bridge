@@ -51,7 +51,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
         return { config: BridgeConfigSchema.parse({ mcpServers: servers }), watchPaths: [] };
       },
       createCredentialStore: () => ({}) as CredentialStore,
-      createClient: (name, _config, { logger }) => {
+      createHttpClient: (name, _config, { logger }) => {
         const client = new ScriptedUpstreamClient(name);
         clients.push(client);
         clientLogs.set(name, logger);
@@ -64,6 +64,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
     const created = new InstanceLink({
       source: SOURCE,
       env: {},
+      childEnv: {},
       logger: recordingLogger(lines),
       ...TIMINGS,
       _socketPath: fx.socketPath,
@@ -331,17 +332,24 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
   let server: Server;
   let retryAnswer: (id: string) => Buffer;
   let link: InstanceLink;
+  let socketPath: string;
+  let attaches: Array<Record<string, unknown>>;
+  let onAttach: Buffer[];
 
   beforeEach(async () => {
     dir = await mkdtemp("/tmp/cbe-retry-");
-    const socketPath = join(dir, "d.sock");
+    socketPath = join(dir, "d.sock");
+    attaches = [];
+    onAttach = [];
     server = createServer((sock: Socket) => {
       const decoder = new FrameDecoder();
       sock.on("data", (chunk: Buffer) => {
         decoder.push(chunk);
         for (let frame = decoder.next(); frame !== null; frame = decoder.next()) {
-          const request = frame as { id: string; method: string };
+          const request = frame as { id: string; method: string; params: Record<string, unknown> };
           if (request.method === "ATTACH") {
+            attaches.push(request.params);
+            for (const extra of onAttach) sock.write(extra);
             sock.write(encodeFrame({ method: "UPSTREAM", params: { name: "svc", status: "disconnected", tools: [] } }));
             sock.write(encodeFrame({ id: request.id, result: { upstreams: ["svc"] } }));
           } else if (request.method === "RETRY") {
@@ -351,7 +359,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
       });
     });
     await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-    link = new InstanceLink({ source: SOURCE, env: {}, ...TIMINGS, _socketPath: socketPath, _ensureDaemon: async () => {} });
+    link = new InstanceLink({ source: SOURCE, env: {}, childEnv: {}, ...TIMINGS, _socketPath: socketPath, _ensureDaemon: async () => {} });
   });
 
   afterEach(async () => {
@@ -394,6 +402,37 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
       error: "the manager reported a status this bridge doesn't know: sleeping",
       tools: [],
     });
+  });
+
+  it("sends the environment it was given for the STDIO servers the instance starts when it attaches", async () => {
+    const withEnv = new InstanceLink({ source: SOURCE, env: {}, childEnv: { PATH: "/usr/bin", MARKER: "m" }, ...TIMINGS, _socketPath: socketPath, _ensureDaemon: async () => {} });
+    try {
+      await withEnv.attach();
+    } finally {
+      await withEnv.close();
+    }
+
+    expect(attaches.at(-1)).toMatchObject({ env: {}, childEnv: { PATH: "/usr/bin", MARKER: "m" } });
+  });
+
+  it("logs a line at a level it doesn't know at debug, and a stopped server's stderr lines with it", async () => {
+    const lines: LoggedLine[] = [];
+    onAttach = [
+      encodeFrame({ method: "LOG", params: { upstream: "svc", level: "trace", message: "from a newer manager" } }),
+      encodeFrame({ method: "LOG", params: { upstream: "svc", level: "warn", message: "STDIO server exited with code 1", stderr: ["boom"] } }),
+      encodeFrame({ method: "LOG", params: { upstream: "svc", level: "warn", message: "bad stderr", stderr: "boom" } }),
+    ];
+    const logged = new InstanceLink({ source: SOURCE, env: {}, childEnv: {}, logger: recordingLogger(lines), ...TIMINGS, _socketPath: socketPath, _ensureDaemon: async () => {} });
+    try {
+      await logged.attach();
+    } finally {
+      await logged.close();
+    }
+
+    expect(lines).toEqual([
+      { level: "debug", message: "from a newer manager", context: { component: "upstream", server: "svc" } },
+      { level: "warn", message: "STDIO server exited with code 1", context: { component: "upstream", server: "svc", stderr: ["boom"] } },
+    ]);
   });
 });
 

@@ -339,7 +339,3 @@ describe("integration: HTTP client with credential templates", () => {
     await client.close();
   });
 });
-
-// STDIO credential expansion is now performed by `UpstreamManager` before
-// instantiating `DaemonStdioClient`, so its coverage lives in the manager
-// tests in `test/upstream.test.ts` (UpstreamManager describe block).

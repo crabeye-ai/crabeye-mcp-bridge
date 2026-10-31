@@ -2,19 +2,12 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 import { UPSTREAM_MARKER_ENV } from "../../src/constants.js";
 import { readParentPid } from "../../src/process/process-utils.js";
 import { launchedByAnotherBridge } from "../../src/upstream/launch-guard.js";
-import { OpenSessionFixture, spawnTestManager, until, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
+import { AttachedBridge, fixtureSource, servingConfigs, spawnTestManager, stubServerFile, until, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
-
-const ECHO_MARKER = `
-  require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
-    const msg = JSON.parse(line);
-    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { marker: process.env.${UPSTREAM_MARKER_ENV} ?? null } }) + "\\n");
-  });
-`;
 
 let cli: string;
 
@@ -68,19 +61,19 @@ describe("launch guard", () => {
     expect(await launchedByAnotherBridge({ [UPSTREAM_MARKER_ENV]: "yes" }, chain({ 700: 600 }), 700)).toBe(false);
   });
 
-  it.skipIf(process.platform === "win32")("marks every child the daemon starts with the daemon's pid, overriding the session's env", async () => {
-    fx = await spawnTestManager({ manager: { childPingMs: 0 } });
-    const session = await OpenSessionFixture.open(fx, {
-      command: process.execPath,
-      args: ["-e", ECHO_MARKER],
-      resolvedEnv: { [UPSTREAM_MARKER_ENV]: "" },
+  it.skipIf(process.platform === "win32")("marks every child the daemon starts with the daemon's pid, overriding the server's env and the client's", async () => {
+    const stub = await stubServerFile();
+    onTestFinished(() => stub.cleanup());
+    fx = await spawnTestManager({
+      manager: { childPingMs: 0, ...servingConfigs({ [fixtureSource.path]: { svc: { command: process.execPath, args: [stub.path], env: { [UPSTREAM_MARKER_ENV]: "" } } } }) },
     });
-    session.sendRpc({ jsonrpc: "2.0", id: 1, method: "probe" });
+    const bridge = await AttachedBridge.attach(fx, { childEnv: { ...(process.env as Record<string, string>), [UPSTREAM_MARKER_ENV]: "1" } });
+    onTestFinished(() => bridge.close());
+    await bridge.connected("svc");
 
-    const reply = (await session.waitForFrame((p) => (p as { id?: unknown }).id === 1, 5_000)) as { result: { marker: unknown } };
+    const env = JSON.parse((await bridge.calledText("svc", "env"))!) as Record<string, string>;
 
-    expect(reply.result.marker).toBe(String(process.pid));
-    await session.close();
+    expect(env[UPSTREAM_MARKER_ENV]).toBe(String(process.pid));
   });
 
   it("refuses to serve when its ancestor daemon started it", { timeout: 30_000 }, async () => {

@@ -40,7 +40,7 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
 
     expect(await tellAuthChanged()).toEqual({ connections: 2 });
 
-    expect((await status()).httpUpstreams.map((each) => each.status)).toEqual(["connected", "connected"]);
+    expect((await status()).upstreams.map((each) => each.status)).toEqual(["connected", "connected"]);
     expect(server.count("tools/call")).toBe(0);
     expect(await Promise.all(clients.map((each) => each.call("svc")))).toEqual([ECHOED, ECHOED]);
   });
@@ -58,7 +58,7 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
 
     expect(await tellAuthChanged()).toEqual({ connections: 1 });
 
-    expect((await status()).httpUpstreams).toEqual([{ serverName: "svc", status: "auth_required", instances: 1 }]);
+    expect((await status()).upstreams).toEqual([{ serverName: "svc", type: "streamable-http", status: "auth_required", instances: 1 }]);
     for (const each of clients) await expectAuthMessage(each);
   });
 
@@ -75,7 +75,7 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     expect(String(await call)).toContain("Connection closed");
     await vi.waitFor(() => expect(fixture.daemonLines.map((line) => line.message)).toContain(DROPPED));
     expect(await store().get(oauthCredentialKey("svc"))).toMatchObject({ access_token: fresh.access_token, refresh_token: fresh.refresh_token });
-    expect((await status()).httpUpstreams).toEqual([{ serverName: "svc", status: "connected", instances: 1 }]);
+    expect((await status()).upstreams).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 1 }]);
   });
 
   it("keeps the credentials removed when a refresh in flight on the connection it replaces finishes afterwards", async () => {

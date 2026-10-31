@@ -41,7 +41,7 @@ describe.skipIf(process.platform === "win32")("token refresh of HTTP upstreams s
     const servers = { mcpServers: { svc: { url: server.url, _bridge: { auth: BRIDGE_AUTH } } } };
     const config = await writeJson("config.json", { configPaths: [await writeJson("client.json", servers)] });
     const [a, b] = [await bridge(config, { kind: "merged" }), await bridge(await writeJson("other.json", servers))];
-    expect((await status()).httpUpstreams).toEqual([{ serverName: "svc", status: "connected", instances: 2 }]);
+    expect((await status()).upstreams).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 2 }]);
 
     expect(await callAsTheTokensExpire(server, [a, b])).toEqual([ECHOED, ECHOED]);
     expect(server.tokenRequests()).toBe(1);
@@ -58,7 +58,7 @@ describe.skipIf(process.platform === "win32")("token refresh of HTTP upstreams s
     const a = await bridge(await writeJson("bridge.json", { mcpServers: { svc: { url: server.url, ...shared } } }));
     const b = await bridge(await writeJson("other.json", { mcpServers: { svc: { url: server.url, ...shared, ...second } } }), env && { env: env() });
     expect(await Promise.all([a.call("svc"), b.call("svc")])).toEqual([ECHOED, ECHOED]);
-    expect((await status()).httpUpstreams.map((each) => each.serverName)).toEqual(["svc", "svc"]);
+    expect((await status()).upstreams.map((each) => each.serverName)).toEqual(["svc", "svc"]);
 
     expect(await callAsTheTokensExpire(server, [a, b])).toEqual([ECHOED, ECHOED]);
 
@@ -90,7 +90,7 @@ describe.skipIf(process.platform === "win32")("token refresh of HTTP upstreams s
     await rewriteJsonUntil("bridge.json", { mcpServers: { svc: { url: server.url, _bridge: { auth: { ...BRIDGE_AUTH, clientId: "client-2" } } } } }, async () =>
       expect(server.count("tools/list")).toBe(2),
     );
-    await vi.waitFor(async () => expect((await status()).httpUpstreams).toEqual([{ serverName: "svc", status: "connected", instances: 1 }]));
+    await vi.waitFor(async () => expect((await status()).upstreams).toEqual([{ serverName: "svc", type: "streamable-http", status: "connected", instances: 1 }]));
     server.expireAccessTokens();
 
     expect(await client.call("svc")).toEqual(ECHOED);
@@ -117,9 +117,9 @@ describe.skipIf(process.platform === "win32")("token refresh of HTTP upstreams s
       expect(await b.call("svc")).toEqual(ECHOED);
 
       expect(server.tokenRequestLog().map((request) => request.clientSecret)).toEqual(["secret-a", "secret-b"]);
-      const { instances, httpUpstreams } = await status();
+      const { instances, upstreams } = await status();
       expect(instances).toHaveLength(2);
-      expect(httpUpstreams).toHaveLength(2);
+      expect(upstreams).toHaveLength(2);
     });
 
     it("reports a client secret variable the client doesn't set, by name and never by a value", async () => {

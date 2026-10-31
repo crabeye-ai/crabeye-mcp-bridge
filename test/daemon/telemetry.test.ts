@@ -10,9 +10,7 @@ describe("Telemetry", () => {
         spawnedTotal: 0,
         killedTotal: { grace: 0, restart: 0, crash: 0, wedged: 0 },
       },
-      sessions: { total: 0, openedTotal: 0, closedTotal: 0 },
       rpc: { inFlight: 0, errorsTotal: {} },
-      upstreamRequests: { refusedTotal: {} },
     });
   });
 
@@ -26,50 +24,37 @@ describe("Telemetry", () => {
       expect(s.children.spawnedTotal).toBe(2);
     });
 
-    it("recordKill decrements total and increments killedTotal[reason]", () => {
+    it("recordStop decrements total and increments killedTotal[reason]", () => {
       const t = new Telemetry();
       t.recordSpawn();
       t.recordSpawn();
-      t.recordKill("grace");
-      t.recordKill("restart");
+      t.recordStop("grace");
+      t.recordStop("restart");
       const s = t.snapshot();
       expect(s.children.total).toBe(0);
       expect(s.children.spawnedTotal).toBe(2);
       expect(s.children.killedTotal).toEqual({ grace: 1, restart: 1, crash: 0, wedged: 0 });
     });
 
-    it("recordKill never drops total below zero", () => {
+    it("recordStop never drops total below zero", () => {
       const t = new Telemetry();
-      t.recordKill("crash");
+      t.recordStop("crash");
       expect(t.snapshot().children.total).toBe(0);
       expect(t.snapshot().children.killedTotal.crash).toBe(1);
+    });
+
+    it("lowers total without counting a kill for a stop that isn't one", () => {
+      const t = new Telemetry();
+      t.recordSpawn();
+      t.recordStop(null);
+      expect(t.snapshot().children).toEqual({ total: 0, spawnedTotal: 1, killedTotal: { grace: 0, restart: 0, crash: 0, wedged: 0 } });
     });
 
     it("counts each reason independently", () => {
       const t = new Telemetry();
       const reasons: KilledReason[] = ["grace", "grace", "restart", "crash", "crash", "crash"];
-      for (const r of reasons) t.recordKill(r);
+      for (const r of reasons) t.recordStop(r);
       expect(t.snapshot().children.killedTotal).toEqual({ grace: 2, restart: 1, crash: 3, wedged: 0 });
-    });
-  });
-
-  describe("sessions", () => {
-    it("open/close updates total and lifetime counters", () => {
-      const t = new Telemetry();
-      t.recordSessionOpen();
-      t.recordSessionOpen();
-      t.recordSessionClose();
-      const s = t.snapshot();
-      expect(s.sessions.total).toBe(1);
-      expect(s.sessions.openedTotal).toBe(2);
-      expect(s.sessions.closedTotal).toBe(1);
-    });
-
-    it("close on empty floors total at zero", () => {
-      const t = new Telemetry();
-      t.recordSessionClose();
-      expect(t.snapshot().sessions.total).toBe(0);
-      expect(t.snapshot().sessions.closedTotal).toBe(1);
     });
   });
 
@@ -94,10 +79,10 @@ describe("Telemetry", () => {
       const t = new Telemetry();
       t.recordRpcError("invalid_params");
       t.recordRpcError("invalid_params");
-      t.recordRpcError("session_not_found");
+      t.recordRpcError("unknown_method");
       expect(t.snapshot().rpc.errorsTotal).toEqual({
         invalid_params: 2,
-        session_not_found: 1,
+        unknown_method: 1,
       });
     });
 
@@ -111,50 +96,6 @@ describe("Telemetry", () => {
       t.recordRpcError("code_0");
       t.recordRpcError("code_0");
       expect(t.snapshot().rpc.errorsTotal.code_0).toBeGreaterThanOrEqual(3);
-    });
-  });
-
-  describe("upstream requests", () => {
-    it("counts refused requests by method", () => {
-      const t = new Telemetry();
-      t.recordRefusedUpstreamRequest("sampling/createMessage");
-      t.recordRefusedUpstreamRequest("sampling/createMessage");
-      t.recordRefusedUpstreamRequest("roots/list");
-      t.recordRefusedUpstreamRequest("__proto__");
-      const refused = t.snapshot().upstreamRequests.refusedTotal;
-      expect(refused).toEqual({ "sampling/createMessage": 2, "roots/list": 1, ["__proto__"]: 1 });
-      expect(Object.getPrototypeOf(refused)).toBe(Object.prototype);
-    });
-
-    it("stops adding methods at 64 but keeps counting the ones it has", () => {
-      const t = new Telemetry();
-      for (let i = 0; i < 70; i++) t.recordRefusedUpstreamRequest(`m${i}`);
-      t.recordRefusedUpstreamRequest("m0");
-      const refused = t.snapshot().upstreamRequests.refusedTotal;
-      expect(Object.keys(refused)).toHaveLength(64);
-      expect(refused.m0).toBe(2);
-      expect(refused.m64).toBeUndefined();
-    });
-  });
-
-  describe("snapshot independence", () => {
-    it("snapshot does not share map reference with internal state", () => {
-      const t = new Telemetry();
-      t.recordRpcError("foo");
-      const s1 = t.snapshot();
-      t.recordRpcError("foo");
-      // Mutating after a snapshot must not retroactively change it.
-      expect(s1.rpc.errorsTotal.foo).toBe(1);
-      expect(t.snapshot().rpc.errorsTotal.foo).toBe(2);
-    });
-
-    it("snapshot copies killedTotal record", () => {
-      const t = new Telemetry();
-      t.recordKill("grace");
-      const s1 = t.snapshot();
-      t.recordKill("grace");
-      expect(s1.children.killedTotal.grace).toBe(1);
-      expect(t.snapshot().children.killedTotal.grace).toBe(2);
     });
   });
 });

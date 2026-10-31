@@ -65,7 +65,7 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
     }
   });
 
-  it("STATUS returns version, pid, and empty children/sessions", async () => {
+  it("STATUS returns version, pid, and no children, instances or upstreams", async () => {
     manager = new ManagerDaemon({
       socketPath: paths.sock,
       pidPath: paths.pid,
@@ -87,19 +87,21 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
         pid: number;
         version: number;
         children: never[];
-        sessions: never[];
+        instances: never[];
+        upstreams: never[];
       };
       expect(result.version).toBeGreaterThan(0);
       expect(result.pid).toBe(process.pid);
       expect(result.children).toEqual([]);
-      expect(result.sessions).toEqual([]);
+      expect(result.instances).toEqual([]);
+      expect(result.upstreams).toEqual([]);
       expect(result.uptime).toBeGreaterThanOrEqual(0);
     } finally {
       client.close();
     }
   });
 
-  it("OPEN with malformed params returns invalid_params", async () => {
+  it("refuses any OPEN, which only bridges from crabeye-mcp-bridge 1.3.0 or earlier send, saying to restart the AI client", async () => {
     manager = new ManagerDaemon({
       socketPath: paths.sock,
       pidPath: paths.pid,
@@ -118,8 +120,10 @@ describe.skipIf(isWindows)("ManagerDaemon (UDS)", () => {
     });
     try {
       await expect(client.call("OPEN", { hash: "x" })).rejects.toMatchObject({
-        code: "invalid_params",
+        code: "bridge_unsupported",
+        message: expect.stringContaining("restart the AI client"),
       });
+      expect(await client.call("PING", { seq: 1 })).toEqual({ seq: 1, pid: process.pid });
     } finally {
       client.close();
     }

@@ -8,13 +8,7 @@ import {
   MIN_BRIDGE_PROTOCOL_VERSION,
   MIN_DAEMON_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
-  UNREPORTED_BRIDGE_PROTOCOL_VERSION,
-  notImplementedResponse,
-  ERROR_CODE_UPSTREAM_RESTARTED,
-  INNER_ERROR_CODE_UPSTREAM_RESTARTED,
-  type SessionEvictedParams,
   type DaemonMethod,
-  type UpstreamRestartedReason,
   type RestartParams,
   type RestartResult,
 } from "../../src/daemon/protocol.js";
@@ -133,53 +127,19 @@ describe("daemon protocol", () => {
     });
   });
 
-  describe("response helpers", () => {
-    it("not_implemented carries the method name", () => {
-      const r = notImplementedResponse("42", "RPC");
-      expect(r.id).toBe("42");
-      expect(r.error?.code).toBe("not_implemented");
-      expect(r.error?.message).toContain("RPC");
-    });
-
-    it("speaks protocol 3 and needs a daemon that does, while still accepting bridges from protocol 1", () => {
-      expect(PROTOCOL_VERSION).toBe(3);
-      expect(MIN_DAEMON_PROTOCOL_VERSION).toBe(3);
-      expect([MIN_BRIDGE_PROTOCOL_VERSION, UNREPORTED_BRIDGE_PROTOCOL_VERSION]).toEqual([1, 1]);
+  describe("versions", () => {
+    it("speaks protocol 4, and needs daemons and bridges that do", () => {
+      expect(PROTOCOL_VERSION).toBe(4);
+      expect([MIN_DAEMON_PROTOCOL_VERSION, MIN_BRIDGE_PROTOCOL_VERSION]).toEqual([4, 4]);
     });
   });
 
-  describe("protocol — SESSION_EVICTED", () => {
-    it("typechecks SESSION_EVICTED method and params", () => {
-      const m: DaemonMethod = "SESSION_EVICTED";
-      const p: SessionEvictedParams = {
-        sessionId: "11111111-1111-1111-1111-111111111111",
-        reason: "child_exited",
-      };
-      expect(m).toBe("SESSION_EVICTED");
-      expect(p.reason).toBe("child_exited");
-    });
-  });
-
-  describe("protocol — Phase E additions", () => {
-    it("exports ERROR_CODE_UPSTREAM_RESTARTED with the literal value", () => {
-      expect(ERROR_CODE_UPSTREAM_RESTARTED).toBe("upstream_restarted");
-    });
-
-    it("exports INNER_ERROR_CODE_UPSTREAM_RESTARTED with the numeric literal", () => {
-      expect(INNER_ERROR_CODE_UPSTREAM_RESTARTED).toBe(-32004);
-    });
-
-    it("typechecks both upstream-restarted reasons", () => {
-      const a: UpstreamRestartedReason = "admin_restart";
-      const b: UpstreamRestartedReason = "daemon_respawn";
-      expect([a, b]).toEqual(["admin_restart", "daemon_respawn"]);
-    });
-
+  describe("protocol — RESTART and PING", () => {
     it("typechecks RestartParams + RestartResult", () => {
       const p: RestartParams = { upstreamHash: "deadbeef" };
-      const r: RestartResult = { ok: true, killed: 1 };
+      const r: RestartResult = { ok: true, restarted: 1 };
       expect(p.upstreamHash).toBe("deadbeef");
-      expect(r.killed).toBe(1);
+      expect(r.restarted).toBe(1);
     });
 
     it("includes PING in DaemonMethod union", () => {
@@ -189,7 +149,7 @@ describe("daemon protocol", () => {
   });
 
   it("reports only the upstream states bridges of this protocol version know; another one needs a protocol version bump", () => {
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBe(4);
     expect(CONNECTION_STATUSES).toEqual(["disconnected", "connecting", "connected", "auth_required"]);
   });
 });

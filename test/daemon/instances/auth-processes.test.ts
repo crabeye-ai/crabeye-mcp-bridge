@@ -87,8 +87,8 @@ describe.skipIf(process.platform === "win32")("crabeye-mcp-bridge auth with brid
     return run(process.execPath, [cliScript, ...args], { env: env() });
   }
 
-  async function httpUpstreams(): Promise<unknown> {
-    return JSON.parse((await cli("daemon", "status")).stdout).httpUpstreams;
+  async function daemonUpstreams(): Promise<unknown> {
+    return JSON.parse((await cli("daemon", "status")).stdout).upstreams;
   }
 
   async function runTool(bridge: BridgeProcess): Promise<{ content: Array<{ text?: string }>; isError?: boolean }> {
@@ -114,7 +114,7 @@ describe.skipIf(process.platform === "win32")("crabeye-mcp-bridge auth with brid
     expect(stdout.split("\n")[0]).toBe('Authenticated "svc"');
     expect(await browser.opened()).toHaveLength(1);
     expect(await browser.failures()).toEqual([]);
-    expect(await httpUpstreams()).toEqual([{ server: "svc", state: "connected", instances: 1 }]);
+    expect(await daemonUpstreams()).toEqual([{ server: "svc", type: "streamable-http", state: "connected", instances: 1 }]);
     expect(upstream.count("tools/call")).toBe(0);
     for (const each of clients) expect(await runTool(each)).toMatchObject({ content: ECHOED });
   });
@@ -129,7 +129,7 @@ describe.skipIf(process.platform === "win32")("crabeye-mcp-bridge auth with brid
 
     expect(stdout).toBe('Removed local token + registered client for "svc"\n');
     expect(stderr).toBe("");
-    expect(await httpUpstreams()).toEqual([{ server: "svc", state: "auth_required", instances: 1 }]);
+    expect(await daemonUpstreams()).toEqual([{ server: "svc", type: "streamable-http", state: "auth_required", instances: 1 }]);
     for (const each of clients) await expectAuthMessage(each);
   });
 

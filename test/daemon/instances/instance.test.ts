@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeConfigSchema, type BridgeConfig, type HttpServerConfig } from "../../../src/config/schema.js";
 import type { CredentialStore } from "../../../src/credentials/credential-store.js";
-import { HttpUpstreamPool } from "../../../src/daemon/instances/http-upstream-pool.js";
+import type { StdioUpstreamClientOptions } from "../../../src/daemon/instances/stdio-upstream-client.js";
+import { UpstreamPool } from "../../../src/daemon/instances/upstream-pool.js";
 import { Instance, type InstanceDeps, type InstanceNotification } from "../../../src/daemon/instances/instance.js";
 import type { InstanceSource } from "../../../src/daemon/protocol.js";
 import type { Logger } from "../../../src/logging/index.js";
 import { rewriteUntil } from "../../_helpers/rewrite-until.js";
-import { ScriptedUpstreamClient } from "../../_helpers/scripted-upstream-client.js";
+import { ScriptedStdioClient, ScriptedUpstreamClient, stdioPoolOptions } from "../../_helpers/scripted-upstream-client.js";
 import { spyLogger, type SpyLogger } from "../../_helpers/spy-logger.js";
 
 const MIXED = {
@@ -57,7 +58,8 @@ describe("Instance", () => {
   let clients: ScriptedUpstreamClient[];
   let clientLogs: Map<string, Logger>;
   let created: Array<{ name: string; config: HttpServerConfig; env: Record<string, string> }>;
-  let pool: HttpUpstreamPool;
+  let pool: UpstreamPool;
+  let stdioClients: Array<{ client: ScriptedStdioClient; options: StdioUpstreamClientOptions }>;
   let stores: Array<Record<string, string>>;
   let deps: InstanceDeps;
   const instances: Instance[] = [];
@@ -67,8 +69,8 @@ describe("Instance", () => {
     await writeFile(configPath, JSON.stringify(config));
   }
 
-  async function open(env: Record<string, string> = {}): Promise<Instance> {
-    const instance = await Instance.open(source, env, deps);
+  async function open(env: Record<string, string> = {}, childEnv: Record<string, string> = {}): Promise<Instance> {
+    const instance = await Instance.open(source, { env, childEnv }, deps);
     instances.push(instance);
     return instance;
   }
@@ -82,9 +84,17 @@ describe("Instance", () => {
     clientLogs = new Map();
     created = [];
     stores = [];
-    pool = new HttpUpstreamPool({
+    stdioClients = [];
+    pool = new UpstreamPool({
       logger: log,
-      createClient: (name, config, { logger, env }) => {
+      stdio: stdioPoolOptions({
+        createClient: (options) => {
+          const client = new ScriptedStdioClient(options.name);
+          stdioClients.push({ client, options });
+          return client;
+        },
+      }),
+      createHttpClient: (name, config, { logger, env }) => {
         const client = new ScriptedUpstreamClient(name);
         clients.push(client);
         clientLogs.set(name, logger);
@@ -111,11 +121,18 @@ describe("Instance", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("hosts every HTTP and SSE server, with or without _bridge.auth, and no STDIO one", async () => {
+  it("hosts every server, HTTP, SSE or STDIO, with or without _bridge.auth", async () => {
     const instance = await open();
 
-    expect(instance.status()).toEqual({ source, bridges: 0, upstreams: ["events", "oauth", "plain"] });
+    expect(instance.status()).toEqual({ source, bridges: 0, upstreams: ["events", "local", "oauth", "plain"] });
     expect(clients.map((c) => c.name).sort()).toEqual(["events", "oauth", "plain"]);
+    expect(stdioClients.map(({ client }) => client.name)).toEqual(["local"]);
+  });
+
+  it("starts its STDIO servers with the environment of the bridge that opened it", async () => {
+    await open({ MCP_BRIDGE_MASTER_KEY: "k" }, { PATH: "/bin", MARKER: "first" });
+
+    expect(stdioClients[0]!.options.childEnv).toEqual({ PATH: "/bin", MARKER: "first" });
   });
 
   it("opens its credential store with the instance's environment, and gives a connection only the client secret variable it names", async () => {
@@ -129,7 +146,7 @@ describe("Instance", () => {
 
   it("rejects when the config can't be loaded", async () => {
     deps.loadConfig = () => Promise.reject(new Error("Config file not found: /x"));
-    await expect(Instance.open(source, {}, deps)).rejects.toThrow("Config file not found");
+    await expect(Instance.open(source, { env: {}, childEnv: {} }, deps)).rejects.toThrow("Config file not found");
   });
 
   it("greets an attachment with a snapshot of each server, then keeps it up to date until it detaches", async () => {
@@ -137,15 +154,15 @@ describe("Instance", () => {
     const bridge = recorder();
 
     instance.attach(bridge);
-    expect(instance.upstreamNames().sort()).toEqual(["events", "oauth", "plain"]);
-    expect(bridge.notifications.map((n) => n.method)).toEqual(["UPSTREAM", "UPSTREAM", "UPSTREAM"]);
+    expect(instance.upstreamNames().sort()).toEqual(["events", "local", "oauth", "plain"]);
+    expect(bridge.notifications.map((n) => n.method)).toEqual(["UPSTREAM", "UPSTREAM", "UPSTREAM", "UPSTREAM"]);
     const plain = clients.find((c) => c.name === "plain")!;
     plain.setStatus("disconnected", new Error("reset"));
     expect(bridge.notifications.at(-1)).toEqual({ method: "UPSTREAM", params: { name: "plain", status: "disconnected", error: "reset", tools: [] } });
 
     instance.detach(bridge);
     plain.setStatus("connected");
-    expect(bridge.notifications).toHaveLength(4);
+    expect(bridge.notifications).toHaveLength(5);
     expect(instance.attachmentCount).toBe(0);
   });
 
@@ -167,10 +184,12 @@ describe("Instance", () => {
     source = { kind: "file", path: join(dir, "other.json") };
     await open({ MCP_BRIDGE_MASTER_KEY: "k" });
     expect(clients).toHaveLength(3);
-    expect(pool.upstreams().map((u) => u.ownerCount)).toEqual([2, 2, 2]);
+    expect(stdioClients).toHaveLength(1);
+    expect(pool.upstreams().map((u) => u.ownerCount)).toEqual([2, 2, 2, 2]);
 
     await open({ MCP_BRIDGE_MASTER_KEY: "other" });
     expect(clients).toHaveLength(6);
+    expect(stdioClients).toHaveLength(1);
   });
 
   describe("when its config file changes", { timeout: 30_000 }, () => {
@@ -229,7 +248,7 @@ describe("Instance", () => {
         () => writeFile(configPath, "{ not json"),
         () => expect(log.warn).toHaveBeenCalledWith("failed to reload config", expect.objectContaining({ error: "Invalid JSON in config file" })),
       );
-      expect(instance.status().upstreams).toEqual(["events", "oauth", "plain"]);
+      expect(instance.status().upstreams).toEqual(["events", "local", "oauth", "plain"]);
     });
 
     it("retries a server paused for authorization", async () => {
@@ -285,7 +304,7 @@ describe("Instance", () => {
     const instance = await open();
     current = { mcpServers: { ...MIXED.mcpServers, fresh: { url: "https://fresh.example.com/mcp" } } };
 
-    expect((await instance.upstream("fresh"))?.name).toBe("fresh");
+    expect(await instance.upstream("fresh")).toBeDefined();
     expect(await instance.upstream("missing")).toBeUndefined();
   });
 
@@ -295,7 +314,7 @@ describe("Instance", () => {
     await instance.reload();
     expect(instance.status().upstreams).toEqual(["plain"]);
 
-    await rewriteUntil(() => writeConfig(MIXED), () => expect(instance.status().upstreams).toEqual(["events", "oauth", "plain"]));
+    await rewriteUntil(() => writeConfig(MIXED), () => expect(instance.status().upstreams).toEqual(["events", "local", "oauth", "plain"]));
   });
 
   it("watches the files a reload names, such as a client file added to the bridge-owned config", { timeout: 30_000 }, async () => {
@@ -338,6 +357,88 @@ describe("Instance", () => {
     const instance = await open();
     await instance.close();
     await vi.waitFor(() => expect(clients.every((c) => c.closed)).toBe(true));
+    await vi.waitFor(() => expect(stdioClients[0]!.client.stops).toEqual(["idle"]));
     expect(instance.status().upstreams).toEqual([]);
+  });
+
+  describe("with STDIO servers", () => {
+    const LOCAL = { command: "node", args: ["server.js"] };
+
+    it("starts one server for two names with the same command, telling attachments about each under its own name", async () => {
+      current = { mcpServers: { a: LOCAL, b: LOCAL } };
+      const instance = await open();
+      const bridge = recorder();
+      instance.attach(bridge);
+      stdioClients[0]!.client.setStatus("connected");
+
+      expect(stdioClients).toHaveLength(1);
+      const named = bridge.notifications.filter((n) => n.method === "UPSTREAM").map((n) => (n.params as { name: string }).name);
+      expect(new Set(named)).toEqual(new Set(["a", "b"]));
+      expect((await (await instance.upstream("b"))!.retry()).name).toBe("b");
+    });
+
+    it("sends attachments a server's stop warning, with its stderr lines", async () => {
+      current = { mcpServers: { local: LOCAL } };
+      const instance = await open();
+      const bridge = recorder();
+      instance.attach(bridge);
+
+      stdioClients[0]!.options.events.exited(stdioClients[0]!.client.child!, { cause: "exited", code: 2, signal: null });
+
+      expect(bridge.notifications).toContainEqual({
+        method: "LOG",
+        params: { upstream: "local", level: "warn", message: "STDIO server exited with code 2", stderr: ["(no stderr output)"] },
+      });
+    });
+
+    it("keeps the server when a reload renames it", async () => {
+      current = { mcpServers: { local: LOCAL } };
+      const instance = await open();
+      current = { mcpServers: { renamed: LOCAL } };
+
+      await instance.reload();
+
+      expect(instance.status().upstreams).toEqual(["renamed"]);
+      expect(stdioClients).toHaveLength(1);
+      expect(stdioClients[0]!.client.stops).toEqual([]);
+    });
+
+    it.each([
+      ["its cwd", { mcpServers: { local: { ...LOCAL, cwd: "/srv" } } }],
+      ["its _bridge.reconnect", { mcpServers: { local: { ...LOCAL, _bridge: { reconnect: { reconnectBaseDelay: 500 } } } } }],
+      ["the global _bridge.reconnect", { mcpServers: { local: LOCAL }, _bridge: { reconnect: { reconnectBaseDelay: 500 } } }],
+      ["its env", { mcpServers: { local: { ...LOCAL, env: { A: "1" } } } }],
+    ])("starts the server again when a reload changes %s", async (_change, next) => {
+      current = { mcpServers: { local: LOCAL } };
+      const instance = await open();
+      current = next;
+
+      await instance.reload();
+
+      expect(stdioClients).toHaveLength(2);
+      await vi.waitFor(() => expect(stdioClients[0]!.client.stops).toEqual(["idle"]));
+      expect(instance.status().upstreams).toEqual(["local"]);
+    });
+
+    it("starts the server again with the new reconnect settings", async () => {
+      current = { mcpServers: { local: LOCAL } };
+      const instance = await open();
+      current = { mcpServers: { local: { ...LOCAL, _bridge: { reconnect: { reconnectBaseDelay: 500, reconnectMaxDelay: 2_000 } } } } };
+
+      await instance.reload();
+
+      expect(stdioClients[1]!.options).toMatchObject({ reconnectBaseDelay: 500, reconnectMaxDelay: 2_000 });
+    });
+
+    it.each(["toString", "constructor", "hasOwnProperty"])("stops a server named %s when a reload removes it", async (name) => {
+      current = { mcpServers: { [name]: LOCAL } };
+      const instance = await open();
+      current = { mcpServers: {} };
+
+      await instance.reload();
+
+      expect(instance.status().upstreams).toEqual([]);
+      await vi.waitFor(() => expect(stdioClients[0]!.client.stops).toEqual(["idle"]));
+    });
   });
 });

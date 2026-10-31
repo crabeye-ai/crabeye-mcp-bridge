@@ -1,6 +1,6 @@
+import type { CallToolResult } from "@modelcontextprotocol/client";
 import { ConfigWatcher } from "../../config/config-watcher.js";
-import { diffServers } from "../../config/config-diff.js";
-import { isHttpServer, resolveUpstreams, type BridgeConfig, type HttpServerConfig } from "../../config/schema.js";
+import { isHttpServer, resolveUpstreams, type BridgeConfig, type ServerConfig } from "../../config/schema.js";
 import type { CredentialStore } from "../../credentials/credential-store.js";
 import type { Logger } from "../../logging/index.js";
 import { resolveReconnectInputs } from "../../upstream/upstream-hash.js";
@@ -11,16 +11,22 @@ import type {
   UpstreamRemovedParams,
   UpstreamSnapshot,
 } from "../protocol.js";
-import type { HttpUpstreamPool, Lease, SharedUpstream } from "./http-upstream-pool.js";
-import { httpUpstreamIdentity } from "./identity.js";
+import { httpUpstreamIdentity, stdioUpstreamKey } from "./identity.js";
+import type { Lease, PoolSpec, UpstreamPool } from "./upstream-pool.js";
 
 export interface LoadedConfig {
   config: BridgeConfig;
   watchPaths: string[];
 }
 
+/** The client variables an instance reads, and the environment its STDIO servers start with. */
+export interface InstanceEnv {
+  env: Record<string, string>;
+  childEnv: Record<string, string>;
+}
+
 export interface InstanceDeps {
-  pool: HttpUpstreamPool;
+  pool: UpstreamPool;
   logger: Logger;
   loadConfig: (source: InstanceSource) => Promise<LoadedConfig>;
   createCredentialStore: (env: Record<string, string>) => CredentialStore;
@@ -37,19 +43,27 @@ export interface InstanceAttachment {
   send(notification: InstanceNotification): void;
 }
 
+/** One of an instance's upstreams, under the name the instance gives it. */
+export interface HostedUpstream {
+  callTool(params: { name: string; arguments?: Record<string, unknown> }, options: { signal: AbortSignal }): Promise<CallToolResult>;
+  retry(): Promise<UpstreamSnapshot>;
+}
+
 interface Hosted {
+  key: string;
   lease: Lease;
   unsubscribe: () => void;
 }
 
 /**
  * The daemon's copy of one config, shared by every bridge that would load it.
- * Holds a pooled connection for each HTTP and SSE server and follows edits
- * to the files it loaded.
+ * Holds a pooled connection for each server and follows edits to the files it
+ * loaded.
  */
 export class Instance {
   readonly source: InstanceSource;
   private readonly _env: Record<string, string>;
+  private readonly _childEnv: Record<string, string>;
   private readonly _deps: InstanceDeps;
   private readonly _store: CredentialStore;
   private readonly _log: Logger;
@@ -63,19 +77,20 @@ export class Instance {
   private _reloadQueued: Promise<void> | undefined;
   private _closed = false;
 
-  private constructor(source: InstanceSource, env: Record<string, string>, loaded: LoadedConfig, deps: InstanceDeps) {
+  private constructor(source: InstanceSource, { env, childEnv }: InstanceEnv, loaded: LoadedConfig, deps: InstanceDeps) {
     this.source = source;
     this._env = env;
+    this._childEnv = childEnv;
     this._deps = deps;
     this._config = loaded.config;
     this._log = deps.logger.child({ component: "instance" });
     this._store = deps.createCredentialStore(env);
-    for (const [name, config] of Object.entries(hostedServers(loaded.config))) this._host(name, config);
+    for (const [name, config] of Object.entries(resolveUpstreams(loaded.config))) this._host(name, this._specFor(name, config));
     this._watch(loaded.watchPaths);
   }
 
   /** Loads the config for `source`; rejects with the loader's error when it can't. */
-  static async open(source: InstanceSource, env: Record<string, string>, deps: InstanceDeps): Promise<Instance> {
+  static async open(source: InstanceSource, env: InstanceEnv, deps: InstanceDeps): Promise<Instance> {
     return new Instance(source, env, await deps.loadConfig(source), deps);
   }
 
@@ -86,7 +101,7 @@ export class Instance {
   /** Sends the attachment a snapshot of every hosted upstream, then keeps it up to date. */
   attach(attachment: InstanceAttachment): void {
     this._attachments.add(attachment);
-    for (const { lease } of this._hosted.values()) attachment.send({ method: "UPSTREAM", params: lease.upstream.snapshot() });
+    for (const [name, { lease }] of this._hosted) attachment.send({ method: "UPSTREAM", params: { ...lease.upstream.snapshot(), name } });
   }
 
   upstreamNames(): string[] {
@@ -98,11 +113,14 @@ export class Instance {
   }
 
   /** The hosted upstream named `name`, reloading the config first when there is none. */
-  async upstream(name: string): Promise<SharedUpstream | undefined> {
-    const hosted = this._hosted.get(name);
-    if (hosted !== undefined) return hosted.lease.upstream;
-    await this.reload();
-    return this._hosted.get(name)?.lease.upstream;
+  async upstream(name: string): Promise<HostedUpstream | undefined> {
+    if (!this._hosted.has(name)) await this.reload();
+    const upstream = this._hosted.get(name)?.lease.upstream;
+    if (upstream === undefined) return undefined;
+    return {
+      callTool: (params, options) => upstream.callTool(params, options),
+      retry: async () => ({ ...(await upstream.retry()), name }),
+    };
   }
 
   /**
@@ -185,21 +203,24 @@ export class Instance {
   private _apply(next: BridgeConfig): void {
     const previous = this._config;
     this._config = next;
-    const diff = diffServers(hostedServers(previous), hostedServers(next));
-    for (const name of diff.removed) {
+    const servers = resolveUpstreams(next);
+    const toRelease: Hosted[] = [];
+    for (const [name, config] of Object.entries(servers)) {
+      const spec = this._specFor(name, config);
+      const current = this._hosted.get(name);
+      if (current?.key === spec.key) continue;
+      this._log.info(current === undefined ? "adding server" : "reconnecting server", { server: name });
+      if (current !== undefined) toRelease.push(current);
+      this._host(name, spec);
+    }
+    for (const name of [...this._hosted.keys()]) {
+      if (Object.hasOwn(servers, name)) continue;
       this._log.info("removing server", { server: name });
-      this._unhost(name);
+      toRelease.push(this._hosted.get(name)!);
+      this._hosted.delete(name);
       this._broadcast({ method: "UPSTREAM_REMOVED", params: { upstream: name } });
     }
-    for (const { name, config } of diff.reconnect) {
-      this._log.info("reconnecting server", { server: name });
-      this._unhost(name);
-      this._host(name, config);
-    }
-    for (const { name, config } of diff.added) {
-      this._log.info("adding server", { server: name });
-      this._host(name, config);
-    }
+    for (const hosted of toRelease) release(hosted);
     const interval = next._bridge.healthCheckInterval;
     if (interval !== previous._bridge.healthCheckInterval) {
       for (const { lease } of this._hosted.values()) lease.setHealthCheckInterval(interval);
@@ -207,37 +228,36 @@ export class Instance {
     for (const { lease } of this._hosted.values()) lease.upstream.retryIfPaused();
   }
 
-  private _host(name: string, config: HttpServerConfig): void {
-    const bridgeConfig = this._config;
-    const { key, network, env } = httpUpstreamIdentity(name, config, this._env);
-    const lease = this._deps.pool.acquire({
-      key,
-      name,
-      config,
-      credentialStore: this._store,
-      reconnect: resolveReconnectInputs(bridgeConfig._bridge, config),
-      healthCheckIntervalSec: bridgeConfig._bridge.healthCheckInterval,
-      network,
-      env,
-    });
+  private _specFor(name: string, config: ServerConfig): PoolSpec {
+    const base = { name, healthCheckIntervalSec: this._config._bridge.healthCheckInterval };
+    const reconnect = resolveReconnectInputs(this._config._bridge, config);
+    if (isHttpServer(config)) {
+      const { key, network, env } = httpUpstreamIdentity(name, config, this._env);
+      return { ...base, key, kind: "http", http: { config, credentialStore: this._store, reconnect, network, env } };
+    }
+    const key = stdioUpstreamKey(config, reconnect, this._env);
+    return { ...base, key, kind: "stdio", stdio: { config, childEnv: this._childEnv, credentialStore: this._store, reconnect } };
+  }
+
+  private _host(name: string, spec: PoolSpec): void {
+    const lease = this._deps.pool.acquire(spec, this);
     const unsubscribe = lease.upstream.subscribe({
-      onSnapshot: (snapshot) => this._broadcast({ method: "UPSTREAM", params: snapshot }),
-      onLog: (level, message, context) =>
+      onSnapshot: (snapshot) => this._broadcast({ method: "UPSTREAM", params: { ...snapshot, name } }),
+      onLog: (level, message, context, stderr) =>
         this._broadcast({
           method: "LOG",
-          params: { upstream: name, level, message, ...(Object.keys(context).length > 0 && { context }) },
+          params: { upstream: name, level, message, ...(Object.keys(context).length > 0 && { context }), ...(stderr !== undefined && { stderr }) },
         }),
     });
-    this._hosted.set(name, { lease, unsubscribe });
-    this._broadcast({ method: "UPSTREAM", params: lease.upstream.snapshot() });
+    this._hosted.set(name, { key: spec.key, lease, unsubscribe });
+    this._broadcast({ method: "UPSTREAM", params: { ...lease.upstream.snapshot(), name } });
   }
 
   private _unhost(name: string): void {
     const hosted = this._hosted.get(name);
     if (hosted === undefined) return;
     this._hosted.delete(name);
-    hosted.unsubscribe();
-    hosted.lease.release();
+    release(hosted);
   }
 
   private _broadcast(notification: InstanceNotification): void {
@@ -245,10 +265,7 @@ export class Instance {
   }
 }
 
-function hostedServers(config: BridgeConfig): Record<string, HttpServerConfig> {
-  const hosted: Record<string, HttpServerConfig> = {};
-  for (const [name, server] of Object.entries(resolveUpstreams(config))) {
-    if (isHttpServer(server)) hosted[name] = server;
-  }
-  return hosted;
+function release(hosted: Hosted): void {
+  hosted.unsubscribe();
+  hosted.lease.release();
 }

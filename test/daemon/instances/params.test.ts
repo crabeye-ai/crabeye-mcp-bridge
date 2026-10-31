@@ -6,12 +6,16 @@ import {
   parseCancelToolParams,
   parseRetryParams,
 } from "../../../src/daemon/instances/params.js";
+import { MAX_CHILD_ENV_BYTES } from "../../../src/daemon/instances/child-env.js";
 
 const attach = {
-  bridgeProtocolVersion: 3,
+  bridgeProtocolVersion: 4,
   source: { kind: "file", path: "/home/u/bridge.json" },
   env: { MCP_BRIDGE_MASTER_KEY: "k", NOTION_OAUTH_SECRET: "s" },
+  childEnv: { PATH: "/usr/bin", HOME: "/home/u" },
 };
+
+const sizedEnv = (bytes: number) => ({ BIG: "x".repeat(bytes - "BIG".length) });
 
 describe("parseAttachParams", () => {
   it("accepts a config source and the instance variables", () => {
@@ -19,8 +23,13 @@ describe("parseAttachParams", () => {
   });
 
   it("accepts the merged default with no variables", () => {
-    const merged = { ...attach, source: { kind: "merged", path: "/home/u/.crabeye-mcp-bridge/config.json" }, env: {} };
+    const merged = { ...attach, source: { kind: "merged", path: "/home/u/.crabeye-mcp-bridge/config.json" }, env: {}, childEnv: {} };
     expect(parseAttachParams(merged)).toEqual(merged);
+  });
+
+  it("accepts an environment for STDIO servers of up to 4 MiB, and a Windows drive variable", () => {
+    expect(parseAttachParams({ ...attach, childEnv: sizedEnv(MAX_CHILD_ENV_BYTES) })?.childEnv).toEqual(sizedEnv(MAX_CHILD_ENV_BYTES));
+    expect(parseAttachParams({ ...attach, childEnv: { "=C:": "C:\\work" } })?.childEnv).toEqual({ "=C:": "C:\\work" });
   });
 
   it.each([
@@ -41,6 +50,14 @@ describe("parseAttachParams", () => {
     ["a relative certificate file", { ...attach, env: { NODE_EXTRA_CA_CERTS: "certs/ca.pem" } }],
     ["a value over 64 KiB", { ...attach, env: { MCP_BRIDGE_MASTER_KEY: "a".repeat(65_537) } }],
     ["more than 64 variables", { ...attach, env: Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`V${i}_OAUTH`, "x"])) }],
+    ["no environment for STDIO servers", { ...attach, childEnv: undefined }],
+    ["an environment for STDIO servers that isn't an object", { ...attach, childEnv: ["PATH"] }],
+    ["a non-string value for STDIO servers", { ...attach, childEnv: { PATH: 1 } }],
+    ["a NUL in a value for STDIO servers", { ...attach, childEnv: { PATH: "a\0b" } }],
+    ["a NUL in a name for STDIO servers", { ...attach, childEnv: { "PA\0TH": "x" } }],
+    ["an empty name for STDIO servers", { ...attach, childEnv: { "": "x" } }],
+    ["an = in a name for STDIO servers", { ...attach, childEnv: { "A=B": "x" } }],
+    ["an environment for STDIO servers over 4 MiB", { ...attach, childEnv: sizedEnv(MAX_CHILD_ENV_BYTES + 1) }],
   ])("refuses %s", (_label, params) => {
     expect(parseAttachParams(params)).toBeNull();
   });

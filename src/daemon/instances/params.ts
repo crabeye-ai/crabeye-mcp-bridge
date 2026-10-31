@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
-import { CERTIFICATE_FILE_ENV_NAMES, isInstanceEnvName } from "../instance-env.js";
+import { CERTIFICATE_FILE_ENV_NAMES, isInstanceEnvName, isSpawnableEntry } from "../instance-env.js";
+import { MAX_CHILD_ENV_BYTES } from "./child-env.js";
 import type { AttachParams, AuthChangedParams, CallToolParams, CancelToolParams, InstanceSource, RetryParams } from "../protocol.js";
 
 const MAX_PATH_BYTES = 4096;
@@ -9,14 +10,22 @@ const MAX_CALL_ID_BYTES = 64;
 const MAX_UPSTREAM_NAME_BYTES = 256;
 const MAX_TOOL_NAME_BYTES = 1024;
 
-export function parseAttachParams(raw: unknown): AttachParams | null {
+/** The protocol version an ATTACH says its bridge speaks, read before the rest, whose shape depends on it. */
+export function bridgeProtocolVersionOf(raw: unknown): number | null {
   if (!isPlainObject(raw)) return null;
-  const { bridgeProtocolVersion, source, env } = raw;
-  if (typeof bridgeProtocolVersion !== "number" || !Number.isSafeInteger(bridgeProtocolVersion) || bridgeProtocolVersion < 1) return null;
+  const { bridgeProtocolVersion } = raw;
+  return typeof bridgeProtocolVersion === "number" && Number.isSafeInteger(bridgeProtocolVersion) && bridgeProtocolVersion >= 1 ? bridgeProtocolVersion : null;
+}
+
+export function parseAttachParams(raw: unknown): AttachParams | null {
+  const bridgeProtocolVersion = bridgeProtocolVersionOf(raw);
+  if (bridgeProtocolVersion === null || !isPlainObject(raw)) return null;
+  const { source, env, childEnv } = raw;
   const parsedSource = parseSource(source);
   const parsedEnv = parseEnv(env);
-  if (parsedSource === null || parsedEnv === null) return null;
-  return { bridgeProtocolVersion, source: parsedSource, env: parsedEnv };
+  const parsedChildEnv = parseChildEnv(childEnv);
+  if (parsedSource === null || parsedEnv === null || parsedChildEnv === null) return null;
+  return { bridgeProtocolVersion, source: parsedSource, env: parsedEnv, childEnv: parsedChildEnv };
 }
 
 export function parseCallToolParams(raw: unknown): CallToolParams | null {
@@ -58,6 +67,19 @@ function parseEnv(raw: unknown): Record<string, string> | null {
     if (!isInstanceEnvName(name)) return null;
     if (typeof value !== "string" || Buffer.byteLength(value) > MAX_ENV_VALUE_BYTES || value.includes("\0")) return null;
     if (CERTIFICATE_FILE_ENV_NAMES.includes(name) && !isAbsolute(value)) return null;
+    env[name] = value;
+  }
+  return env;
+}
+
+function parseChildEnv(raw: unknown): Record<string, string> | null {
+  if (!isPlainObject(raw)) return null;
+  const env: Record<string, string> = {};
+  let bytes = 0;
+  for (const [name, value] of Object.entries(raw)) {
+    if (typeof value !== "string" || !isSpawnableEntry(name, value)) return null;
+    bytes += Buffer.byteLength(name) + Buffer.byteLength(value);
+    if (bytes > MAX_CHILD_ENV_BYTES) return null;
     env[name] = value;
   }
   return env;

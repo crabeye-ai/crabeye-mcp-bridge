@@ -90,7 +90,7 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
     return running as StatusResult;
   }
 
-  async function cliStatus(): Promise<{ instances: unknown; httpUpstreams: unknown }> {
+  async function cliStatus(): Promise<{ instances: unknown; upstreams: unknown }> {
     const { stdout } = await run(process.execPath, [cliScript, "daemon", "status"], { env: env() });
     return JSON.parse(stdout);
   }
@@ -118,7 +118,7 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
     await until(async () => (await status()).instances[0]?.bridges === 2, 10_000);
     expect(await cliStatus()).toMatchObject({
       instances: [{ config: configPath, kind: "file", bridges: 2, servers: ["svc"] }],
-      httpUpstreams: [{ server: "svc", state: "connected", instances: 1 }],
+      upstreams: [{ server: "svc", type: "streamable-http", state: "connected", instances: 1 }],
     });
   });
 
@@ -136,7 +136,7 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
     await until(async () => (await status()).instances[0]?.bridges === 2, 10_000);
     expect(await cliStatus()).toMatchObject({
       instances: [{ config: bridgeConfigPath, kind: "merged", bridges: 2, servers: ["svc"] }],
-      httpUpstreams: [{ server: "svc", state: "connected", instances: 1 }],
+      upstreams: [{ server: "svc", type: "streamable-http", state: "connected", instances: 1 }],
     });
   });
 
