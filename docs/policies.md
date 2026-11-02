@@ -42,11 +42,13 @@ Your MCP client only sees `search_tools` and `run_tool`, so permission rules it 
 
 ## Rate limiting
 
-The bridge applies a preemptive rate limit to every upstream so an LLM's bursty tool calls don't blow through the upstream's API quota. When the limit is hit, calls wait in a FIFO queue until the sliding window opens — the LLM just sees slightly higher latency instead of an error. Each queued call has its own 60-second timeout; past that it fails.
+A preemptive rate limit applies to every upstream so an LLM's bursty tool calls don't blow through the upstream's API quota. When the limit is hit, calls wait in a FIFO queue until the sliding window opens — the LLM just sees slightly higher latency instead of an error. Each queued call has its own 60-second timeout; past that it fails. A call cancelled while it waits gives up its place.
+
+The [manager](stdio-manager.md) enforces the limit once for every AI client: with three clients open on the same config, a server limited to 30 calls per window gets at most 30 calls per window from all of them together, not 30 from each. One budget covers every call that goes through the same connection to the server under the same limit, so it also covers clients that load different configs, when those configs connect to the server the same way (see [How sharing works](stdio-manager.md#how-sharing-works) and [Configs and connections](stdio-manager.md#configs-and-connections)). Configs that give a shared server different limits each have their own budget, so the server can get up to the sum; configs that connect to it differently have their own connection and their own budget. Because clients share the queue too, one client's burst can make another client's call wait, or fail once the queue is full.
 
 ### Defaults
 
-Out of the box, every upstream gets `{ maxCalls: 30, windowSeconds: 6 }` — averaging 5 calls per second, smoothed across a 6-second window. This protects upstreams the user didn't think to configure; the first time the default actually blocks a call on a given upstream, the bridge logs an INFO message naming both opt-out paths.
+Out of the box, every upstream gets `{ maxCalls: 30, windowSeconds: 6 }` — averaging 5 calls per second, smoothed across a 6-second window. This protects upstreams the user didn't think to configure; the first time the default actually blocks a call on a given upstream, the manager logs an INFO message naming both opt-out paths, and it shows in the log of every client whose config follows that default for the upstream.
 
 ### Per-server override
 
@@ -109,4 +111,13 @@ First match wins:
 4. Global `_bridge.defaultRateLimit` object → use it
 5. Otherwise → hardcoded `{ maxCalls: 30, windowSeconds: 6 }`
 
-Rate limit configuration is hot-reloadable. When a hot-reload lifts a limit (per-server or global flips to `false`) while calls are queued, those queued calls fire immediately instead of erroring — the user's intent was to remove the throttle.
+Rate limit configuration is hot-reloadable, for every client at once and without restarting the server. A call waiting for its turn follows the config's server:
+
+- when a reload lifts the limit (per-server or global flips to `false`), the call runs at once instead of erroring — the user's intent was to remove the throttle;
+- when a reload changes the limit, the call waits under the new one; the calls made within the window still count, unless another config already uses the new limit on that connection, in which case its budget applies as it stands;
+- when a reload changes how the server is started or connected, the call waits for a turn on the new connection;
+- when a reload removes the server, the call fails at once.
+
+A call that waits again this way starts its 60-second timeout again.
+
+A call that waited for its turn is checked against the tool policy again before it runs, so a reload that disables its tool meanwhile stops it.

@@ -494,6 +494,9 @@ export class ManagerDaemon {
       case "CALL_TOOL":
         if (channel === undefined) return errorResponse(req.id, ERROR_CODE_INVALID_REQUEST, "CALL_TOOL requires a channel");
         return this.instances.handleCallTool(req.id, req.params, channel);
+      case "SEARCH_TOOLS":
+        if (channel === undefined) return errorResponse(req.id, ERROR_CODE_INVALID_REQUEST, "SEARCH_TOOLS requires a channel");
+        return this.instances.handleSearchTools(req.id, req.params, channel);
       case "RETRY":
         if (channel === undefined) return errorResponse(req.id, ERROR_CODE_INVALID_REQUEST, "RETRY requires a channel");
         return this.instances.handleRetry(req.id, req.params, channel);

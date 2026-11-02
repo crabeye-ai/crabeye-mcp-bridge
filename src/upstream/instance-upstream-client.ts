@@ -3,6 +3,7 @@ import { notInDaemonConfig, type UpstreamSnapshot } from "../daemon/protocol.js"
 import { canonicalize } from "./upstream-hash.js";
 import type { UpstreamLink } from "./instance-link.js";
 import type {
+  CallToolOptions,
   ConnectionStatus,
   StatusChangeCallback,
   StatusChangeEvent,
@@ -89,14 +90,11 @@ export class InstanceUpstreamClient implements UpstreamClient {
     if (this._status !== "connected") throw new Error(`Cannot ping: client "${this.name}" is not connected`);
   }
 
-  async callTool(
-    params: { name: string; arguments?: Record<string, unknown> },
-    options?: { signal?: AbortSignal },
-  ): Promise<CallToolResult> {
+  async callTool(params: { name: string; arguments?: Record<string, unknown> }, options?: CallToolOptions): Promise<CallToolResult> {
     if (this._status !== "connected") {
       throw new Error(`Cannot call tool "${params.name}": client "${this.name}" is not connected`);
     }
-    return this._link.callTool(this.name, params, options?.signal);
+    return this._link.callTool(this.name, params, options);
   }
 
   async close(): Promise<void> {

@@ -103,6 +103,15 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
     return results.flatMap((r) => r.providers.flatMap((p) => p.tools.map((tool) => tool.tool_name))).sort();
   }
 
+  async function searchFailure(bridge: BridgeProcess): Promise<string> {
+    const result = (await bridge.client.callTool({ name: "search_tools", arguments: { queries: [{ provider: "svc" }] } })) as {
+      content: Array<{ text: string }>;
+      isError?: boolean;
+    };
+    expect(result.isError).toBe(true);
+    return result.content[0]!.text;
+  }
+
   it.each(["modern", "legacy"] as const)("starts the daemon for an HTTP-only config and gives two clients one %s connection, shown by daemon status", async (era) => {
     const server = await upstream({ era });
     const configPath = await workspace({ svc: { url: server.url } });
@@ -187,8 +196,7 @@ describe.skipIf(process.platform === "win32")("bridges sharing HTTP upstreams th
 
     expect(failure("svc")).toBe("daemon did not become reachable within timeout");
     expect(failure("svc")).toBe(failure("stub"));
-    expect(await searchedTools(bridge, "svc")).toEqual([]);
-    expect(await searchedTools(bridge, "stub")).toEqual([]);
+    expect(await searchFailure(bridge)).toBe("Error: tools can't be searched: daemon did not become reachable within timeout");
     const [http, stdio] = await Promise.all([runTool(bridge, "svc__echo"), runTool(bridge, "stub__plain")]);
     expect(http).toEqual(errorResult('Upstream server "svc" is unavailable; reconnecting in the background. Please retry shortly.'));
     expect(stdio).toEqual(errorResult('Upstream server "stub" is unavailable; reconnecting in the background. Please retry shortly.'));

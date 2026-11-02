@@ -4,6 +4,7 @@ import type { CallToolRequest } from "@modelcontextprotocol/client";
 import { BridgeServer } from "../../src/server/bridge-server.js";
 import { transportKeepingFirstMessageHandler } from "../_helpers/transports.js";
 import { spyLogger } from "../_helpers/spy-logger.js";
+import { localSearch } from "../_helpers/local-search.js";
 
 async function settle(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
@@ -22,7 +23,7 @@ describe("tool calls as a modern client's first request when the transport drops
 
   async function connectModern(): Promise<{ client: Client; started: () => boolean; clientsLogged: () => number }> {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     server = bridge;
     let started = false;
     void bridge.sessionStarted().then(() => {

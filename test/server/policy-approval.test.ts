@@ -14,6 +14,7 @@ import {
 } from "../../src/server/policy-approval.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
 import { errorResult, viaRunTool } from "../_helpers/run-tool.js";
+import { localSearch } from "../_helpers/local-search.js";
 
 const NO_ELICITATION = errorResult("Tool linear__create_issue requires confirmation but the client does not support elicitation");
 
@@ -72,6 +73,7 @@ async function pairWithPolicy(opts: {
 
   const server = new BridgeServer({
     toolRegistry: registry,
+    search: localSearch(registry),
     policyEngine: new PolicyEngine("always", {
       linear: { toolPolicy: opts.policy },
     }),
@@ -153,7 +155,7 @@ describe.each(["legacy", "modern"] as const)(
       expect(upstream.callTool).toHaveBeenCalledWith({
         name: "create_issue",
         arguments: { title: "Bug" },
-      }, { signal: expect.any(AbortSignal) });
+      }, { signal: expect.any(AbortSignal), approved: true });
 
       await cleanup();
     });

@@ -172,6 +172,8 @@ Pass multiple query objects to search for different things in a single call. Res
 
 The first query returns tool details (has `tool` filter), the second returns a provider summary, and the third returns expanded tool details for design tools. Each query produces its own result set with independent pagination.
 
+A search takes at most 64 queries, and a `tool`, `provider` or `category` term of at most 1 KiB. Only the first 16,384 characters of a tool's description are searched, though results show all of it, and a word is matched by its first 64 characters. A tool whose name on its server is longer than 1,024 bytes isn't found, as it can't be called. A search that runs longer than 2 seconds stops with an error asking for simpler regexes or fewer queries.
+
 ### Running a tool without searching
 
 If the assistant already knows the namespaced name, it can skip the search and call `run_tool` right away:
@@ -221,3 +223,5 @@ For precise matching, prefix the tool query with `regex:`:
 ```
 
 This finds all tools whose name starts with `list_` — across every server.
+
+A regex is matched in time that grows only with the pattern and the text it is matched against, so one search can't hold up the [manager](stdio-manager.md) for every client. A pattern that can't be matched that way is searched as plain text instead: one with a backreference, a lookahead, a Unicode property escape such as `\p{L}`, an inline flag such as `(?i:…)`, or a counted repeat above 16 such as `{17}`, and one with the `u` or `v` flag. `/pattern/i` ignores case, but an escaped letter written in octal, or a class range such as `[A-z]`, isn't matched in both cases, and a range such as `[Z-a]`, which runs backwards once lower-cased, makes the pattern plain text. Patterns longer than 200 characters are searched as plain text too. See [Multiple queries](#multiple-queries) for the limits on a search.

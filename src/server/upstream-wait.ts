@@ -1,36 +1,20 @@
 import type { UpstreamClient } from "../upstream/types.js";
 import type { Logger } from "../logging/index.js";
-import { APP_NAME } from "../constants.js";
+import { cancelledError, reauthorizationError, removedError, unavailableError } from "../upstream/call-errors.js";
 
 export const WAIT_FOR_RESPAWN_MS = 30_000;
 
-export interface UpstreamWaitOptions {
-  getClient: (name: string) => UpstreamClient | undefined;
+/** The part of a client that waiting for it to connect needs. */
+export type WaitableClient = Pick<UpstreamClient, "name" | "status" | "retryNow" | "onStatusChange">;
+
+export interface UpstreamWaitOptions<C extends WaitableClient = UpstreamClient> {
+  getClient: (name: string) => C | undefined;
   onClientsChanged?: (listener: () => void) => () => void;
   signal?: AbortSignal;
   logger?: Logger;
 }
 
 type WaitOutcome = "changed" | "timeout" | "cancelled";
-
-export function reauthorizationError(source: string, serverName: string): Error {
-  return new Error(
-    `Upstream server "${source}" needs re-authorization. Run: ${APP_NAME} auth ${serverName} ` +
-      "(or update its configured credentials if it does not use OAuth).",
-  );
-}
-
-export function cancelledError(): Error {
-  return new Error("Request cancelled");
-}
-
-export function removedError(source: string): Error {
-  return new Error(`Upstream server "${source}" was removed from the configuration`);
-}
-
-function unavailableError(source: string): Error {
-  return new Error(`Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`);
-}
 
 export async function untilSettledOrCancelled(work: Promise<void>, signal: AbortSignal): Promise<void> {
   if (signal.aborted) throw cancelledError();
@@ -46,16 +30,16 @@ export async function untilSettledOrCancelled(work: Promise<void>, signal: Abort
   }
 }
 
-export async function awaitConnectedClient(source: string, options: UpstreamWaitOptions): Promise<UpstreamClient> {
+export async function awaitConnectedClient<C extends WaitableClient>(source: string, options: UpstreamWaitOptions<C>): Promise<C> {
   const deadline = Date.now() + WAIT_FOR_RESPAWN_MS;
   let waiting = false;
-  let retried: UpstreamClient | undefined;
+  let retried: C | undefined;
   for (;;) {
     if (options.signal?.aborted) throw cancelledError();
     const client = options.getClient(source);
     if (!client) throw removedError(source);
     if (client.status === "connected") {
-      if (waiting) options.logger?.info("server reconnected, executing tool call", { component: "bridge", server: source });
+      if (waiting) options.logger?.info("server reconnected, executing tool call", { server: source });
       return client;
     }
     if (client !== retried) {
@@ -64,7 +48,7 @@ export async function awaitConnectedClient(source: string, options: UpstreamWait
     }
     if (client.status === "auth_required") throw reauthorizationError(source, client.name);
     if (!waiting) {
-      options.logger?.info("waiting for server to reconnect", { component: "bridge", server: source });
+      options.logger?.info("waiting for server to reconnect", { server: source });
       waiting = true;
     }
     const outcome = await nextChange(client, deadline - Date.now(), options);
@@ -73,7 +57,7 @@ export async function awaitConnectedClient(source: string, options: UpstreamWait
   }
 }
 
-function nextChange(client: UpstreamClient, timeoutMs: number, options: UpstreamWaitOptions): Promise<WaitOutcome> {
+function nextChange<C extends WaitableClient>(client: C, timeoutMs: number, options: UpstreamWaitOptions<C>): Promise<WaitOutcome> {
   const { onClientsChanged, signal } = options;
   return new Promise<WaitOutcome>((resolve) => {
     const cleanups: Array<() => void> = [];

@@ -71,25 +71,15 @@ export class UpstreamManager {
       : (serverConfig as HttpServerConfig).type;
     log.info(`connecting (${transport})`);
 
-    return this._connect(this._register(name, serverConfig, log), name, log);
+    return this._connect(this._register(name, log), name, log);
   }
 
-  private _register(name: string, serverConfig: ServerConfig, log: Logger): Registered {
+  private _register(name: string, log: Logger): Registered {
     const registered: Registered = { client: this._clientFactory(name), unsubscribers: [] };
     this._clients.set(name, registered);
-    this._applyCategory(name, serverConfig);
     this._wireSubscriptions(name, registered, log);
     this._notifyClientsChanged();
     return registered;
-  }
-
-  private _applyCategory(name: string, serverConfig: ServerConfig): void {
-    const category = serverConfig._bridge?.category;
-    if (category) {
-      this._toolRegistry.setCategoryForSource(name, category);
-    } else {
-      this._toolRegistry.removeCategoryForSource(name);
-    }
   }
 
   private _wireSubscriptions(name: string, registered: Registered, log: Logger): void {
@@ -185,11 +175,8 @@ export class UpstreamManager {
       }
     }
 
-    // 3. Update changed servers
-    for (const { name, config } of diff.servers.changed) {
-      this._logger.info(`server changed`, { component: "reload", server: name });
-      this._applyCategory(name, config);
-    }
+    // 3. Log changed servers
+    for (const { name } of diff.servers.changed) this._logger.info(`server changed`, { component: "reload", server: name });
 
     this._config = newConfig;
   }

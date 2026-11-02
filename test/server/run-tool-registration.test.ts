@@ -8,9 +8,9 @@ import { BaseUpstreamClient } from "../../src/upstream/base-client.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { BridgeServer } from "../../src/server/bridge-server.js";
-import { ToolSearchService } from "../../src/search/index.js";
 import { transportKeepingFirstMessageHandler } from "../_helpers/transports.js";
 import { errorResult } from "../_helpers/run-tool.js";
+import { localSearch } from "../_helpers/local-search.js";
 
 function inMemoryUpstream(): InMemoryTransport {
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -61,7 +61,7 @@ describe("upstream registration", () => {
     startManager(servers, toolRegistry);
     const server = new BridgeServer({
       toolRegistry,
-      toolSearchService: new ToolSearchService(toolRegistry),
+      search: localSearch(toolRegistry),
       getUpstreamClient: (name) => manager.getClient(name),
       onClientsChanged: (listener) => manager.onClientsChanged(listener),
     });

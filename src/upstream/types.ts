@@ -34,6 +34,12 @@ export interface StatusChangeEvent {
 export type StatusChangeCallback = (event: StatusChangeEvent) => void;
 export type ToolsChangedCallback = (tools: ReadonlyArray<Tool>) => void;
 
+export interface CallToolOptions {
+  signal?: AbortSignal;
+  /** The bridge's client approved the call; only the manager's stand-ins pass it on. */
+  approved?: boolean;
+}
+
 export interface UpstreamClient {
   readonly name: string;
   readonly status: ConnectionStatus;
@@ -46,10 +52,7 @@ export interface UpstreamClient {
   readonly instructions?: string;
 
   connect(): Promise<void>;
-  callTool(
-    params: { name: string; arguments?: Record<string, unknown> },
-    options?: { signal?: AbortSignal },
-  ): Promise<CallToolResult>;
+  callTool(params: { name: string; arguments?: Record<string, unknown> }, options?: CallToolOptions): Promise<CallToolResult>;
   close(): Promise<void>;
 
   ping(timeoutMs?: number): Promise<void>;

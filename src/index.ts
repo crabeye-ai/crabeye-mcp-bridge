@@ -7,21 +7,13 @@ import {
   ConfigWatcher,
 } from "./config/index.js";
 import { loadMergedConfig } from "./config/merged-loader.js";
-import { findSelfReferences, resolveUpstreams, isHttpServer, isStdioServer } from "./config/schema.js";
+import { findSelfReferences, resolveUpstreams, isHttpServer, isStdioServer, serverBridgeConfigs } from "./config/schema.js";
 import { warnRemovedSettings } from "./config/removed-settings.js";
 import { launchedByAnotherBridge } from "./upstream/launch-guard.js";
-import type {
-  BridgeConfig,
-  ServerBridgeConfig,
-  ServerConfig,
-  HttpServerConfig,
-} from "./config/schema.js";
+import type { BridgeConfig, HttpServerConfig } from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
-import type { RateLimiter } from "./server/rate-limiter.js";
-import { applyRateLimiters } from "./server/rate-limit-resolution.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { renderPassthrough } from "./server/passthrough.js";
-import { ToolSearchService } from "./search/index.js";
 import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { InstanceLink, instanceSourceFor } from "./upstream/instance-link.js";
@@ -57,18 +49,6 @@ function logSelfReferences(config: BridgeConfig, logger: Logger): void {
   }
 }
 
-function buildServerBridgeConfigs(
-  upstreams: Record<string, ServerConfig>,
-): Record<string, ServerBridgeConfig> {
-  const result: Record<string, ServerBridgeConfig> = {};
-  for (const [name, serverConfig] of Object.entries(upstreams)) {
-    if ("_bridge" in serverConfig && serverConfig._bridge) {
-      result[name] = serverConfig._bridge;
-    }
-  }
-  return result;
-}
-
 const program = new Command();
 
 program
@@ -84,9 +64,7 @@ program
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
-    let toolSearchService: ToolSearchService | undefined;
     let configWatcher: ConfigWatcher | undefined;
-    const rateLimiters = new Map<string, RateLimiter>();
 
     try {
       // Config resolution: --config / MCP_BRIDGE_CONFIG → single-file load,
@@ -168,45 +146,26 @@ program
       }
 
       const daemonSettings = config._bridge.daemon;
-      upstreamManager = new UpstreamManager({
-        config,
-        toolRegistry,
+      const instanceLink = new InstanceLink({
+        source: instanceSourceFor(explicitPath),
+        env: instanceEnvFrom(process.env),
+        childEnv: childEnvFrom(process.env),
         logger,
-        instanceLink: new InstanceLink({
-          source: instanceSourceFor(explicitPath),
-          env: instanceEnvFrom(process.env),
-          childEnv: childEnvFrom(process.env),
-          logger,
-          rpcTimeoutMs: daemonSettings.rpcTimeoutMs,
-          heartbeatMs: daemonSettings.heartbeatMs,
-          respawnLockWaitMs: daemonSettings.respawnLockWaitMs,
-          reconnect: config._bridge.reconnect,
-        }),
+        rpcTimeoutMs: daemonSettings.rpcTimeoutMs,
+        heartbeatMs: daemonSettings.heartbeatMs,
+        respawnLockWaitMs: daemonSettings.respawnLockWaitMs,
+        reconnect: config._bridge.reconnect,
       });
+      upstreamManager = new UpstreamManager({ config, toolRegistry, logger, instanceLink });
 
-      const serverBridgeConfigs = buildServerBridgeConfigs(upstreams);
-
-      const policyEngine = new PolicyEngine(
-        config._bridge.toolPolicy,
-        serverBridgeConfigs,
-      );
-
-      toolSearchService = new ToolSearchService(toolRegistry, policyEngine);
-
-      applyRateLimiters({
-        upstreams,
-        global: config._bridge,
-        rateLimiters,
-        logger,
-      });
+      const policyEngine = new PolicyEngine(config._bridge.toolPolicy, serverBridgeConfigs(upstreams));
 
       server = new BridgeServer({
         toolRegistry,
-        toolSearchService,
+        search: (params) => instanceLink.search(params),
         policyEngine,
         logger,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
-        getRateLimiter: (name) => rateLimiters.get(name),
         onClientsChanged: (listener) => upstreamManager!.onClientsChanged(listener),
         showStats: options.stats === true,
         onSearchStats: (stats) => {
@@ -256,22 +215,12 @@ program
 
         // Always update the policy engine with the full new state
         const newUpstreams = resolveUpstreams(newConfig);
-        const newBridgeConfigs = buildServerBridgeConfigs(newUpstreams);
+        const newBridgeConfigs = serverBridgeConfigs(newUpstreams);
         policyEngine.update(newConfig._bridge.toolPolicy, newBridgeConfigs);
 
         if (diff.bridge.toolPolicy) {
           logger.info(`tool policy changed to ${diff.bridge.toolPolicy}`, { component: "reload" });
         }
-
-        // Update rate limiters from new config. The helper handles every
-        // transition: new/changed/removed limit, drain-on-disable, and
-        // upstream-removed.
-        applyRateLimiters({
-          upstreams: newUpstreams,
-          global: newConfig._bridge,
-          rateLimiters,
-          logger,
-        });
 
         // Server-level changes
         const hasServerChanges =
@@ -341,11 +290,6 @@ program
       setTimeout(() => process.exit(exitCode), SHUTDOWN_DEADLINE_MS).unref();
       try {
         configWatcher?.stop();
-        toolSearchService?.dispose();
-        for (const rl of rateLimiters.values()) {
-          rl.dispose();
-        }
-        rateLimiters.clear();
         if (upstreamManager) {
           await upstreamManager.closeAll();
         }

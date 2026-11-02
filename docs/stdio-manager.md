@@ -48,7 +48,13 @@ A config's connections and STDIO servers stay in use while a bridge uses that co
 
 If the manager is stopped or replaced while a call is running, that call fails with `daemon shutdown`, or with `daemon connection closed` when the manager crashes or is killed. The bridge starts a new manager, which starts and connects every server again, and later calls go through without restarting the client. A tool result too large for the manager to pass on (over 16 MB) fails with an error saying so.
 
-What `search_tools` and `run_tool` show doesn't change: each bridge still applies its own tool policy, rate limits and passthrough settings. Cancelling a call cancels it at the server, and each server's instructions reach every client.
+What `search_tools` and `run_tool` show doesn't change, except:
+
+* `search_tools` returns an error when the manager can't be reached, as `run_tool` does;
+* a regex the manager can't match in linear time is searched as plain text (see [Regex search](how-it-works.md#regex-search));
+* a search has limits on its size and running time (see [Multiple queries](how-it-works.md#multiple-queries)).
+
+The manager keeps one search index for each copy of a config, which every bridge using that copy searches, and enforces each server's rate limit once for every client (see [Rate limiting](policies.md#rate-limiting)). Each bridge still asks its own client to approve calls the tool policy marks `prompt`, and applies its passthrough settings. Cancelling a call cancels it at the server, and each server's instructions reach every client.
 
 ## HTTP and SSE upstreams
 
@@ -76,7 +82,7 @@ The manager:
 * reads a `clientSecret` from the variables of the client the connection is for, never from its own environment;
 * connects a server again for every bridge as soon as `crabeye-mcp-bridge auth <server>` or `auth --remove <server>` changes its stored credentials.
 
-When an HTTP or SSE server's URL, headers or `_bridge.auth` change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Everything else in that file takes effect for each client when that client restarts. The same goes for a STDIO server's settings and the global `_bridge.reconnect` in that file: the manager follows edits to the client config files it lists and to a `--config` file, but reads `config.json` itself again only when a client starts.
+When an HTTP or SSE server's URL, headers or `_bridge.auth` change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Rate limits and categories in that file likewise apply to every client of a config once any of its clients restarts, and so does a tool policy that disables a tool or asks for approval; one that allows more applies to each client when it restarts. Everything else in that file takes effect for each client when that client restarts. The same goes for a STDIO server's settings and the global `_bridge.reconnect` in that file: the manager follows edits to the client config files it lists and to a `--config` file, but reads `config.json` itself again only when a client starts.
 
 The [manager log](#manager-log) records what happens to these upstreams. Their warnings and errors also show in the log of each bridge using them (the AI client's MCP log), tagged with the server name. A warning that is only given once, such as the `"sse"` deprecation, shows in the bridges using the upstream at that moment.
 
@@ -142,7 +148,7 @@ All knobs live under `_bridge.daemon.*` in the bridge config:
 | `idleMs` | `60000` | A config's connections and STDIO servers are let go this long after the last bridge using it disconnects, unless another config still uses them. The manager exits this long after it has nothing left. |
 | `graceMs` | `60000` | A STDIO server keeps running this long after the last config using it is let go, in case a bridge starts using it again. |
 | `rpcTimeoutMs` | `30000` | How long a bridge waits for the manager to answer when it connects to it and checks on it. A manager that doesn't answer a check in time is replaced. |
-| `heartbeatMs` | `5000` | How often a bridge checks that the manager is still answering. A manager that misses three checks in a row is replaced, even when no call is running. |
+| `heartbeatMs` | `5000` | How often a bridge checks that the manager is still answering. A manager that misses three checks in a row is replaced, even when no call is running. A search can keep the manager from answering for up to 2 seconds, so values below about 700 can get a busy manager replaced. |
 
 `rpcTimeoutMs` and `heartbeatMs` apply to each bridge's one connection to the manager, whatever servers it uses. The manager exits roughly `2 × idleMs + graceMs` (≈3 min by default) after the last bridge disconnects, or `2 × idleMs` when it ran no STDIO server.
 
@@ -154,7 +160,7 @@ The manager follows edits to the client config files and `--config` files it loa
 
 2. **A change that only renames a server, or adds a second name for the same command,** keeps the running server.
 
-3. **A change to nothing the manager starts the server with** (e.g. you only edited `_bridge.toolPolicy`, or you upgraded the server's program on disk in place) keeps the running server. The bridge picks up the policy change, but running the new program needs:
+3. **A change to nothing the manager starts the server with** (e.g. you only edited `_bridge.toolPolicy`, or you upgraded the server's program on disk in place) keeps the running server. Changes to tool policies, categories and rate limits apply to every client at once, but running the new program needs:
 
    ```bash
    crabeye-mcp-bridge daemon restart-upstream <upstreamHash>
@@ -205,6 +211,7 @@ The log records:
 * waiting for a previous manager to exit, and taking over from one that is no longer running;
 * the STDIO servers a bridge from crabeye 1.3.0 or earlier asks for being refused, at most once a minute, with how many;
 * bridges attaching to and detaching from a config, a config that can't be loaded (and why), servers added, removed or reconnected after an edit, and servers connected again after `crabeye-mcp-bridge auth` or `auth --remove`;
+* a server's default rate limit first making a call wait, with how to change or turn it off (see [Defaults](policies.md#defaults));
 * HTTP and SSE upstreams connecting, failing to connect, being paused for authorization, failing health checks, and their other warnings;
 * STDIO servers starting, failing to connect, exiting on their own (with their exit code or signal), and being stopped (idle, not answering pings, restarted, shutting down, or after quitting when asked which protocol versions they speak).
 

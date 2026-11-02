@@ -285,6 +285,13 @@ export type GlobalBridgeConfig = z.infer<typeof GlobalBridgeConfigSchema>;
 export type DaemonConfig = z.infer<typeof DaemonConfigSchema>;
 export type BridgeConfig = z.infer<typeof BridgeConfigSchema>;
 
+/** The `_bridge` settings of each server that has them, by name, as the policy engine reads them. */
+export function serverBridgeConfigs(servers: Record<string, ServerConfig>): Record<string, ServerBridgeConfig> {
+  const configs: Record<string, ServerBridgeConfig> = {};
+  for (const [name, config] of Object.entries(servers)) if (config._bridge !== undefined) configs[name] = config._bridge;
+  return configs;
+}
+
 // --- Upstream resolution ---
 
 /**

@@ -13,6 +13,7 @@ import { runToolDefinition, searchToolDefinition } from "../../src/search/index.
 import { ClientMetadata, type HandshakeSource } from "../../src/server/client-metadata.js";
 import { spyLogger, type SpyLogger } from "../_helpers/spy-logger.js";
 import { viaRunTool } from "../_helpers/run-tool.js";
+import { localSearch } from "../_helpers/local-search.js";
 
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const expectedProtocolVersion: Record<ProtocolEra, string> = {
@@ -49,7 +50,7 @@ function burstOfRequests(client: Client) {
 describe.each(["legacy", "modern"] as const)("client identity logging (%s era)", (era) => {
   it("logs the client once per connection under concurrent requests", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const client = await connectClient(bridge, era);
 
     await burstOfRequests(client);
@@ -71,7 +72,7 @@ describe.each(["legacy", "modern"] as const)("client identity logging (%s era)",
 
   it("logs again for a new connection", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
 
     const first = await connectClient(bridge, era, "first");
     await first.listTools();
@@ -94,7 +95,7 @@ describe.each(["legacy", "modern"] as const)("client identity logging (%s era)",
 describe("client identity logging on a legacy connection", () => {
   it("logs at initialize, before any tools request", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const client = await connectClient(bridge, "legacy");
 
     expect(clientConnectedLines(logger)).toHaveLength(1);
@@ -105,7 +106,7 @@ describe("client identity logging on a legacy connection", () => {
 
   it("logs the handshake identity, not identity keys in request _meta", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const client = await connectClient(bridge, "legacy");
 
     await client.listTools({
@@ -128,7 +129,7 @@ describe("client identity logging on a legacy connection", () => {
 
   it("ignores identity keys in request _meta when the handshake names no client", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const client = await connectClient(bridge, "legacy", "");
 
     await client.listTools({
@@ -143,7 +144,7 @@ describe("client identity logging on a legacy connection", () => {
 
   it("stays silent and keeps serving when the client sends an empty clientInfo", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const client = await connectClient(bridge, "legacy", "");
 
     await expect(client.listTools()).resolves.toEqual({ tools: [searchToolDefinition, runToolDefinition] });
@@ -186,7 +187,7 @@ describe("client identity logging on a modern connection", () => {
 
   it("logs when the first request is a tool call", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const client = await connectClient(bridge, "modern");
 
     await callMissingTool(client);
@@ -199,7 +200,7 @@ describe("client identity logging on a modern connection", () => {
 
   it("waits for a request that names the client, then logs it once", async () => {
     const logger = spyLogger();
-    const bridge = new BridgeServer({ logger });
+    const bridge = new BridgeServer({ logger, search: localSearch() });
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await bridge.connect(serverSide);
     await clientSide.start();

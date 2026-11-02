@@ -10,8 +10,9 @@ import { netTransport } from "../../src/daemon/net-transport.js";
 import { encodeFrame, FrameDecoder, type StatusResult, type UpstreamSnapshot } from "../../src/daemon/protocol.js";
 import { getBridgeConfigPath } from "../../src/config/bridge-config.js";
 import { InstanceLink, instanceSourceFor, type UpstreamView } from "../../src/upstream/instance-link.js";
+import { CallRefusedError } from "../../src/upstream/call-errors.js";
 import { spawnTestManager, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
-import { ScriptedUpstreamClient } from "../_helpers/scripted-upstream-client.js";
+import { ScriptedUpstreamClient, tool } from "../_helpers/scripted-upstream-client.js";
 import { recordingLogger, type LoggedLine } from "../_helpers/spy-logger.js";
 import type { Logger } from "../../src/logging/index.js";
 
@@ -121,6 +122,48 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
     expect(view.events).toEqual(["snapshot:connected"]);
   });
 
+  it("runs a call to a tool whose policy needs approval only when the bridge says its client approved it", async () => {
+    servers = { svc: { url: "https://svc.example.com/mcp", _bridge: { toolPolicy: "prompt" } } };
+    const l = link();
+    await l.attach();
+
+    await expect(l.callTool("svc", { name: "search" })).rejects.toEqual(
+      new CallRefusedError("Tool svc__search now requires confirmation after a configuration change; please retry"),
+    );
+    expect(await l.callTool("svc", { name: "search" }, { approved: true })).toEqual({ content: [{ type: "text", text: "called search" }] });
+    expect(clients.find((c) => c.name === "svc")!.calls).toHaveLength(1);
+  });
+
+  it("attaches first when asked to search before attaching, then answers from the instance", async () => {
+    const l = link();
+
+    const result = await l.search({ queries: [{ provider: "svc" }] });
+
+    expect(l.isAttached).toBe(true);
+    expect(result.results).toEqual([expect.objectContaining({ providers: [], total: 0 })]);
+    clients.find((c) => c.name === "svc")!.setTools([tool("create_issue")]);
+    await vi.waitFor(async () => {
+      const { results } = await l.search({ queries: [{ provider: "svc", expand_tools: true }] });
+      expect(results[0]!.providers.flatMap((provider) => provider.tools.map((t) => t.tool_name))).toEqual(["svc__create_issue"]);
+    });
+  });
+
+  it("doesn't attach again for a search right after a failed attempt, answering with that failure", async () => {
+    let attempts = 0;
+    const l = link({
+      reconnect: { reconnectBaseDelay: 60_000, reconnectMaxDelay: 60_000 },
+      _ensureDaemon: async () => {
+        attempts++;
+        throw new Error("daemon unreachable");
+      },
+    });
+    await expect(l.attach()).rejects.toThrow("daemon unreachable");
+
+    await expect(l.search({ queries: [{ provider: "svc" }] })).rejects.toThrow("daemon unreachable");
+
+    expect(attempts).toBe(1);
+  });
+
   it("tells stand-ins about the snapshots it gets while attaching only once attached, so a call made then can go through", async () => {
     const l = link();
     const attachedWhenTold: boolean[] = [];
@@ -163,14 +206,14 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
         }),
       );
     const controller = new AbortController();
-    const call = l.callTool("svc", { name: "slow" }, controller.signal);
+    const call = l.callTool("svc", { name: "slow" }, { signal: controller.signal });
     await vi.waitFor(() => expect(svc.calls).toHaveLength(1));
 
     controller.abort(new Error("Request cancelled"));
 
     await expect(call).rejects.toThrow("Request cancelled");
     await vi.waitFor(() => expect(upstreamAborted).toBe(true));
-    await expect(l.callTool("svc", { name: "slow" }, controller.signal)).rejects.toThrow("Request cancelled");
+    await expect(l.callTool("svc", { name: "slow" }, { signal: controller.signal })).rejects.toThrow("Request cancelled");
     expect(svc.calls).toHaveLength(1);
   });
 
@@ -327,7 +370,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
   });
 });
 
-describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daemon that answers in one write", () => {
+describe.skipIf(process.platform === "win32")("InstanceLink against a daemon that answers in one write", () => {
   let dir: string;
   let server: Server;
   let retryAnswer: (id: string) => Buffer;
@@ -354,6 +397,8 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
             sock.write(encodeFrame({ id: request.id, result: { upstreams: ["svc"] } }));
           } else if (request.method === "RETRY") {
             sock.write(retryAnswer(request.id));
+          } else if (request.method === "SEARCH_TOOLS") {
+            sock.write(encodeFrame({ id: request.id, result: {} }));
           }
         }
       });
@@ -379,6 +424,12 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
 
     expect(await link.retry("svc")).toMatchObject({ status: "disconnected", error: "reset" });
     expect(link.snapshot("svc")).toMatchObject({ status: "disconnected" });
+  });
+
+  it("rejects a search reply without results", async () => {
+    await link.attach();
+
+    await expect(link.search({ queries: [{ provider: "svc" }] })).rejects.toThrow("malformed SEARCH_TOOLS reply");
   });
 
   it("rejects a reply that isn't a snapshot", async () => {
@@ -419,6 +470,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
     const lines: LoggedLine[] = [];
     onAttach = [
       encodeFrame({ method: "LOG", params: { upstream: "svc", level: "trace", message: "from a newer manager" } }),
+      encodeFrame({ method: "LOG", params: { upstream: "svc", level: "info", message: "default rate limit reached" } }),
       encodeFrame({ method: "LOG", params: { upstream: "svc", level: "warn", message: "STDIO server exited with code 1", stderr: ["boom"] } }),
       encodeFrame({ method: "LOG", params: { upstream: "svc", level: "warn", message: "bad stderr", stderr: "boom" } }),
     ];
@@ -431,6 +483,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink.retry against a daem
 
     expect(lines).toEqual([
       { level: "debug", message: "from a newer manager", context: { component: "upstream", server: "svc" } },
+      { level: "info", message: "default rate limit reached", context: { component: "upstream", server: "svc" } },
       { level: "warn", message: "STDIO server exited with code 1", context: { component: "upstream", server: "svc", stderr: ["boom"] } },
     ]);
   });

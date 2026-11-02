@@ -1,10 +1,5 @@
-export {
-  ToolSearchService,
-  SEARCH_TOOL_NAME,
-  RUN_TOOL_NAME,
-  searchToolDefinition,
-  runToolDefinition,
-} from "./tool-search-service.js";
+export { ToolSearchService } from "./tool-search-service.js";
+export { SEARCH_TOOL_NAME, RUN_TOOL_NAME, searchToolDefinition, runToolDefinition } from "./tool-definitions.js";
 export type {
   SearchQuery,
   SearchToolsParams,
@@ -13,4 +8,4 @@ export type {
   SearchToolResult,
   ProviderResult,
   QueryResult,
-} from "./tool-search-service.js";
+} from "./types.js";

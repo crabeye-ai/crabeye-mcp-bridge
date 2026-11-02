@@ -27,6 +27,7 @@ function spec(overrides: SpecOverrides = {}): PoolSpec {
     key: overrides.key ?? "k1",
     name,
     healthCheckIntervalSec: overrides.healthCheckIntervalSec ?? 0,
+    rateLimit: { kind: "disabled" },
     http: {
       config: HttpServerConfigSchema.parse({ url: "https://mcp.example.com/mcp" }),
       credentialStore: store,

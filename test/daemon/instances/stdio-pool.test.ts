@@ -15,6 +15,7 @@ function stdioSpec(name = "svc", key = "k1"): PoolSpec {
     key,
     name,
     healthCheckIntervalSec: 0,
+    rateLimit: { kind: "disabled" },
     stdio: { config: StdioServerConfigSchema.parse({ command: "node" }), childEnv: {}, credentialStore: {} as CredentialStore, reconnect: {} },
   };
 }

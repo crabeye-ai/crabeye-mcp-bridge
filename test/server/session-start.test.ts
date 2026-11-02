@@ -3,6 +3,7 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/client";
 import { BridgeServer } from "../../src/server/bridge-server.js";
 import { transportKeepingFirstMessageHandler } from "../_helpers/transports.js";
+import { localSearch } from "../_helpers/local-search.js";
 
 const VERSION_PROBE: JSONRPCMessage = {
   jsonrpc: "2.0",
@@ -54,7 +55,7 @@ describe("BridgeServer session start", () => {
   async function connectBridge(
     wrap: (transport: Transport) => Transport = (transport) => transport,
   ): Promise<{ started: () => boolean; clientSide: InMemoryTransport }> {
-    server = new BridgeServer();
+    server = new BridgeServer({ search: localSearch() });
     let started = false;
     void server.sessionStarted().then(() => {
       started = true;
@@ -115,7 +116,7 @@ describe("BridgeServer session start", () => {
   });
 
   it("starts the session at once when the transport cannot report messages", async () => {
-    server = new BridgeServer();
+    server = new BridgeServer({ search: localSearch() });
 
     await server.connect(transportWithoutMessageHandler());
 

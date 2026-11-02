@@ -15,6 +15,7 @@ import {
   namespaceTool,
   parseNamespacedName,
 } from "../src/server/tool-namespacing.js";
+import { localSearch } from "./_helpers/local-search.js";
 
 const BRIDGE_TOOLS = [searchToolDefinition, runToolDefinition];
 const REAUTHORIZE_SRV =
@@ -142,6 +143,7 @@ describe("BridgeServer initialize", () => {
     const toolRegistry = new ToolRegistry();
     const server = new BridgeServer({
       toolRegistry,
+      search: localSearch(toolRegistry),
       buildPassthrough: () => "## linear\n\nUse Linear for tickets.",
     });
     const client = new Client({ name: "t", version: "0" });
@@ -161,6 +163,7 @@ describe("BridgeServer initialize", () => {
     let block = "";
     const server = new BridgeServer({
       toolRegistry,
+      search: localSearch(toolRegistry),
       buildPassthrough: () => block,
     });
 
@@ -722,6 +725,7 @@ describe("StdioServerTransport", () => {
     const bridgeServer = new BridgeServer({
       stdin,
       stdout,
+      search: localSearch(),
     });
 
     await bridgeServer.start();

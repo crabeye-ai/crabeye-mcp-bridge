@@ -58,7 +58,6 @@ describe("UpstreamManager with a daemon instance", () => {
     expect(manager.getClient("svc")).toBe(first);
     expect(first!.status).toBe("connected");
     expect(link.viewsOf("svc")).toHaveLength(1);
-    expect(registry.getCategoryForSource("svc")).toBe("tracker");
     expect(clientsChanged).not.toHaveBeenCalled();
   });
 

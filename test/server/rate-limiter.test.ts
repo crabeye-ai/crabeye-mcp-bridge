@@ -244,26 +244,8 @@ describe("RateLimiter", () => {
     });
   });
 
-  describe("drainAndDispose", () => {
-    it("resolves queued waiters in FIFO order, never rejects them", async () => {
-      const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
-      await rl.acquire(); // fill
-
-      const order: number[] = [];
-      const onReject = vi.fn();
-
-      const p1 = rl.acquire().then(() => order.push(1)).catch(onReject);
-      const p2 = rl.acquire().then(() => order.push(2)).catch(onReject);
-      const p3 = rl.acquire().then(() => order.push(3)).catch(onReject);
-
-      rl.drainAndDispose();
-      await Promise.all([p1, p2, p3]);
-
-      expect(order).toEqual([1, 2, 3]);
-      expect(onReject).not.toHaveBeenCalled();
-    });
-
-    it("dispose() (without drain) still rejects waiters with 'Rate limiter disposed'", async () => {
+  describe("dispose", () => {
+    it("rejects the waiting calls with 'Rate limiter disposed'", async () => {
       const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
       await rl.acquire();
 
@@ -279,8 +261,7 @@ describe("RateLimiter", () => {
 
     it("is idempotent", () => {
       const rl = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
-      rl.drainAndDispose();
-      expect(() => rl.drainAndDispose()).not.toThrow();
+      rl.dispose();
       expect(() => rl.dispose()).not.toThrow();
     });
   });

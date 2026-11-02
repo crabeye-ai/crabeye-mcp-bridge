@@ -12,18 +12,23 @@ import {
   type EnsureAttemptOptions,
   type LivenessFailureKind,
 } from "../daemon/index.js";
+import { DaemonRpcError } from "../daemon/client.js";
 import {
+  ERROR_CODE_CALL_REFUSED,
   PROTOCOL_VERSION,
   type AttachParams,
   type AttachResult,
   type InstanceSource,
+  type SearchToolsRequest,
+  type SearchToolsResult,
   type UpstreamLogParams,
   type UpstreamRemovedParams,
   type UpstreamSnapshot,
 } from "../daemon/protocol.js";
 import { createNoopLogger, type Logger } from "../logging/index.js";
 import { DEFAULT_RECONNECT_BASE_DELAY_MS, DEFAULT_RECONNECT_MAX_DELAY_MS } from "./base-client.js";
-import { isConnectionStatus } from "./types.js";
+import { CallRefusedError } from "./call-errors.js";
+import { isConnectionStatus, type CallToolOptions } from "./types.js";
 import type { UpstreamReconnectInputs } from "./upstream-hash.js";
 
 const NO_TIMEOUT = { timeoutMs: 0 };
@@ -143,10 +148,18 @@ export class InstanceLink {
     return latest;
   }
 
+  /** Searches the instance's tools once attached, attaching now unless an attempt just failed. */
+  async search(params: SearchToolsRequest): Promise<SearchToolsResult> {
+    await this.attachNow();
+    const reply = await this._attachedSupervisor().call("SEARCH_TOOLS", params, { timeoutMs: this._opts.rpcTimeoutMs });
+    if (!isSearchResult(reply)) throw new Error("malformed SEARCH_TOOLS reply");
+    return reply;
+  }
+
   async callTool(
     upstream: string,
     params: { name: string; arguments?: Record<string, unknown> },
-    signal?: AbortSignal,
+    { signal, approved }: CallToolOptions = {},
   ): Promise<CallToolResult> {
     if (signal?.aborted) throw abortReason(signal);
     const supervisor = this._attachedSupervisor();
@@ -167,13 +180,17 @@ export class InstanceLink {
       this._pendingCalls.add(fail);
       signal?.addEventListener("abort", onAbort, { once: true });
       supervisor
-        .call("CALL_TOOL", { callId, upstream, name: params.name, ...(params.arguments && { arguments: params.arguments }) }, NO_TIMEOUT)
+        .call(
+          "CALL_TOOL",
+          { callId, upstream, name: params.name, ...(params.arguments && { arguments: params.arguments }), ...(approved && { approved: true }) },
+          NO_TIMEOUT,
+        )
         .then(
           (result) => {
             finish();
             resolvePromise(result as CallToolResult);
           },
-          (err: unknown) => fail(toError(err)),
+          (err: unknown) => fail(callError(err)),
         );
     });
   }
@@ -388,8 +405,17 @@ function logOf(value: unknown): UpstreamLogParams | null {
   const { upstream, level, message, stderr } = value as Partial<Record<keyof UpstreamLogParams, unknown>>;
   if (stderr !== undefined && !(Array.isArray(stderr) && stderr.every((line) => typeof line === "string"))) return null;
   if (typeof upstream !== "string" || typeof message !== "string") return null;
-  const known = level === "debug" || level === "warn" || level === "error";
+  const known = level === "debug" || level === "info" || level === "warn" || level === "error";
   return { ...(value as UpstreamLogParams), level: known ? level : "debug" };
+}
+
+/** A call the manager refused comes back as the refusal, for the bridge to pass on as is. */
+function callError(err: unknown): Error {
+  return err instanceof DaemonRpcError && err.code === ERROR_CODE_CALL_REFUSED ? new CallRefusedError(err.message) : toError(err);
+}
+
+function isSearchResult(value: unknown): value is SearchToolsResult {
+  return typeof value === "object" && value !== null && Array.isArray((value as { results?: unknown }).results);
 }
 
 function toError(err: unknown): Error {

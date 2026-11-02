@@ -1,4 +1,5 @@
 import type { RateLimitConfig } from "../config/schema.js";
+import { CallRefusedError } from "../upstream/call-errors.js";
 
 export type { RateLimitConfig };
 
@@ -21,12 +22,12 @@ export interface RateLimiterOptions {
   maxQueued?: number;
   /**
    * Fires exactly once, the first time `acquire()` has to enqueue a waiter
-   * (i.e. the window was full). Reset by `setOnFirstBlock()`. Used by the
-   * wiring layer to log a one-time hint when a *default* limit first blocks
-   * a call on an upstream. The callback should be lightweight — it runs
-   * synchronously before the waiter is enqueued.
+   * (i.e. the window was full). Re-armed by `setOnFirstBlock()`. The callback
+   * should be lightweight — it runs synchronously before the waiter is enqueued.
    */
   onFirstBlock?: () => void;
+  /** When calls were made within the window before this limiter, which count against it until they leave the window. */
+  recentCalls?: readonly number[];
 }
 
 const DEFAULT_QUEUE_MULTIPLIER = 10;
@@ -35,7 +36,7 @@ function waitCancelledError(): Error {
   return new Error("Rate limit wait cancelled");
 }
 
-export class RateLimiterDisposedError extends Error {
+class RateLimiterDisposedError extends Error {
   constructor() {
     super("Rate limiter disposed");
     this.name = "RateLimiterDisposedError";
@@ -59,6 +60,13 @@ export class RateLimiter {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxQueued = opts.maxQueued ?? config.maxCalls * DEFAULT_QUEUE_MULTIPLIER;
     this.onFirstBlock = opts.onFirstBlock;
+    this.timestamps = [...(opts.recentCalls ?? [])];
+  }
+
+  /** When the calls still within the window were made, oldest first. */
+  recentCalls(): number[] {
+    this.prune();
+    return [...this.timestamps];
   }
 
   async acquire(signal?: AbortSignal): Promise<void> {
@@ -73,7 +81,7 @@ export class RateLimiter {
     // Backpressure: refuse to grow the queue past the configured cap. Bounds
     // memory + timer count when an upstream stalls under sustained burst.
     if (this.queue.length >= this.maxQueued) {
-      throw new Error("Rate limit queue full");
+      throw new CallRefusedError("Rate limit queue full");
     }
 
     if (!this.firstBlockFired) {
@@ -102,7 +110,7 @@ export class RateLimiter {
         },
         timer: setTimeout(() => {
           this.dequeue(waiter);
-          waiter.reject(new Error("Rate limit timeout: too many calls queued"));
+          waiter.reject(new CallRefusedError("Rate limit timeout: too many calls queued"));
         }, this.timeoutMs),
       };
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -125,39 +133,21 @@ export class RateLimiter {
     this.tryDrain();
   }
 
-  /**
-   * Swap the first-block callback. Resets the "already fired" flag so the new
-   * callback gets one shot. Pass `undefined` to clear (e.g. when an upstream
-   * transitions from default-sourced to an explicit per-server limit).
-   */
+  /** Swaps the first-block callback and re-arms it, so it fires again the next time a call has to wait; `undefined` clears it. */
   setOnFirstBlock(cb: (() => void) | undefined): void {
     this.onFirstBlock = cb;
     this.firstBlockFired = false;
   }
 
+  /** Stops the limiter, rejecting the calls still waiting with `RateLimiterDisposedError`. */
   dispose(): void {
-    this.teardown(false);
-  }
-
-  /**
-   * Tear down while *resolving* (not rejecting) queued waiters in FIFO order.
-   * Used when a hot-reload removes the limit for this upstream — the user's
-   * intent is to lift the limit, so queued calls should fire, not error.
-   * Process shutdown still uses `dispose()`.
-   */
-  drainAndDispose(): void {
-    this.teardown(true);
-  }
-
-  private teardown(resolveQueued: boolean): void {
     if (this.drainTimer !== undefined) {
       clearTimeout(this.drainTimer);
       this.drainTimer = undefined;
     }
     for (const waiter of this.queue) {
       clearTimeout(waiter.timer);
-      if (resolveQueued) waiter.resolve();
-      else waiter.reject(new RateLimiterDisposedError());
+      waiter.reject(new RateLimiterDisposedError());
     }
     this.queue = [];
     this.timestamps = [];

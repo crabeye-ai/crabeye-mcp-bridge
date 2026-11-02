@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
-import { RateLimiter } from "../../src/server/rate-limiter.js";
 import { PolicyEngine } from "../../src/policy/policy-engine.js";
+import { CallRefusedError } from "../../src/upstream/call-errors.js";
 import type { StatusChangeCallback, UpstreamClient } from "../../src/upstream/types.js";
 import {
   createTestPair,
@@ -13,7 +13,6 @@ import {
 import { errorResult, viaRunTool } from "../_helpers/run-tool.js";
 
 const REMOVED = errorResult('Upstream server "srv" was removed from the configuration');
-const DENIED = errorResult("Tool srv__op is disabled by policy");
 
 type Pair = Awaited<ReturnType<typeof createTestPair>>;
 
@@ -29,19 +28,6 @@ function disconnectedClient(name: string): { client: UpstreamClient; listeners: 
   return { client, listeners };
 }
 
-function gatedRateLimiter(): { limiter: RateLimiter; acquired: Promise<void>; release: () => void } {
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  let entered!: () => void;
-  const acquired = new Promise<void>((resolve) => { entered = resolve; });
-  const limiter = { acquire: vi.fn(() => { entered(); return gate; }) } as unknown as RateLimiter;
-  return { limiter, acquired, release };
-}
-
-function queuedWaiters(limiter: RateLimiter): unknown[] {
-  return (limiter as unknown as { queue: unknown[] }).queue;
-}
-
 describe.each([false, true])("run_tool waits across reloads and cancellation (modern: %s)", (modern) => {
   let pair: Pair | undefined;
   const upstreams = new FakeUpstreams();
@@ -54,69 +40,18 @@ describe.each([false, true])("run_tool waits across reloads and cancellation (mo
     expect(leftoverListeners).toBe(0);
   });
 
-  async function connect(rateLimiter?: RateLimiter, policyEngine?: PolicyEngine): Promise<Pair> {
+  async function connect(policyEngine?: PolicyEngine): Promise<Pair> {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__op")]);
     pair = await createTestPair({
       registry,
       modern,
       getUpstreamClient: upstreams.get,
-      getRateLimiter: () => rateLimiter,
       policyEngine,
       onClientsChanged: upstreams.onClientsChanged,
     });
     return pair;
   }
-
-  it("fails with the removal when a reload removes the upstream while the call waits for a rate-limit slot", async () => {
-    const original = makeMockUpstreamClient("srv");
-    upstreams.set("srv", original);
-    const { limiter, acquired, release } = gatedRateLimiter();
-    const { client } = await connect(limiter);
-
-    const call = client.callTool(viaRunTool("srv__op"));
-    await acquired;
-    upstreams.set("srv", undefined);
-    release();
-
-    expect(await call).toMatchObject(REMOVED);
-    expect(original.callTool).not.toHaveBeenCalled();
-  });
-
-  it("fails with the removal when a reload disposes the rate limiter the call is queued on", async () => {
-    const upstream = makeMockUpstreamClient("srv");
-    upstreams.set("srv", upstream);
-    const limiter = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
-    await limiter.acquire();
-    const queue = queuedWaiters(limiter);
-    const { client } = await connect(limiter);
-
-    const call = client.callTool(viaRunTool("srv__op"));
-    await vi.waitFor(() => expect(queue).toHaveLength(1));
-    limiter.dispose();
-    upstreams.set("srv", undefined);
-
-    expect(await call).toMatchObject(REMOVED);
-    expect(upstream.callTool).not.toHaveBeenCalled();
-  });
-
-  it("calls the replacement when a reload replaces the upstream while the call waits for a rate-limit slot", async () => {
-    const original = makeMockUpstreamClient("srv");
-    upstreams.set("srv", original);
-    const { limiter, acquired, release } = gatedRateLimiter();
-    const { client } = await connect(limiter);
-    const replacement = makeMockUpstreamClient("srv", {
-      callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from replacement" }] }),
-    });
-
-    const call = client.callTool(viaRunTool("srv__op"));
-    await acquired;
-    upstreams.set("srv", replacement);
-    release();
-
-    expect((await call).content).toEqual([{ type: "text", text: "from replacement" }]);
-    expect(original.callTool).not.toHaveBeenCalled();
-  });
 
   it("fails promptly with the removal when a reload removes an upstream the call is waiting on", async () => {
     const { client: down, listeners } = disconnectedClient("srv");
@@ -131,88 +66,40 @@ describe.each([false, true])("run_tool waits across reloads and cancellation (mo
     expect(listeners.size).toBe(0);
   });
 
-  it("refuses a call that a reload denied while it waited, even on the replacement", async () => {
+  it("calls the replacement when a reload replaces the upstream the call is waiting on", async () => {
     const { client: down, listeners } = disconnectedClient("srv");
     upstreams.set("srv", down);
-    const policy = new PolicyEngine("always", {});
-    const { client } = await connect(undefined, policy);
-    const replacement = makeMockUpstreamClient("srv");
+    const { client } = await connect();
+    const replacement = makeMockUpstreamClient("srv", {
+      callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from replacement" }] }),
+    });
 
     const call = client.callTool(viaRunTool("srv__op"));
     await vi.waitFor(() => expect(listeners.size).toBe(1));
-    policy.update("always", { srv: { toolPolicy: "never" } });
     upstreams.set("srv", replacement);
 
-    expect(await call).toMatchObject(DENIED);
-    expect(replacement.callTool).not.toHaveBeenCalled();
+    expect((await call).content).toEqual([{ type: "text", text: "from replacement" }]);
+    expect(down.callTool).not.toHaveBeenCalled();
   });
 
-  it("refuses a call that a reload denied while it waited for a rate-limit slot", async () => {
+  it("doesn't say a call was approved when its policy needed no approval", async () => {
     const upstream = makeMockUpstreamClient("srv");
     upstreams.set("srv", upstream);
-    const policy = new PolicyEngine("always", {});
-    const { limiter, acquired, release } = gatedRateLimiter();
-    const { client } = await connect(limiter, policy);
+    const { client } = await connect(new PolicyEngine("always", {}));
 
-    const call = client.callTool(viaRunTool("srv__op"));
-    await acquired;
-    policy.update("always", { srv: { toolPolicy: "never" } });
-    release();
+    await client.callTool(viaRunTool("srv__op"));
 
-    expect(await call).toMatchObject(DENIED);
-    expect(upstream.callTool).not.toHaveBeenCalled();
+    expect(upstream.callTool).toHaveBeenCalledWith({ name: "op", arguments: {} }, { signal: expect.any(AbortSignal) });
   });
 
-  it("refuses a call that a reload denied while it waited for a reconnect after its rate-limit slot", async () => {
-    const original = makeMockUpstreamClient("srv");
-    upstreams.set("srv", original);
-    const policy = new PolicyEngine("always", {});
-    const { limiter, acquired, release } = gatedRateLimiter();
-    const { client } = await connect(limiter, policy);
-    const { client: down, listeners } = disconnectedClient("srv");
-    const replacement = makeMockUpstreamClient("srv");
-
-    const call = client.callTool(viaRunTool("srv__op"));
-    await acquired;
-    upstreams.set("srv", down);
-    release();
-    await vi.waitFor(() => expect(listeners.size).toBe(1));
-    policy.update("always", { srv: { toolPolicy: "never" } });
-    upstreams.set("srv", replacement);
-
-    expect(await call).toMatchObject(DENIED);
-    expect(original.callTool).not.toHaveBeenCalled();
-    expect(replacement.callTool).not.toHaveBeenCalled();
-  });
-
-  it("refuses a call whose tool started requiring confirmation while it waited, instead of running it unconfirmed", async () => {
-    const { client: down, listeners } = disconnectedClient("srv");
-    upstreams.set("srv", down);
-    const policy = new PolicyEngine("always", {});
-    const { client } = await connect(undefined, policy);
-    const replacement = makeMockUpstreamClient("srv");
-
-    const call = client.callTool(viaRunTool("srv__op"));
-    await vi.waitFor(() => expect(listeners.size).toBe(1));
-    policy.update("always", { srv: { toolPolicy: "prompt" } });
-    upstreams.set("srv", replacement);
-
-    expect(await call).toMatchObject(
-      errorResult("Tool srv__op now requires confirmation after a configuration change; please retry"),
-    );
-    expect(replacement.callTool).not.toHaveBeenCalled();
-  });
-
-  it("returns the rate limiter's message as an error result when its queue is full", async () => {
-    const upstream = makeMockUpstreamClient("srv");
+  it("shows the manager's reason for refusing a call as it is", async () => {
+    const upstream = makeMockUpstreamClient("srv", {
+      callTool: vi.fn().mockRejectedValue(new CallRefusedError("Rate limit queue full")),
+    });
     upstreams.set("srv", upstream);
-    const limiter = new RateLimiter({ maxCalls: 1, windowSeconds: 60 }, { maxQueued: 0 });
-    await limiter.acquire();
-    const { client } = await connect(limiter);
+    const { client } = await connect();
 
     expect(await client.callTool(viaRunTool("srv__op"))).toMatchObject(errorResult("Rate limit queue full"));
-    expect(upstream.callTool).not.toHaveBeenCalled();
-    limiter.drainAndDispose();
   });
 
   it("stops waiting for a reconnect when the client cancels", async () => {
@@ -229,30 +116,6 @@ describe.each([false, true])("run_tool waits across reloads and cancellation (mo
     await expect(call).rejects.toThrow();
     await vi.waitFor(() => expect(listeners.size).toBe(0));
     expect(down.callTool).not.toHaveBeenCalled();
-  });
-
-  it("gives up a queued rate-limit slot when the client cancels, so the next call is first in line", async () => {
-    const upstream = makeMockUpstreamClient("srv");
-    upstreams.set("srv", upstream);
-    const limiter = new RateLimiter({ maxCalls: 1, windowSeconds: 60 });
-    await limiter.acquire();
-    const queue = queuedWaiters(limiter);
-    const { client } = await connect(limiter);
-    await useUpRequestIdZero(client);
-    const controller = new AbortController();
-
-    const cancelled = client.callTool(viaRunTool("srv__op", { n: 1 }), { signal: controller.signal });
-    await vi.waitFor(() => expect(queue).toHaveLength(1));
-    const next = client.callTool(viaRunTool("srv__op", { n: 2 }));
-    await vi.waitFor(() => expect(queue).toHaveLength(2));
-    controller.abort();
-
-    await expect(cancelled).rejects.toThrow();
-    await vi.waitFor(() => expect(queue).toHaveLength(1));
-    limiter.drainAndDispose();
-    await next;
-    expect(upstream.callTool).toHaveBeenCalledOnce();
-    expect(upstream.callTool).toHaveBeenCalledWith({ name: "op", arguments: { n: 2 } }, { signal: expect.any(AbortSignal) });
   });
 
   it("aborts the upstream call when the client cancels it in flight", async () => {

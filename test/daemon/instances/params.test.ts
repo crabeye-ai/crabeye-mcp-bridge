@@ -5,6 +5,7 @@ import {
   parseCallToolParams,
   parseCancelToolParams,
   parseRetryParams,
+  parseSearchToolsParams,
 } from "../../../src/daemon/instances/params.js";
 import { MAX_CHILD_ENV_BYTES } from "../../../src/daemon/instances/child-env.js";
 
@@ -66,9 +67,10 @@ describe("parseAttachParams", () => {
 describe("parseCallToolParams", () => {
   const call = { callId: "c1", upstream: "svc", name: "search", arguments: { q: "x" } };
 
-  it("accepts a call with and without arguments", () => {
+  it("accepts a call with and without arguments, and one its client approved", () => {
     expect(parseCallToolParams(call)).toEqual(call);
     expect(parseCallToolParams({ ...call, arguments: undefined })).toEqual({ callId: "c1", upstream: "svc", name: "search" });
+    expect(parseCallToolParams({ ...call, approved: true })).toEqual({ ...call, approved: true });
   });
 
   it.each([
@@ -80,8 +82,30 @@ describe("parseCallToolParams", () => {
     ["no tool name", { ...call, name: undefined }],
     ["arguments that are an array", { ...call, arguments: [1] }],
     ["arguments that are a string", { ...call, arguments: "x" }],
+    ["an approval that isn't true", { ...call, approved: false }],
   ])("refuses %s", (_label, params) => {
     expect(parseCallToolParams(params)).toBeNull();
+  });
+});
+
+describe("parseSearchToolsParams", () => {
+  const query = { tool: "create", provider: "linear", category: "", expand_tools: true, limit: 5, offset: 2.5 };
+
+  it("accepts queries with the fields search_tools takes, and leaves out any other field", () => {
+    expect(parseSearchToolsParams({ queries: [query, {}] })).toEqual({ queries: [query, {}] });
+    expect(parseSearchToolsParams({ queries: [{ tool: "x", extra: 1 }] })).toEqual({ queries: [{ tool: "x" }] });
+  });
+
+  it.each([
+    ["no queries", {}],
+    ["queries that aren't an array", { queries: { tool: "x" } }],
+    ["a query that isn't an object", { queries: ["x"] }],
+    ["a term that isn't a string", { queries: [{ provider: 1 }] }],
+    ["a limit that isn't a finite number", { queries: [{ tool: "x", limit: Number.POSITIVE_INFINITY }] }],
+    ["an offset that is a string", { queries: [{ tool: "x", offset: "1" }] }],
+    ["expand_tools that isn't a boolean", { queries: [{ tool: "x", expand_tools: "yes" }] }],
+  ])("refuses %s", (_label, params) => {
+    expect(parseSearchToolsParams(params)).toBeNull();
   });
 });
 

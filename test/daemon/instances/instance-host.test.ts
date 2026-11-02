@@ -76,7 +76,7 @@ describe("InstanceHost", () => {
   }
 
   beforeEach(() => {
-    configs = new Map([[fileSource.path, { mcpServers: { svc: { url: "https://svc.example.com/mcp" } } }]]);
+    configs = new Map([[fileSource.path, { mcpServers: { svc: { url: "https://svc.example.com/mcp" } }, _bridge: { defaultRateLimit: false } }]]);
     loads = 0;
     loadGate = Promise.resolve();
     clients = [];

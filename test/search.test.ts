@@ -14,6 +14,7 @@ import {
 import type { QueryResult } from "../src/search/index.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
 import { errorResult } from "./_helpers/run-tool.js";
+import { localSearch } from "./_helpers/local-search.js";
 
 function makeTool(name: string, description?: string): Tool {
   return {
@@ -468,6 +469,7 @@ describe("ToolSearchService", () => {
         makeTool("spam__b", "Tool B"),
       ];
       registry.setToolsForSource("spam", tools);
+      service.search({ queries: [{ provider: "spam" }] });
 
       const index = (service as unknown as { index: { removeAll: () => void } }).index;
       const removeAllSpy = vi.spyOn(index, "removeAll");
@@ -479,10 +481,12 @@ describe("ToolSearchService", () => {
           makeTool("spam__b", "Tool B"),
         ]);
       }
+      service.search({ queries: [{ provider: "spam" }] });
       expect(removeAllSpy).not.toHaveBeenCalled();
 
       // A real content change still triggers the rebuild.
       registry.setToolsForSource("spam", [makeTool("spam__a", "Tool A (renamed desc)")]);
+      service.search({ queries: [{ provider: "spam" }] });
       expect(removeAllSpy).toHaveBeenCalledTimes(1);
     });
   });
@@ -490,6 +494,7 @@ describe("ToolSearchService", () => {
   describe("dispose", () => {
     it("stops following registry changes", () => {
       registry.setToolsForSource("a", [makeTool("a__t1", "Alpha tool")]);
+      service.search({ queries: [{ provider: "a" }] });
 
       service.dispose();
       registry.setToolsForSource("a", []);
@@ -637,6 +642,7 @@ describe("BridgeServer search_tools and run_tool", () => {
 
     const server = new BridgeServer({
       toolRegistry,
+      search: localSearch(toolRegistry, opts?.policyEngine),
       policyEngine: opts?.policyEngine,
       getUpstreamClient: (name) => (name === "linear" ? linearClient : undefined),
     });
@@ -835,7 +841,7 @@ describe("BridgeServer search_tools and run_tool", () => {
     expect(linearClient.callTool).toHaveBeenCalledWith({
       name: "create_issue",
       arguments: { title: "Bug" },
-    }, { signal: expect.any(AbortSignal) });
+    }, { signal: expect.any(AbortSignal), approved: true });
 
     await cleanup();
   });

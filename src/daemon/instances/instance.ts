@@ -1,8 +1,13 @@
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { ConfigWatcher } from "../../config/config-watcher.js";
-import { isHttpServer, resolveUpstreams, type BridgeConfig, type ServerConfig } from "../../config/schema.js";
+import { isHttpServer, resolveUpstreams, serverBridgeConfigs, type BridgeConfig, type RateLimitConfig, type ServerConfig } from "../../config/schema.js";
 import type { CredentialStore } from "../../credentials/credential-store.js";
 import type { Logger } from "../../logging/index.js";
+import { PolicyEngine } from "../../policy/index.js";
+import type { SearchToolsParams, SearchToolsResponse } from "../../search/index.js";
+import { defaultLimitReachedMessage, resolveRateLimitConfig } from "../../server/rate-limit-resolution.js";
+import { awaitConnectedClient } from "../../server/upstream-wait.js";
+import { CallRefusedError, requiresConfirmationError } from "../../upstream/call-errors.js";
 import { resolveReconnectInputs } from "../../upstream/upstream-hash.js";
 import type {
   InstanceSource,
@@ -12,6 +17,8 @@ import type {
   UpstreamSnapshot,
 } from "../protocol.js";
 import { httpUpstreamIdentity, stdioUpstreamKey } from "./identity.js";
+import { hostedView, takeSlotFor, type HostedView } from "./hosted-calls.js";
+import { ToolIndex } from "./tool-index.js";
 import type { Lease, PoolSpec, UpstreamPool } from "./upstream-pool.js";
 
 export interface LoadedConfig {
@@ -43,22 +50,31 @@ export interface InstanceAttachment {
   send(notification: InstanceNotification): void;
 }
 
+export interface HostedCallOptions {
+  signal: AbortSignal;
+  /** The bridge's client approved the call. */
+  approved?: boolean;
+}
+
 /** One of an instance's upstreams, under the name the instance gives it. */
 export interface HostedUpstream {
-  callTool(params: { name: string; arguments?: Record<string, unknown> }, options: { signal: AbortSignal }): Promise<CallToolResult>;
+  /** Waits for a slot under the server's rate limit and for the server to connect, checks the policy again, then calls it. */
+  callTool(params: { name: string; arguments?: Record<string, unknown> }, options: HostedCallOptions): Promise<CallToolResult>;
   retry(): Promise<UpstreamSnapshot>;
 }
 
 interface Hosted {
   key: string;
   lease: Lease;
+  view: HostedView;
   unsubscribe: () => void;
 }
 
 /**
  * The daemon's copy of one config, shared by every bridge that would load it.
- * Holds a pooled connection for each server and follows edits to the files it
- * loaded.
+ * Holds a pooled connection for each server, the index `search_tools`
+ * searches and the tool policy calls are checked against, and follows edits
+ * to the files it loaded.
  */
 export class Instance {
   readonly source: InstanceSource;
@@ -69,6 +85,9 @@ export class Instance {
   private readonly _log: Logger;
   private readonly _attachments = new Set<InstanceAttachment>();
   private readonly _hosted = new Map<string, Hosted>();
+  private readonly _hostedChanged = new Set<() => void>();
+  private readonly _policy: PolicyEngine;
+  private readonly _index: ToolIndex;
   private _config: BridgeConfig;
   private _watcher: ConfigWatcher | undefined;
   private _watchPaths: readonly string[] = [];
@@ -85,7 +104,13 @@ export class Instance {
     this._config = loaded.config;
     this._log = deps.logger.child({ component: "instance" });
     this._store = deps.createCredentialStore(env);
-    for (const [name, config] of Object.entries(resolveUpstreams(loaded.config))) this._host(name, this._specFor(name, config));
+    const servers = resolveUpstreams(loaded.config);
+    this._policy = new PolicyEngine(loaded.config._bridge.toolPolicy, serverBridgeConfigs(servers));
+    this._index = new ToolIndex(this._policy);
+    for (const [name, config] of Object.entries(servers)) {
+      this._host(name, this._specFor(name, config));
+      this._index.setCategory(name, config._bridge?.category);
+    }
     this._watch(loaded.watchPaths);
   }
 
@@ -115,12 +140,16 @@ export class Instance {
   /** The hosted upstream named `name`, reloading the config first when there is none. */
   async upstream(name: string): Promise<HostedUpstream | undefined> {
     if (!this._hosted.has(name)) await this.reload();
-    const upstream = this._hosted.get(name)?.lease.upstream;
-    if (upstream === undefined) return undefined;
+    const hosted = this._hosted.get(name);
+    if (hosted === undefined) return undefined;
     return {
-      callTool: (params, options) => upstream.callTool(params, options),
-      retry: async () => ({ ...(await upstream.retry()), name }),
+      callTool: (params, options) => this._call(name, params, options),
+      retry: async () => ({ ...(await hosted.lease.upstream.retry()), name }),
     };
+  }
+
+  search(params: SearchToolsParams): SearchToolsResponse {
+    return this._index.search(params);
   }
 
   /**
@@ -150,6 +179,26 @@ export class Instance {
     await this._applying;
     for (const name of [...this._hosted.keys()]) this._unhost(name);
     this._attachments.clear();
+    this._index.close();
+  }
+
+  private async _call(name: string, params: { name: string; arguments?: Record<string, unknown> }, { signal, approved }: HostedCallOptions): Promise<CallToolResult> {
+    await takeSlotFor(name, (current) => this._hosted.get(current)?.lease, signal);
+    const upstream = await awaitConnectedClient(name, {
+      getClient: (current) => this._hosted.get(current)?.view,
+      onClientsChanged: (listener) => this._onHostedChanged(listener),
+      signal,
+      logger: this._log,
+    });
+    const decision = this._policy.evaluate(name, params.name, params.arguments);
+    if (decision.kind === "deny") throw new CallRefusedError(decision.reason);
+    if (decision.kind === "prompt" && approved !== true) throw requiresConfirmationError(name, params.name);
+    return upstream.callTool(params, { signal });
+  }
+
+  private _onHostedChanged(listener: () => void): () => void {
+    this._hostedChanged.add(listener);
+    return () => this._hostedChanged.delete(listener);
   }
 
   private _watch(watchPaths: string[]): void {
@@ -204,11 +253,16 @@ export class Instance {
     const previous = this._config;
     this._config = next;
     const servers = resolveUpstreams(next);
+    this._policy.update(next._bridge.toolPolicy, serverBridgeConfigs(servers));
     const toRelease: Hosted[] = [];
     for (const [name, config] of Object.entries(servers)) {
       const spec = this._specFor(name, config);
       const current = this._hosted.get(name);
-      if (current?.key === spec.key) continue;
+      this._index.setCategory(name, config._bridge?.category);
+      if (current?.key === spec.key) {
+        current.lease.setRateLimit(spec.rateLimit);
+        continue;
+      }
       this._log.info(current === undefined ? "adding server" : "reconnecting server", { server: name });
       if (current !== undefined) toRelease.push(current);
       this._host(name, spec);
@@ -218,9 +272,11 @@ export class Instance {
       this._log.info("removing server", { server: name });
       toRelease.push(this._hosted.get(name)!);
       this._hosted.delete(name);
+      this._index.remove(name);
       this._broadcast({ method: "UPSTREAM_REMOVED", params: { upstream: name } });
     }
     for (const hosted of toRelease) release(hosted);
+    if (toRelease.length > 0) this._notifyHostedChanged();
     const interval = next._bridge.healthCheckInterval;
     if (interval !== previous._bridge.healthCheckInterval) {
       for (const { lease } of this._hosted.values()) lease.setHealthCheckInterval(interval);
@@ -229,7 +285,7 @@ export class Instance {
   }
 
   private _specFor(name: string, config: ServerConfig): PoolSpec {
-    const base = { name, healthCheckIntervalSec: this._config._bridge.healthCheckInterval };
+    const base = { name, healthCheckIntervalSec: this._config._bridge.healthCheckInterval, rateLimit: resolveRateLimitConfig(config, this._config._bridge) };
     const reconnect = resolveReconnectInputs(this._config._bridge, config);
     if (isHttpServer(config)) {
       const { key, network, env } = httpUpstreamIdentity(name, config, this._env);
@@ -240,24 +296,41 @@ export class Instance {
   }
 
   private _host(name: string, spec: PoolSpec): void {
-    const lease = this._deps.pool.acquire(spec, this);
-    const unsubscribe = lease.upstream.subscribe({
-      onSnapshot: (snapshot) => this._broadcast({ method: "UPSTREAM", params: { ...snapshot, name } }),
+    const lease = this._deps.pool.acquire(spec, this, { defaultLimitReached: (config) => this._defaultLimitReached(name, config) });
+    const upstream = lease.upstream;
+    const announce = (snapshot: UpstreamSnapshot): void => {
+      this._index.follow(name, snapshot);
+      this._broadcast({ method: "UPSTREAM", params: { ...snapshot, name } });
+    };
+    const unsubscribe = upstream.subscribe({
+      onSnapshot: announce,
       onLog: (level, message, context, stderr) =>
         this._broadcast({
           method: "LOG",
           params: { upstream: name, level, message, ...(Object.keys(context).length > 0 && { context }), ...(stderr !== undefined && { stderr }) },
         }),
     });
-    this._hosted.set(name, { key: spec.key, lease, unsubscribe });
-    this._broadcast({ method: "UPSTREAM", params: { ...lease.upstream.snapshot(), name } });
+    this._hosted.set(name, { key: spec.key, lease, view: hostedView(name, upstream), unsubscribe });
+    announce(upstream.snapshot());
   }
 
   private _unhost(name: string): void {
     const hosted = this._hosted.get(name);
     if (hosted === undefined) return;
     this._hosted.delete(name);
+    this._index.remove(name);
     release(hosted);
+    this._notifyHostedChanged();
+  }
+
+  private _defaultLimitReached(name: string, config: RateLimitConfig): void {
+    const message = defaultLimitReachedMessage(name, config);
+    this._log.info(message, { server: name });
+    this._broadcast({ method: "LOG", params: { upstream: name, level: "info", message } });
+  }
+
+  private _notifyHostedChanged(): void {
+    for (const listener of [...this._hostedChanged]) listener();
   }
 
   private _broadcast(notification: InstanceNotification): void {

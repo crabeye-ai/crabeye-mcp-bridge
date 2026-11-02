@@ -5,6 +5,7 @@ import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { BridgeServer } from "../../src/server/bridge-server.js";
 import type { BridgeServerOptions } from "../../src/server/bridge-server.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
+import { localSearch } from "./local-search.js";
 
 export function makeTool(name: string, description?: string): Tool {
   return {
@@ -17,7 +18,7 @@ export function makeTool(name: string, description?: string): Tool {
 export async function createTestPair(options?: Partial<BridgeServerOptions> & { registry?: ToolRegistry; modern?: boolean }) {
   const { registry, modern, ...serverOptions } = options ?? {};
   const toolRegistry = registry ?? new ToolRegistry();
-  const server = new BridgeServer({ ...serverOptions, toolRegistry });
+  const server = new BridgeServer({ search: localSearch(toolRegistry, serverOptions.policyEngine), ...serverOptions, toolRegistry });
 
   const client = new Client(
     { name: "test-client", version: "1.0.0" },

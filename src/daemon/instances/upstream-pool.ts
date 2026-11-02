@@ -1,5 +1,7 @@
 import type { Logger } from "../../logging/index.js";
 import { SharedRefreshes } from "../../oauth/shared-refreshes.js";
+import type { RateLimitConfig } from "../../config/schema.js";
+import type { ResolvedRateLimit } from "../../server/rate-limit-resolution.js";
 import { createHttpConnection, defaultCreateHttpClient, type CreateHttpClient, type HttpConnectionSpec } from "./http-connection.js";
 import {
   PooledUpstream,
@@ -9,6 +11,7 @@ import {
   type PoolConnection,
   type RunningChild,
 } from "./pooled-upstream.js";
+import { RateBudgets, type SlotOutcome } from "./rate-budgets.js";
 import { createStdioConnection, type LegacyServers, type StdioConnectionOptions, type StdioConnectionSpec } from "./stdio-connection.js";
 
 /** At most how long a closing connection's refreshes may delay a stopping manager while they save their tokens. */
@@ -19,6 +22,8 @@ export type PoolSpec = {
   /** The name the owner gives the upstream. */
   name: string;
   healthCheckIntervalSec: number;
+  /** This owner's limit on calls through the connection. */
+  rateLimit: ResolvedRateLimit;
 } & ({ kind: "stdio"; stdio: StdioConnectionSpec } | { kind: "http"; http: HttpConnectionSpec });
 
 /** What an owner may do with a connection it holds a lease on. */
@@ -28,8 +33,21 @@ export interface Lease {
   readonly upstream: SharedUpstream;
   /** This owner's health-check interval, which applies while it is the longest-standing owner. */
   setHealthCheckInterval(intervalSec: number): void;
+  /** This owner's limit on calls; owners under the same limit share one budget, and its waiting calls follow it to a new one. */
+  setRateLimit(limit: ResolvedRateLimit): void;
+  /**
+   * Waits for a slot under this owner's limit, granted at once without one;
+   * "released" once the lease is released. Rejects with a `CallRefusedError`
+   * when the limit's queue is full or the wait times out.
+   */
+  takeSlot(signal: AbortSignal): Promise<SlotOutcome>;
   /** Idempotent. The connection closes once its last lease is released, after `graceMs` for a STDIO server. */
   release(): void;
+}
+
+export interface LeaseEvents {
+  /** The default limit this owner follows first made a call through the connection wait. */
+  defaultLimitReached?(config: RateLimitConfig): void;
 }
 
 export interface UpstreamPoolOptions {
@@ -60,13 +78,15 @@ interface Entry {
 /**
  * One connection per upstream key across every instance in the daemon:
  * HTTP and SSE connections refresh tokens once among them, and a STDIO server
- * runs once whatever names and instances use it.
+ * runs once whatever names and instances use it. Calls through a connection
+ * share a rate-limit budget per limit its owners give it.
  */
 export class UpstreamPool {
   private readonly _entries = new Map<string, Entry>();
   private readonly _closing = new Map<PooledUpstream, Promise<void>>();
   private readonly _refreshes = new SharedRefreshes();
   private readonly _legacyServers: LegacyServers = new Set();
+  private readonly _budgets = new RateBudgets();
   private readonly _opts: UpstreamPoolOptions;
 
   constructor(options: UpstreamPoolOptions) {
@@ -82,19 +102,23 @@ export class UpstreamPool {
    * health-check interval applies, then the next one's. `instance` groups the
    * leases one instance holds under different names.
    */
-  acquire(spec: PoolSpec, instance: object = {}): Lease {
+  acquire(spec: PoolSpec, instance: object = {}, events: LeaseEvents = {}): Lease {
     const entry = this._entryFor(spec);
     this._keep(entry);
     const { upstream } = entry;
     const owner = {};
     upstream.addOwner(owner, instance, spec.name, spec.healthCheckIntervalSec);
+    this._budgets.add(owner, spec.key, spec.rateLimit, events.defaultLimitReached);
     let released = false;
     return {
       upstream,
       setHealthCheckInterval: (intervalSec) => upstream.setHealthCheckInterval(owner, intervalSec),
+      setRateLimit: (limit) => this._budgets.setLimit(owner, limit),
+      takeSlot: (signal) => this._budgets.takeSlot(owner, signal),
       release: () => {
         if (released) return;
         released = true;
+        this._budgets.release(owner);
         if (upstream.removeOwner(owner) === 0) this._closeUnused(entry);
       },
     };

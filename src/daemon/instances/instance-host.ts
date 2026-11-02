@@ -7,6 +7,7 @@ import type { Logger } from "../../logging/index.js";
 import {
   ERROR_CODE_ALREADY_ATTACHED,
   ERROR_CODE_BRIDGE_UNSUPPORTED,
+  ERROR_CODE_CALL_REFUSED,
   ERROR_CODE_DAEMON_STOPPING,
   ERROR_CODE_INSTANCE_LOAD_FAILED,
   ERROR_CODE_INVALID_PARAMS,
@@ -23,16 +24,27 @@ import {
   type AuthChangedResult,
   type DaemonResponse,
   type InstanceSource,
+  type SearchToolsResult,
   type StatusChild,
   type StatusInstance,
   type StatusUpstream,
 } from "../protocol.js";
+import { SearchTimeoutError, searchQueriesProblem } from "../../search/limits.js";
 import type { FrameChannel } from "../transport.js";
+import { CallRefusedError } from "../../upstream/call-errors.js";
 import type { CreateHttpClient } from "./http-connection.js";
 import { instanceKey } from "./identity.js";
 import { Instance, type InstanceAttachment, type InstanceDeps, type InstanceEnv, type InstanceNotification, type LoadedConfig } from "./instance.js";
 import { UpstreamPool, type UpstreamPoolOptions } from "./upstream-pool.js";
-import { bridgeProtocolVersionOf, parseAttachParams, parseAuthChangedParams, parseCallToolParams, parseCancelToolParams, parseRetryParams } from "./params.js";
+import {
+  bridgeProtocolVersionOf,
+  parseAttachParams,
+  parseAuthChangedParams,
+  parseCallToolParams,
+  parseCancelToolParams,
+  parseRetryParams,
+  parseSearchToolsParams,
+} from "./params.js";
 
 const MAX_INSTANCES = 64;
 
@@ -161,13 +173,32 @@ export class InstanceHost {
       if (upstream === undefined) return unknownUpstream(id, params.upstream);
       const result = await upstream.callTool(
         { name: params.name, ...(params.arguments !== undefined && { arguments: params.arguments }) },
-        { signal: controller.signal },
+        { signal: controller.signal, approved: params.approved === true },
       );
       return { id, result };
     } catch (err) {
+      if (err instanceof CallRefusedError && !controller.signal.aborted) return errorResponse(id, ERROR_CODE_CALL_REFUSED, err.message);
       return errorResponse(id, ERROR_CODE_UPSTREAM_ERROR, callFailure(err, controller.signal));
     } finally {
       attachment.calls.delete(params.callId);
+    }
+  }
+
+  handleSearchTools(id: string, raw: unknown, channel: FrameChannel): DaemonResponse {
+    const attachment = this._attachments.get(channel);
+    if (attachment === undefined) return errorResponse(id, ERROR_CODE_NOT_ATTACHED, "SEARCH_TOOLS before ATTACH");
+    const params = parseSearchToolsParams(raw);
+    if (params === null) return errorResponse(id, ERROR_CODE_INVALID_PARAMS, "SEARCH_TOOLS params malformed");
+    const problem = searchQueriesProblem(params.queries);
+    if (problem !== null) return errorResponse(id, ERROR_CODE_INVALID_PARAMS, problem);
+    try {
+      const result: SearchToolsResult = attachment.instance.search(params);
+      return { id, result };
+    } catch (err) {
+      if (err instanceof SearchTimeoutError) return errorResponse(id, ERROR_CODE_INVALID_PARAMS, err.message);
+      const message = err instanceof Error ? err.message : String(err);
+      this._log.warn("search failed", { error: message });
+      return errorResponse(id, ERROR_CODE_UPSTREAM_ERROR, message);
     }
   }
 

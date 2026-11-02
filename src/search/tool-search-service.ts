@@ -1,97 +1,37 @@
 import MiniSearch from "minisearch";
-import type { Tool } from "@modelcontextprotocol/server";
 import type { ToolRegistry } from "../server/tool-registry.js";
 import { parseNamespacedName } from "../server/tool-namespacing.js";
 import type { PolicyEngine } from "../policy/index.js";
-
-export interface SearchQuery {
-  tool?: string;
-  provider?: string;
-  category?: string;
-  expand_tools?: boolean;
-  limit?: number;
-  offset?: number;
-}
-
-export interface SearchToolsParams {
-  queries: SearchQuery[];
-}
-
-export interface RunToolParams {
-  name: string;
-  arguments?: Record<string, unknown>;
-}
-
-export interface SearchToolResult {
-  tool_name: string;
-  source: string;
-  description: string;
-  input_schema: object;
-  disabled?: true;
-}
-
-export interface ProviderResult {
-  name: string;
-  category?: string;
-  tool_count: number;
-  tools: SearchToolResult[];
-}
-
-export interface QueryResult {
-  providers: ProviderResult[];
-  total: number;
-  count: number;
-  remaining: number;
-  offset: number;
-  limit: number;
-}
-
-export interface SearchToolsResponse {
-  results: QueryResult[];
-}
+import { parseRegex, prefixOrRegex } from "./search-pattern.js";
+import {
+  DEFAULT_LIMIT,
+  MAX_LIMIT,
+  MAX_SEARCHED_DESCRIPTION_CHARS,
+  MAX_SEARCHED_NAME_BYTES,
+  MAX_SEARCHED_WORD_CHARS,
+  SEARCH_TIME_LIMIT_MS,
+  timeLimit,
+} from "./limits.js";
+import type { ProviderResult, QueryResult, SearchToolResult, SearchToolsParams, SearchToolsResponse } from "./types.js";
 
 interface IndexedTool {
   id: string;
   name: string;
   originalName: string;
   description: string;
+  /** The part of the description that is searched. */
+  searchedDescription: string;
   source: string;
   category: string;
 }
 
-const MAX_LIMIT = 50;
-const DEFAULT_LIMIT = 10;
 const SCORE_CUTOFF = 0.3;
 
-const MAX_REGEX_LEN = 200;
-
-function parseRegex(input: string): RegExp | null {
-  // Support "regex:pattern" prefix (preferred) and legacy /pattern/flags format
-  let pattern: string;
-  let flags = "";
-
-  if (input.startsWith("regex:")) {
-    pattern = input.slice(6);
-  } else {
-    const match = /^\/(.+)\/([gimsuy]*)$/.exec(input);
-    if (!match) return null;
-    pattern = match[1];
-    flags = match[2];
-  }
-
-  if (!pattern || pattern.length > MAX_REGEX_LEN) return null;
-
-  try {
-    // Use 'v' flag (unicode sets) for linear-time guarantee where available,
-    // fall back to plain construction on older runtimes.
-    try {
-      return new RegExp(pattern, flags + "v");
-    } catch {
-      return new RegExp(pattern, flags);
-    }
-  } catch {
-    return null;
-  }
+function tokenize(text: string): string[] {
+  return text
+    .split(/[\s_\-./]+/)
+    .filter(Boolean)
+    .map((word) => word.slice(0, MAX_SEARCHED_WORD_CHARS));
 }
 
 function fingerprintTools(
@@ -109,115 +49,6 @@ function fingerprintTools(
   return `${rows.length}|${rows.join("\x1e")}`;
 }
 
-function matchesPrefixOrRegex(value: string, pattern: string): boolean {
-  const regex = parseRegex(pattern);
-  if (regex) return regex.test(value);
-  return value.toLowerCase().startsWith(pattern.toLowerCase());
-}
-
-export const SEARCH_TOOL_NAME = "search_tools";
-export const RUN_TOOL_NAME = "run_tool";
-
-export const searchToolDefinition: Tool = {
-  name: SEARCH_TOOL_NAME,
-  description: [
-    "Search for available tools across all connected MCP servers. ALWAYS call this BEFORE claiming a tool is unavailable, before web search fallback, or when the user mentions any service/tool/integration.",
-    "",
-    "Discovery workflow:",
-    "1. Search by provider or category to get provider summaries (tool counts, no details)",
-    "2. If you need the tools, drill in with a tool filter or expand_tools: true to get full tool definitions",
-    "",
-    "When to use:",
-    "- User mentions a service or tool by name — search by provider name first",
-    "- User wants to perform an action (create, update, query, etc.) — search by tool keyword",
-    "- User asks what tools or integrations are available — search by provider or category for summaries",
-    "- User asks 'can you...?' about external capabilities — search before answering",
-    "- You need a tool you haven't seen yet — every tool from the connected servers is found through this search",
-    "",
-    "Response shape: results[].providers[].tools[]",
-    "Without a tool filter, only provider summaries are returned (name, category, tool_count). Use a tool query or expand_tools: true to get full tool definitions.",
-    "Use text queries for fuzzy search or prefix with regex: for precise pattern matching.",
-    "Each query object can have its own filters and pagination.",
-  ].join("\n"),
-  inputSchema: {
-    type: "object" as const,
-    properties: {
-      queries: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            tool: {
-              type: "string",
-              description:
-                "Text search query to match tool names and descriptions. " +
-                "Prefix with regex: for regex matching (e.g. \"regex:.*issue.*\"). " +
-                "Prefer passing several queries covering synonyms and related terms to minimize round-trips.",
-            },
-            provider: {
-              type: "string",
-              description:
-                "Filter by upstream server/provider name. " +
-                "Prefix match by default (e.g. \"git\" matches \"github\"). " +
-                "Use regex: prefix for patterns (e.g. \"regex:^(linear|figma)$\").",
-            },
-            category: {
-              type: "string",
-              description:
-                "Filter by tool category (configured via _bridge.category in server config). " +
-                "Prefix match by default. Use regex: prefix for patterns.",
-            },
-            expand_tools: {
-              type: "boolean",
-              description:
-                "When true, return full tool definitions for all tools from matched providers. " +
-                "Without this, provider-only queries return summaries (name, tool_count) without tool details. " +
-                "Ignored when a tool filter is present (tool filter always returns details).",
-            },
-            limit: {
-              type: "number",
-              description: `Maximum number of tool results for this query (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT})`,
-            },
-            offset: {
-              type: "number",
-              description: "Number of tool results to skip for pagination (default 0)",
-            },
-          },
-        },
-        description:
-          "Array of query objects. Each query is self-contained with its own filters and pagination. " +
-          "Results are deduplicated across queries — first query wins. " +
-          "Each query must have at least one of: tool, provider, category.",
-      },
-    },
-    required: ["queries"],
-  },
-};
-
-export const runToolDefinition: Tool = {
-  name: RUN_TOOL_NAME,
-  description: [
-    "Execute any tool from any connected MCP server by its full namespaced name (provider__tool_name format).",
-    "Use this after discovering tools via search_tools.",
-    "Pass the exact namespaced name from search results and the required arguments.",
-  ].join("\n"),
-  inputSchema: {
-    type: "object" as const,
-    properties: {
-      name: {
-        type: "string",
-        description:
-          "The full namespaced tool name to call (e.g. 'linear__create_issue')",
-      },
-      arguments: {
-        type: "object",
-        description: "Arguments to pass to the tool",
-      },
-    },
-    required: ["name"],
-  },
-};
-
 export class ToolSearchService {
   private registry: ToolRegistry;
   private index: MiniSearch<IndexedTool>;
@@ -232,32 +63,35 @@ export class ToolSearchService {
    * the fingerprint is unchanged.
    */
   private lastFingerprint = "";
+  /** Changes are indexed at the next search, so a burst of them costs one rebuild. */
+  private stale = true;
 
   constructor(registry: ToolRegistry, policyEngine?: PolicyEngine) {
     this.registry = registry;
     this.policyEngine = policyEngine;
     this.index = this.createIndex();
-    this.rebuildIndex();
     this.unsubscribeRegistry = this.registry.onChanged(() => {
-      this.rebuildIndex();
+      this.stale = true;
     });
   }
 
   private createIndex(): MiniSearch<IndexedTool> {
     return new MiniSearch<IndexedTool>({
-      fields: ["name", "originalName", "description", "source"],
+      fields: ["name", "originalName", "searchedDescription", "source"],
       storeFields: ["name", "originalName", "description", "source", "category"],
       searchOptions: {
-        boost: { name: 3, originalName: 3, description: 1, source: 0.5 },
+        boost: { name: 3, originalName: 3, searchedDescription: 1, source: 0.5 },
+        tokenize: (text) => [...new Set(tokenize(text).map((term) => term.toLowerCase()))],
         prefix: (term) => term.length >= 3,
         fuzzy: (term) => (term.length >= 5 ? 0.2 : false),
         combineWith: "AND",
       },
-      tokenize: (text) => text.split(/[\s_\-./]+/).filter(Boolean),
+      tokenize,
     });
   }
 
   private rebuildIndex(): void {
+    this.stale = false;
     const registered = this.registry.listRegisteredTools();
     // Cheap content fingerprint: source + name + description + category.
     // Skips the expensive minisearch teardown + re-add when an upstream
@@ -275,6 +109,7 @@ export class ToolSearchService {
     for (const { source, tool } of registered) {
       const parsed = parseNamespacedName(tool.name);
       const originalName = parsed?.toolName ?? tool.name;
+      if (Buffer.byteLength(originalName) > MAX_SEARCHED_NAME_BYTES) continue;
       const category = this.registry.getCategoryForSource(source) ?? "";
 
       const doc: IndexedTool = {
@@ -282,6 +117,7 @@ export class ToolSearchService {
         name: tool.name,
         originalName,
         description: tool.description ?? "",
+        searchedDescription: (tool.description ?? "").slice(0, MAX_SEARCHED_DESCRIPTION_CHARS),
         source,
         category,
       };
@@ -290,8 +126,11 @@ export class ToolSearchService {
     }
   }
 
+  /** Runs `params`' queries; throws `SearchTimeoutError` when they take longer than `SEARCH_TIME_LIMIT_MS`. */
   search(params: SearchToolsParams): SearchToolsResponse {
+    if (this.stale) this.rebuildIndex();
     const queries = params.queries;
+    const checkTimeLimit = timeLimit(SEARCH_TIME_LIMIT_MS);
 
     if (!queries || queries.length === 0) {
       return { results: [] };
@@ -307,6 +146,7 @@ export class ToolSearchService {
     const results: QueryResult[] = [];
 
     for (const query of queries) {
+      checkTimeLimit();
       const hasToolFilter = query.tool !== undefined && query.tool !== "";
       const hasProviderFilter = query.provider !== undefined && query.provider !== "";
       const hasCategoryFilter = query.category !== undefined && query.category !== "";
@@ -331,13 +171,15 @@ export class ToolSearchService {
       );
       const offset = Math.max(0, query.offset ?? 0);
       const isSummary = !hasToolFilter && !expandTools;
+      const providerPattern = hasProviderFilter ? prefixOrRegex(query.provider!, checkTimeLimit) : undefined;
+      const categoryPattern = hasCategoryFilter ? prefixOrRegex(query.category!, checkTimeLimit) : undefined;
 
       if (isSummary) {
         // Summary mode: provider summaries only, no tool details
         const matchedSources = new Set<string>();
         for (const doc of this.indexedTools.values()) {
-          if (hasProviderFilter && !matchesPrefixOrRegex(doc.source, query.provider!)) continue;
-          if (hasCategoryFilter && (!doc.category || !matchesPrefixOrRegex(doc.category, query.category!))) continue;
+          if (providerPattern && !providerPattern.test(doc.source)) continue;
+          if (categoryPattern && (!doc.category || !categoryPattern.test(doc.category))) continue;
           matchedSources.add(doc.source);
         }
 
@@ -374,13 +216,13 @@ export class ToolSearchService {
 
       if (hasToolFilter) {
         toolCandidates = new Set<string>();
-        const regex = parseRegex(query.tool!);
+        const regex = parseRegex(query.tool!, checkTimeLimit);
         if (regex) {
           for (const [name, doc] of this.indexedTools) {
             if (
               regex.test(doc.name) ||
               regex.test(doc.originalName) ||
-              regex.test(doc.description) ||
+              regex.test(doc.searchedDescription) ||
               regex.test(doc.source)
             ) {
               toolCandidates.add(name);
@@ -400,19 +242,19 @@ export class ToolSearchService {
         }
       }
 
-      if (hasProviderFilter) {
+      if (providerPattern) {
         providerCandidates = new Set<string>();
         for (const [name, doc] of this.indexedTools) {
-          if (matchesPrefixOrRegex(doc.source, query.provider!)) {
+          if (providerPattern.test(doc.source)) {
             providerCandidates.add(name);
           }
         }
       }
 
-      if (hasCategoryFilter) {
+      if (categoryPattern) {
         categoryCandidates = new Set<string>();
         for (const [name, doc] of this.indexedTools) {
-          if (doc.category && matchesPrefixOrRegex(doc.category, query.category!)) {
+          if (doc.category && categoryPattern.test(doc.category)) {
             categoryCandidates.add(name);
           }
         }
@@ -523,6 +365,11 @@ export class ToolSearchService {
     }
 
     return { results };
+  }
+
+  /** Indexes the registry again at the next search, for a category change, which the registry doesn't announce. */
+  refresh(): void {
+    this.stale = true;
   }
 
   dispose(): void {

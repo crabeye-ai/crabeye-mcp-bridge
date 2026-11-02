@@ -13,11 +13,12 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/client";
+import type { SearchToolsParams, SearchToolsResponse } from "../search/index.js";
 import type { ConnectionStatus } from "../upstream/types.js";
 
-export const PROTOCOL_VERSION = 4;
-export const MIN_BRIDGE_PROTOCOL_VERSION = 4;
-export const MIN_DAEMON_PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
+export const MIN_BRIDGE_PROTOCOL_VERSION = 5;
+export const MIN_DAEMON_PROTOCOL_VERSION = 5;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
@@ -50,6 +51,7 @@ export type DaemonMethod =
   | "ATTACH"
   | "CALL_TOOL"
   | "CANCEL_TOOL"
+  | "SEARCH_TOOLS"
   | "RETRY"
   | "AUTH_CHANGED"
   | "UPSTREAM"
@@ -143,7 +145,17 @@ export interface CallToolParams {
   upstream: string;
   name: string;
   arguments?: Record<string, unknown>;
+  /**
+   * The bridge asked its client to approve this call, and it did. The manager
+   * takes the bridge's word for it, as it trusts every peer on its user-only socket.
+   */
+  approved?: true;
 }
+
+/** `SEARCH_TOOLS.params`, answered with a `SearchToolsResult` from the instance's index. */
+export type SearchToolsRequest = SearchToolsParams;
+
+export type SearchToolsResult = SearchToolsResponse;
 
 export interface CancelToolParams {
   callId: string;
@@ -168,7 +180,7 @@ export interface AuthChangedResult {
   connections: number;
 }
 
-export type UpstreamLogLevel = "debug" | "warn" | "error";
+export type UpstreamLogLevel = "debug" | "info" | "warn" | "error";
 
 export type UpstreamLogContext = Record<string, string | number | boolean>;
 
@@ -243,6 +255,8 @@ export const ERROR_CODE_UPSTREAM_ERROR = "upstream_error";
 export const ERROR_CODE_TOO_MANY_CALLS = "too_many_calls";
 export const ERROR_CODE_TOO_MANY_INSTANCES = "too_many_instances";
 export const ERROR_CODE_RESPONSE_TOO_LARGE = "response_too_large";
+/** The manager didn't make the call; the message is what the client should be told, as is. */
+export const ERROR_CODE_CALL_REFUSED = "call_refused";
 
 export interface RestartParams {
   upstreamHash: string;

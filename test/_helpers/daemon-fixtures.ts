@@ -177,6 +177,8 @@ export class MemoryCredentialStore {
 /** A bridge attached to an instance over its own connection, recording what the manager tells it. */
 export class AttachedBridge {
   readonly snapshots = new Map<string, UpstreamSnapshot>();
+  /** Every snapshot, in the order they arrived. */
+  readonly updates: UpstreamSnapshot[] = [];
   readonly logs: UpstreamLogParams[] = [];
   readonly removed: string[] = [];
   private nextCallId = 1;
@@ -221,8 +223,13 @@ export class AttachedBridge {
 
   private _onNotification(notification: DaemonNotification): void {
     const params = notification.params as Record<string, unknown>;
-    if (notification.method === "UPSTREAM") this.snapshots.set(params.name as string, params as unknown as UpstreamSnapshot);
-    else if (notification.method === "LOG") this.logs.push(params as unknown as UpstreamLogParams);
-    else if (notification.method === "UPSTREAM_REMOVED") this.removed.push(params.upstream as string);
+    if (notification.method === "UPSTREAM") {
+      this.snapshots.set(params.name as string, params as unknown as UpstreamSnapshot);
+      this.updates.push(params as unknown as UpstreamSnapshot);
+    } else if (notification.method === "LOG") {
+      this.logs.push(params as unknown as UpstreamLogParams);
+    } else if (notification.method === "UPSTREAM_REMOVED") {
+      this.removed.push(params.upstream as string);
+    }
   }
 }

@@ -19,24 +19,15 @@ import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
 import { ApprovalFlow } from "./policy-approval.js";
 import { ClientMetadata } from "./client-metadata.js";
-import {
-  awaitConnectedClient,
-  cancelledError,
-  reauthorizationError,
-  removedError,
-  untilSettledOrCancelled,
-} from "./upstream-wait.js";
+import { awaitConnectedClient, untilSettledOrCancelled } from "./upstream-wait.js";
+import { CallRefusedError, cancelledError, reauthorizationError } from "../upstream/call-errors.js";
 import type { UpstreamClient } from "../upstream/types.js";
-import {
-  ToolSearchService,
-  searchToolDefinition,
-  runToolDefinition,
-} from "../search/index.js";
-import type { RunToolParams, SearchToolsParams } from "../search/index.js";
+import { searchToolDefinition, runToolDefinition } from "../search/tool-definitions.js";
+import type { RunToolParams, SearchToolsParams, SearchToolsResponse } from "../search/index.js";
+import { searchQueriesProblem } from "../search/limits.js";
 import type { PolicyDecision, PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
 import type { SessionStatsSnapshot } from "./session-stats.js";
-import { RateLimiterDisposedError, type RateLimiter } from "./rate-limiter.js";
 import type { Logger } from "../logging/index.js";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 
@@ -66,10 +57,10 @@ export interface BridgeServerOptions {
   stdin?: Readable;
   stdout?: Writable;
   toolRegistry?: ToolRegistry;
-  toolSearchService?: ToolSearchService;
+  /** Answers `search_tools`. */
+  search: (params: SearchToolsParams) => Promise<SearchToolsResponse>;
   policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
-  getRateLimiter?: (name: string) => RateLimiter | undefined;
   onClientsChanged?: (listener: () => void) => () => void;
   logger?: Logger;
   showStats?: boolean;
@@ -130,7 +121,7 @@ function throwIfDenied(decision: PolicyDecision | undefined): void {
 export class BridgeServer {
   private handle: StdioServerHandle | undefined;
   private toolRegistry: ToolRegistry;
-  private toolSearchService: ToolSearchService;
+  private search: (params: SearchToolsParams) => Promise<SearchToolsResponse>;
   private policyEngine: PolicyEngine | undefined;
   private sessionStats: SessionStats;
   private approval = new ApprovalFlow();
@@ -138,14 +129,14 @@ export class BridgeServer {
   private markSessionStarted!: () => void;
   private readonly sessionStart: Promise<void>;
 
-  constructor(options?: BridgeServerOptions) {
-    this.options = options ?? {};
+  constructor(options: BridgeServerOptions) {
+    this.options = options;
     this.sessionStart = new Promise<void>((resolve) => {
       this.markSessionStarted = resolve;
     });
-    this.toolRegistry = options?.toolRegistry ?? new ToolRegistry();
-    this.policyEngine = options?.policyEngine;
-    this.toolSearchService = options?.toolSearchService ?? new ToolSearchService(this.toolRegistry, this.policyEngine);
+    this.toolRegistry = options.toolRegistry ?? new ToolRegistry();
+    this.policyEngine = options.policyEngine;
+    this.search = options.search;
     this.sessionStats = new SessionStats(this.toolRegistry, BRIDGE_TOOLS);
   }
 
@@ -219,20 +210,16 @@ export class BridgeServer {
     });
   }
 
-  private handleSearchTools(params: SearchToolsParams): CallToolResult {
-    if (params.queries.length === 0) {
-      return errorResult("Error: 'queries' must be a non-empty array of query objects.");
-    }
-    for (let i = 0; i < params.queries.length; i++) {
-      const q = params.queries[i];
-      if (!q.tool && !q.provider && !q.category) {
-        return errorResult(
-          `Error: queries[${i}] must have at least one of 'tool', 'provider', or 'category'.`,
-        );
-      }
-    }
+  private async handleSearchTools(params: SearchToolsParams): Promise<CallToolResult> {
+    const problem = searchQueriesProblem(params.queries);
+    if (problem !== null) return errorResult(`Error: ${problem}`);
 
-    const result = this.toolSearchService.search(params);
+    let result: SearchToolsResponse;
+    try {
+      result = await this.search(params);
+    } catch (err) {
+      return errorResult(`Error: tools can't be searched: ${err instanceof Error ? err.message : String(err)}`);
+    }
     this.sessionStats.recordSearchResponse(JSON.stringify(result));
     const snapshot = this.sessionStats.getSnapshot();
     const response: object = this.options.showStats ? { session_stats: snapshot, ...result } : result;
@@ -267,7 +254,8 @@ export class BridgeServer {
     const toolKey = `${parsed.source}__${parsed.toolName}`;
     const decision = this.policyEngine?.evaluate(parsed.source, parsed.toolName, args);
     throwIfDenied(decision);
-    if (decision?.kind === "prompt") {
+    const needsApproval = decision?.kind === "prompt";
+    if (needsApproval) {
       if (!connection.client.supportsFormElicitation(ctx)) {
         throw new Error(`Tool ${toolKey} requires confirmation but the client does not support elicitation`);
       }
@@ -286,47 +274,20 @@ export class BridgeServer {
       throw new Error(`Upstream server not found: ${parsed.source}`);
     }
 
-    const waitOptions = {
+    const client = await awaitConnectedClient(parsed.source, {
       getClient,
       onClientsChanged: this.options.onClientsChanged,
       signal,
-      logger: this.options.logger,
-    };
-    await awaitConnectedClient(parsed.source, waitOptions);
-
-    const rateLimiter = this.options.getRateLimiter?.(parsed.source);
-    if (rateLimiter) {
-      try {
-        await rateLimiter.acquire(signal);
-      } catch (err) {
-        if (signal.aborted) throw cancelledError();
-        if (err instanceof RateLimiterDisposedError) throw removedError(parsed.source);
-        throw err;
-      }
-    }
-
-    const client = await awaitConnectedClient(parsed.source, waitOptions);
-    this.refuseIfPolicyTightened(parsed.source, parsed.toolName, args, decision);
+      logger: this.options.logger?.child({ component: "bridge" }),
+    });
     try {
-      return await client.callTool({ name: parsed.toolName, arguments: args }, { signal });
+      return await client.callTool({ name: parsed.toolName, arguments: args }, { signal, ...(needsApproval && { approved: true }) });
     } catch (err) {
       if (signal.aborted) throw cancelledError();
+      if (err instanceof CallRefusedError) throw err;
       if (client.status === "auth_required") throw reauthorizationError(parsed.source, client.name);
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`Upstream server "${parsed.source}" error: ${message}`);
-    }
-  }
-
-  private refuseIfPolicyTightened(
-    source: string,
-    toolName: string,
-    args: Record<string, unknown> | undefined,
-    decisionBeforeWait: PolicyDecision | undefined,
-  ): void {
-    const decision = this.policyEngine?.evaluate(source, toolName, args);
-    throwIfDenied(decision);
-    if (decision?.kind === "prompt" && decisionBeforeWait?.kind !== "prompt") {
-      throw new Error(`Tool ${source}__${toolName} now requires confirmation after a configuration change; please retry`);
     }
   }
 

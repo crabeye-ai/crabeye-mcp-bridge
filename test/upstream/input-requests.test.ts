@@ -6,7 +6,6 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import { HttpUpstreamClient } from "../../src/upstream/http-client.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
-import { ToolSearchService } from "../../src/search/index.js";
 import { createTestPair } from "../_helpers/bridge-test-pair.js";
 import { INPUT_ASKING_TOOLS, inputAskingServer } from "../_helpers/input-asking-server.js";
 import { readBody, sendWebResponse, toWebRequest } from "../_helpers/web-http.js";
@@ -141,7 +140,6 @@ describe("an upstream that asks the client for input", () => {
       registry.setToolsForSource("asker", INPUT_ASKING_TOOLS);
       const { client, cleanup } = await createTestPair({
         registry,
-        toolSearchService: new ToolSearchService(registry),
         getUpstreamClient: (name) => (name === "asker" ? (upstream as UpstreamClient) : undefined),
       });
       cleanups.push(cleanup);

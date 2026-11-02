@@ -171,7 +171,7 @@ describe("InstanceUpstreamClient", () => {
       const signal = new AbortController().signal;
 
       expect(await client.callTool({ name: "search", arguments: { q: "x" } }, { signal })).toEqual({ content: [{ type: "text", text: "ok" }] });
-      expect(link.callTool).toHaveBeenCalledWith("svc", { name: "search", arguments: { q: "x" } }, signal);
+      expect(link.callTool).toHaveBeenCalledWith("svc", { name: "search", arguments: { q: "x" } }, { signal });
     });
   });
 

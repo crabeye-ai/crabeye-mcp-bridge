@@ -1,7 +1,9 @@
 import { isAbsolute } from "node:path";
 import { CERTIFICATE_FILE_ENV_NAMES, isInstanceEnvName, isSpawnableEntry } from "../instance-env.js";
 import { MAX_CHILD_ENV_BYTES } from "./child-env.js";
-import type { AttachParams, AuthChangedParams, CallToolParams, CancelToolParams, InstanceSource, RetryParams } from "../protocol.js";
+import type { SearchQuery } from "../../search/index.js";
+import { SEARCH_TERMS } from "../../search/limits.js";
+import type { AttachParams, AuthChangedParams, CallToolParams, CancelToolParams, InstanceSource, RetryParams, SearchToolsRequest } from "../protocol.js";
 
 const MAX_PATH_BYTES = 4096;
 const MAX_ENV_COUNT = 64;
@@ -9,6 +11,7 @@ const MAX_ENV_VALUE_BYTES = 65_536;
 const MAX_CALL_ID_BYTES = 64;
 const MAX_UPSTREAM_NAME_BYTES = 256;
 const MAX_TOOL_NAME_BYTES = 1024;
+const SEARCH_NUMBERS = ["limit", "offset"] as const;
 
 /** The protocol version an ATTACH says its bridge speaks, read before the rest, whose shape depends on it. */
 export function bridgeProtocolVersionOf(raw: unknown): number | null {
@@ -30,10 +33,44 @@ export function parseAttachParams(raw: unknown): AttachParams | null {
 
 export function parseCallToolParams(raw: unknown): CallToolParams | null {
   if (!isPlainObject(raw)) return null;
-  const { callId, upstream, name, arguments: args } = raw;
+  const { callId, upstream, name, arguments: args, approved } = raw;
   if (!isBoundedString(callId, MAX_CALL_ID_BYTES) || !isUpstreamName(upstream) || !isBoundedString(name, MAX_TOOL_NAME_BYTES)) return null;
   if (args !== undefined && !isPlainObject(args)) return null;
-  return { callId, upstream, name, ...(args !== undefined && { arguments: args }) };
+  if (approved !== undefined && approved !== true) return null;
+  return { callId, upstream, name, ...(args !== undefined && { arguments: args }), ...(approved && { approved }) };
+}
+
+export function parseSearchToolsParams(raw: unknown): SearchToolsRequest | null {
+  if (!isPlainObject(raw) || !Array.isArray(raw.queries)) return null;
+  const queries: SearchQuery[] = [];
+  for (const query of raw.queries) {
+    const parsed = parseSearchQuery(query);
+    if (parsed === null) return null;
+    queries.push(parsed);
+  }
+  return { queries };
+}
+
+function parseSearchQuery(raw: unknown): SearchQuery | null {
+  if (!isPlainObject(raw)) return null;
+  const query: SearchQuery = {};
+  for (const field of SEARCH_TERMS) {
+    const value = raw[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string") return null;
+    query[field] = value;
+  }
+  for (const field of SEARCH_NUMBERS) {
+    const value = raw[field];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isFinite(value)) return null;
+    query[field] = value;
+  }
+  if (raw.expand_tools !== undefined) {
+    if (typeof raw.expand_tools !== "boolean") return null;
+    query.expand_tools = raw.expand_tools;
+  }
+  return query;
 }
 
 export function parseRetryParams(raw: unknown): RetryParams | null {

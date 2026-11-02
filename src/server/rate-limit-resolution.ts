@@ -3,8 +3,6 @@ import type {
   RateLimitConfig,
   ServerConfig,
 } from "../config/schema.js";
-import type { Logger } from "../logging/index.js";
-import { RateLimiter } from "./rate-limiter.js";
 
 /**
  * Fallback rate limit applied to every upstream that didn't pick one and
@@ -58,77 +56,10 @@ export function resolveRateLimitConfig(
   };
 }
 
-function makeDefaultBlockLogger(
-  name: string,
-  config: RateLimitConfig,
-  logger: Logger,
-): () => void {
-  return () => {
-    logger.info(
-      `default rate limit (${config.maxCalls} calls / ${config.windowSeconds}s) reached for "${name}"; ` +
-        `tune with _bridge.rateLimit or set _bridge.defaultRateLimit: false to opt out`,
-      { component: "rate_limit", upstream: name },
-    );
-  };
-}
-
-/**
- * Reconciles the live `rateLimiters` map against the resolved configuration
- * for the given upstreams. Used at startup and on every config hot-reload.
- *
- * Transitions:
- *  - new upstream resolves to a config → create a `RateLimiter`
- *  - existing upstream's config changed → `reconfigure()` + rewire callback
- *  - existing upstream resolves to `disabled` → `drainAndDispose()` (lift = resolve queued)
- *  - upstream vanished from config entirely → `dispose()` (reject queued; server is gone)
- *
- * The "default" source wires a one-shot INFO logger via `onFirstBlock`. Explicit
- * per-server limits do not log.
- */
-export function applyRateLimiters(args: {
-  upstreams: Record<string, ServerConfig>;
-  global: GlobalBridgeConfig;
-  rateLimiters: Map<string, RateLimiter>;
-  logger: Logger;
-}): void {
-  const { upstreams, global, rateLimiters, logger } = args;
-
-  // First pass: upstreams still present in config. `disabled` here means the
-  // operator lifted the limit (drain — let queued calls fire); a config-change
-  // is the user's intent, not a server going away.
-  for (const [name, serverConfig] of Object.entries(upstreams)) {
-    const resolved = resolveRateLimitConfig(serverConfig, global);
-    const existing = rateLimiters.get(name);
-
-    if (resolved.kind === "disabled") {
-      if (existing) {
-        existing.drainAndDispose();
-        rateLimiters.delete(name);
-      }
-      continue;
-    }
-
-    const onFirstBlock =
-      resolved.source === "default"
-        ? makeDefaultBlockLogger(name, resolved.config, logger)
-        : undefined;
-
-    if (existing) {
-      // Rewire the callback *before* reconfigure, so any waiter drained by
-      // reconfigure() can't see the stale (already-fired) callback.
-      existing.setOnFirstBlock(onFirstBlock);
-      existing.reconfigure(resolved.config);
-    } else {
-      rateLimiters.set(name, new RateLimiter(resolved.config, { onFirstBlock }));
-    }
-  }
-
-  // Second pass: upstreams that vanished from config — server is gone, so
-  // queued calls would 404 downstream anyway. Reject rather than drain.
-  for (const name of [...rateLimiters.keys()]) {
-    if (!(name in upstreams)) {
-      rateLimiters.get(name)!.dispose();
-      rateLimiters.delete(name);
-    }
-  }
+/** The one-time hint for when a default limit first makes a call to `name` wait. */
+export function defaultLimitReachedMessage(name: string, config: RateLimitConfig): string {
+  return (
+    `default rate limit (${config.maxCalls} calls / ${config.windowSeconds}s) reached for "${name}"; ` +
+    `tune with _bridge.rateLimit or set _bridge.defaultRateLimit: false to opt out`
+  );
 }
