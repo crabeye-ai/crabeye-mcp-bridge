@@ -216,14 +216,14 @@ describe.skipIf(isWindows)("search and rate limits shared by every client of the
     const [a, b] = [await connect(config), await connect(config)];
     await call(a);
 
-    const queued = [...Array.from({ length: 5 }, () => call(a)), ...Array.from({ length: 5 }, () => call(b))].map((pending) => pending.catch(() => null));
-    let refusal: CallResult | undefined;
-    await until(async () => {
-      refusal = await call(b, "plain", AbortSignal.timeout(500)).catch(() => undefined);
-      return refusal !== undefined;
-    }, 20_000);
+    const answered: CallResult[] = [];
+    const queued = [...Array.from({ length: 6 }, () => call(a)), ...Array.from({ length: 6 }, () => call(b))].map((pending) =>
+      pending.then((result) => answered.push(result), () => null),
+    );
 
-    expect(refusal).toMatchObject({ isError: true, content: [{ text: "Rate limit queue full" }] });
+    await until(() => answered.length === 2, 20_000);
+
+    expect(answered).toEqual(Array(2).fill(expect.objectContaining({ isError: true, content: [{ type: "text", text: "Rate limit queue full" }] })));
     await Promise.all(bridges.splice(0).map((bridge) => bridge.client.close().catch(() => {})));
     await Promise.all(queued);
   });
