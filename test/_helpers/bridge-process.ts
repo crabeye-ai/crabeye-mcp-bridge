@@ -41,9 +41,13 @@ export interface BridgeProcess {
   notifications: () => string[];
 }
 
+export type PromptAnswer = "accept" | "decline" | "cancel";
+
 export interface BridgeLaunch {
   extraArgs?: string[];
   modern?: boolean;
+  /** Makes the client answer approval prompts, with what this returns for each prompt's message. */
+  elicit?: (message: string) => Promise<PromptAnswer>;
 }
 
 /** `configPath` null starts the bridge without `--config`, on the default config. */
@@ -51,7 +55,7 @@ export async function connectBridgeProcess(
   script: string,
   configPath: string | null,
   env: NodeJS.ProcessEnv,
-  { extraArgs = [], modern = false }: BridgeLaunch = {},
+  { extraArgs = [], modern = false, elicit }: BridgeLaunch = {},
 ): Promise<BridgeProcess> {
   const definedEnv = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
   const transport = new StdioClientTransport({
@@ -62,7 +66,16 @@ export async function connectBridgeProcess(
   });
   let stderr = "";
   transport.stderr!.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-  const client = new Client({ name: "test-client", version: "0" }, modern ? { versionNegotiation: { mode: "auto" } } : undefined);
+  const client = new Client(
+    { name: "test-client", version: "0" },
+    { ...(modern && { versionNegotiation: { mode: "auto" } }), ...(elicit && { capabilities: { elicitation: {} } }) },
+  );
+  if (elicit !== undefined) {
+    client.setRequestHandler("elicitation/create", async (request) => {
+      const action = await elicit(request.params.message);
+      return action === "accept" ? { action, content: {} } : { action };
+    });
+  }
   const notifications: string[] = [];
   client.fallbackNotificationHandler = async (notification) => {
     notifications.push(notification.method);

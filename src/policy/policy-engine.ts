@@ -1,10 +1,14 @@
-import type { ElicitRequestFormParams } from "@modelcontextprotocol/server";
 import type { ToolPolicy, ServerBridgeConfig } from "../config/schema.js";
+import { escapeMatching } from "../logging/escape.js";
+import { escapeLabel } from "../logging/labels.js";
 
 export type PolicyDecision =
   | { kind: "allow" }
   | { kind: "deny"; reason: string }
-  | { kind: "prompt"; request: ElicitRequestFormParams };
+  | { kind: "prompt"; message: string };
+
+/** Control, invisible and direction-changing characters a prompt shows as escapes, so the arguments a user approves read as they will run. */
+const DECEPTIVE_CHARACTERS = /[\x7f-\x9f\u2028\u2029\u2800\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
 
 export class PolicyEngine {
   private globalPolicy: ToolPolicy;
@@ -54,13 +58,7 @@ export class PolicyEngine {
       };
     }
 
-    // policy === "prompt"
-    return {
-      kind: "prompt",
-      request: {
-        message: `Allow ${source}__${toolName} to run?\n\nArguments:\n${JSON.stringify(args ?? {}, null, 2)}`,
-        requestedSchema: { type: "object", properties: {} },
-      },
-    };
+    const shownArgs = escapeMatching(JSON.stringify(args ?? {}, null, 2), DECEPTIVE_CHARACTERS);
+    return { kind: "prompt", message: `Allow ${escapeLabel(`${source}__${toolName}`)} to run?\n\nArguments:\n${shownArgs}` };
   }
 }

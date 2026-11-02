@@ -73,7 +73,7 @@ describe.skipIf(process.platform === "win32")("ManagerDaemon with instances", ()
     await start();
     const { client, notifications } = await bridge();
 
-    expect(await client.call("ATTACH", attachParams)).toEqual({ upstreams: ["svc"] });
+    expect(await client.call("ATTACH", attachParams)).toEqual({ upstreams: ["svc"], logLevel: "info" });
     expect(notifications).toEqual([{ method: "UPSTREAM", params: { name: "svc", status: "connected", tools: [] } }]);
     const status = (await client.call("STATUS")) as StatusResult;
     expect(status.instances).toEqual([{ source, bridges: 1, upstreams: ["svc"] }]);

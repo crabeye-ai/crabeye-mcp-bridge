@@ -6,6 +6,8 @@ import type { UpstreamLink, UpstreamView } from "../../src/upstream/instance-lin
 export class FakeInstanceLink implements UpstreamLink {
   isAttached = true;
   private readonly views = new Map<string, Set<UpstreamView>>();
+  private readonly names = new Set<string>();
+  private readonly namesListeners = new Set<() => void>();
   readonly snapshots = new Map<string, UpstreamSnapshot>();
   attach = vi.fn(async () => {});
   attachNow = vi.fn(async () => {});
@@ -26,6 +28,22 @@ export class FakeInstanceLink implements UpstreamLink {
 
   snapshot(name: string): UpstreamSnapshot | undefined {
     return this.snapshots.get(name);
+  }
+
+  upstreamNames(): string[] {
+    return [...this.names];
+  }
+
+  onUpstreamsChanged(listener: () => void): () => void {
+    this.namesListeners.add(listener);
+    return () => this.namesListeners.delete(listener);
+  }
+
+  /** The instance has these upstreams now, as an attach or its updates would say. */
+  setUpstreams(names: string[]): void {
+    this.names.clear();
+    for (const name of names) this.names.add(name);
+    for (const listener of [...this.namesListeners]) listener();
   }
 
   send(snapshot: UpstreamSnapshot): void {

@@ -262,7 +262,7 @@ export class PooledUpstream {
 }
 
 /** Logs to `inner` and also hands warnings and errors to `report`, with the context that is safe to send. */
-class ReportingLogger implements Logger {
+export class ReportingLogger implements Logger {
   constructor(
     private readonly _inner: Logger,
     private readonly _report: UpstreamReport,

@@ -16,6 +16,17 @@ export interface UpstreamWaitOptions<C extends WaitableClient = UpstreamClient> 
 
 type WaitOutcome = "changed" | "timeout" | "cancelled";
 
+/** Settles when `work` does, or once `WAIT_FOR_RESPAWN_MS` has passed. */
+export async function atMostRespawnWait(work: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeUp = new Promise<void>((resolve) => (timer = setTimeout(resolve, WAIT_FOR_RESPAWN_MS)));
+  try {
+    await Promise.race([work, timeUp]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function untilSettledOrCancelled(work: Promise<void>, signal: AbortSignal): Promise<void> {
   if (signal.aborted) throw cancelledError();
   let onAbort!: () => void;

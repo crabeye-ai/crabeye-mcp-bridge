@@ -2,6 +2,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { dirname, basename } from "node:path";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
+import { describeConfigError } from "./loader.js";
 import type { BridgeConfig } from "./schema.js";
 
 export interface ConfigWatcherOptions {
@@ -9,6 +10,8 @@ export interface ConfigWatcherOptions {
   loadConfig: () => Promise<BridgeConfig>;
   debounceMs?: number;
   logger?: Logger;
+  /** Reports a config that fails to load, in place of the watcher's own warning. */
+  onLoadError?: (err: unknown) => void;
 }
 
 export class ConfigWatcher {
@@ -16,6 +19,7 @@ export class ConfigWatcher {
   private _loadConfig: () => Promise<BridgeConfig>;
   private _debounceMs: number;
   private _logger: Logger;
+  private _onLoadError: ((err: unknown) => void) | undefined;
   private _watchers: FSWatcher[] = [];
   private _timer: ReturnType<typeof setTimeout> | undefined;
   private _listener: ((config: BridgeConfig) => void | Promise<void>) | undefined;
@@ -28,6 +32,7 @@ export class ConfigWatcher {
     this._loadConfig = options.loadConfig;
     this._debounceMs = options.debounceMs ?? 500;
     this._logger = options.logger ?? createNoopLogger();
+    this._onLoadError = options.onLoadError;
   }
 
   start(
@@ -155,10 +160,8 @@ export class ConfigWatcher {
         this._finishReload();
       },
       (err) => {
-        this._logger.warn("failed to reload config", {
-          component: "config-watcher",
-          error: err instanceof Error ? err.message : String(err),
-        });
+        if (this._onLoadError !== undefined) this._onLoadError(err);
+        else this._logger.warn("failed to reload config", { component: "config-watcher", error: describeConfigError(err) });
         this._finishReload();
       },
     );

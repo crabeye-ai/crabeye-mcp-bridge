@@ -1,6 +1,3 @@
-import type { BridgeConfig, ServerConfig, HttpServerConfig } from "../config/schema.js";
-import { isStdioServer, resolveUpstreams } from "../config/schema.js";
-import type { ConfigDiff } from "../config/config-diff.js";
 import type { Logger } from "../logging/index.js";
 import { createNoopLogger } from "../logging/index.js";
 import type { ToolRegistry } from "../server/tool-registry.js";
@@ -10,20 +7,18 @@ import type { UpstreamLink } from "./instance-link.js";
 import { authorizationPausedMessage, type UpstreamClient } from "./types.js";
 
 export type UpstreamManagerOptions = {
-  config: BridgeConfig;
+  /** The upstreams to stand in for until the instance says which it has. */
+  names: string[];
   toolRegistry: ToolRegistry;
   logger?: Logger;
 } & (
   | {
-      /** The bridge's link to its daemon instance, which connects every upstream. `closeAll` closes it. */
+      /** The bridge's link to its daemon instance, which connects every upstream and says which it has. `closeAll` closes it. */
       instanceLink: UpstreamLink;
-      _clientFactory?: undefined;
+      /** Clients for tests to use instead of stand-ins on the link. */
+      _clientFactory?: UpstreamClientFactory;
     }
-  | {
-      instanceLink?: undefined;
-      /** Clients for tests to use instead of the daemon's. */
-      _clientFactory: UpstreamClientFactory;
-    }
+  | { instanceLink?: undefined; _clientFactory: UpstreamClientFactory }
 );
 
 interface Registered {
@@ -32,45 +27,43 @@ interface Registered {
   unsubscribers: Array<() => void>;
 }
 
+/** How connecting one upstream went; `removed` when it was dropped before it got there. */
+type ConnectOutcome = { name: string; error?: string; removed?: true };
+
 export interface ConnectAllResult {
   total: number;
   connected: number;
   failed: Array<{ name: string; error: string }>;
 }
 
+/**
+ * The bridge's stand-ins for its instance's upstreams, one per name: first
+ * the names it was given, then the ones the instance reports, as it gains
+ * and loses them.
+ */
 export class UpstreamManager {
-  private _config: BridgeConfig;
+  private _names: string[];
   private _toolRegistry: ToolRegistry;
   private _logger: Logger;
   private _clientFactory: UpstreamClientFactory;
   private _clients = new Map<string, Registered>();
   private _instanceLink: UpstreamLink | undefined;
   private _clientsChangedListeners = new Set<() => void>();
+  private _unfollow: (() => void) | undefined;
 
   constructor(options: UpstreamManagerOptions) {
-    this._config = options.config;
+    this._names = options.names;
     this._toolRegistry = options.toolRegistry;
     this._logger = options.logger ?? createNoopLogger();
     this._instanceLink = options.instanceLink;
 
-    this._clientFactory = options._clientFactory ?? defaultClientFactory(options.instanceLink);
+    this._clientFactory = options.instanceLink === undefined ? options._clientFactory : (options._clientFactory ?? defaultClientFactory(options.instanceLink));
   }
 
-  private async _addClient(
-    name: string,
-    serverConfig: ServerConfig,
-  ): Promise<{ name: string; error?: string }> {
-    if (this._clients.has(name)) {
-      // Already added (e.g. duplicate config key handled upstream).
-      return { name };
-    }
-
+  private async _addClient(name: string): Promise<ConnectOutcome> {
+    if (this._clients.has(name)) return { name };
     const log = this._logger.child({ component: "upstream", server: name });
-    const transport = isStdioServer(serverConfig)
-      ? "stdio"
-      : (serverConfig as HttpServerConfig).type;
-    log.info(`connecting (${transport})`);
-
+    log.info("connecting");
     return this._connect(this._register(name, log), name, log);
   }
 
@@ -108,11 +101,12 @@ export class UpstreamManager {
     registered.unsubscribers.push(unsubTools, unsubStatus);
   }
 
-  private async _connect(registered: Registered, name: string, log: Logger): Promise<{ name: string; error?: string }> {
+  private async _connect(registered: Registered, name: string, log: Logger): Promise<ConnectOutcome> {
     try {
       await registered.client.connect();
       return { name };
     } catch (err) {
+      if (this._clients.get(name) !== registered) return { name, removed: true };
       const message = err instanceof Error ? err.message : String(err);
       log.error(`failed to connect: ${message}`);
       return { name, error: message };
@@ -128,24 +122,43 @@ export class UpstreamManager {
     await registered.client.close().catch(() => {});
   }
 
+  /** Settles once the instance has said which upstreams it has, or at once without one. */
+  async upstreamsKnown(): Promise<void> {
+    await this._instanceLink?.attachNow().catch(() => {});
+  }
+
+  /** Connects every upstream, then follows the instance as it gains and loses them. */
   async connectAll(): Promise<ConnectAllResult> {
-    const entries = Object.entries(resolveUpstreams(this._config));
-    const connectPromises: Promise<{ name: string; error?: string }>[] = [];
-
-    for (const [name, serverConfig] of entries) {
-      connectPromises.push(this._addClient(name, serverConfig));
-    }
-
-    const outcomes = await Promise.all(connectPromises);
-    const failed = outcomes.filter((o) => o.error !== undefined) as Array<{ name: string; error: string }>;
+    const link = this._instanceLink;
+    this._unfollow ??= link?.onUpstreamsChanged(() => this._follow(link));
+    if (this._names.length === 0) await link?.attach().catch(() => {});
+    const outcomes = (await Promise.all(this._names.map((name) => this._addClient(name)))).filter((outcome) => !outcome.removed);
+    const failed = outcomes.filter((o): o is ConnectOutcome & { error: string } => o.error !== undefined);
     return {
-      total: entries.length,
-      connected: entries.length - failed.length,
+      total: outcomes.length,
+      connected: outcomes.length - failed.length,
       failed,
     };
   }
 
+  private _follow(link: UpstreamLink): void {
+    const names = new Set(link.upstreamNames());
+    for (const name of names) {
+      if (this._clients.has(name)) continue;
+      this._logger.info("adding server", { component: "upstream", server: name });
+      void this._addClient(name);
+    }
+    if (!link.isAttached) return;
+    for (const name of [...this._clients.keys()]) {
+      if (names.has(name)) continue;
+      this._logger.info("removing server", { component: "upstream", server: name });
+      void this._removeClient(name);
+      this._notifyClientsChanged();
+    }
+  }
+
   async closeAll(): Promise<void> {
+    this._unfollow?.();
     const all = [...this._clients];
     this._clients.clear();
     for (const [, registered] of all) {
@@ -156,32 +169,7 @@ export class UpstreamManager {
     await this._instanceLink?.close();
   }
 
-  async applyConfigDiff(diff: ConfigDiff, newConfig: BridgeConfig): Promise<void> {
-    // 1. Remove deleted servers
-    for (const name of diff.servers.removed) {
-      this._logger.info(`removing server`, { component: "reload", server: name });
-      await this._removeClient(name);
-      this._notifyClientsChanged();
-    }
-
-    // 2. Add new servers
-    for (const { name, config } of diff.servers.added) {
-      this._logger.info(`adding server`, { component: "reload", server: name });
-      const result = await this._addClient(name, config);
-      if (result.error) {
-        this._logger.warn(`server failed to connect after reload`, {
-          component: "reload", server: name, error: result.error,
-        });
-      }
-    }
-
-    // 3. Log changed servers
-    for (const { name } of diff.servers.changed) this._logger.info(`server changed`, { component: "reload", server: name });
-
-    this._config = newConfig;
-  }
-
-  /** Fires when a reload removes a server or a client is registered under a name; returns an unsubscribe. */
+  /** Fires when an upstream is removed or a client is registered under a name; returns an unsubscribe. */
   onClientsChanged(listener: () => void): () => void {
     this._clientsChangedListeners.add(listener);
     return () => this._clientsChangedListeners.delete(listener);
@@ -193,11 +181,5 @@ export class UpstreamManager {
 
   getClient(name: string): UpstreamClient | undefined {
     return this._clients.get(name)?.client;
-  }
-
-  retryAuthPaused(): void {
-    for (const { client } of this._clients.values()) {
-      if (client.status === "auth_required") void client.retryNow();
-    }
   }
 }

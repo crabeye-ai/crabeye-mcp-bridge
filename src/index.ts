@@ -1,27 +1,18 @@
 import { Command, InvalidArgumentError, Option } from "commander";
-import {
-  loadConfig,
-  ConfigError,
-  resolveConfigPath,
-  diffConfigs,
-  ConfigWatcher,
-} from "./config/index.js";
-import { loadMergedConfig } from "./config/merged-loader.js";
-import { findSelfReferences, resolveUpstreams, isHttpServer, isStdioServer, serverBridgeConfigs } from "./config/schema.js";
-import { warnRemovedSettings } from "./config/removed-settings.js";
+import { loadConfig, ConfigError } from "./config/index.js";
+import { leftOutWarning, loadMergedConfig } from "./config/merged-loader.js";
+import { findSelfReferences, resolveUpstreams, isHttpServer, isStdioServer } from "./config/schema.js";
+import { SELF_REFERENCE_REASON, warnAboutConfig } from "./config/removed-settings.js";
 import { launchedByAnotherBridge } from "./upstream/launch-guard.js";
-import type { BridgeConfig, HttpServerConfig } from "./config/schema.js";
+import type { HttpServerConfig } from "./config/schema.js";
 import { BridgeServer } from "./server/index.js";
 import { ToolRegistry } from "./server/tool-registry.js";
-import { renderPassthrough } from "./server/passthrough.js";
-import { PolicyEngine } from "./policy/index.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { InstanceLink, instanceSourceFor } from "./upstream/instance-link.js";
 import { childEnvFrom, FOLLOWED_NODE_OPTIONS, instanceEnvFrom, unfollowedNodeOptions } from "./daemon/instance-env.js";
 import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning, tellManagerAuthChanged } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
 import { createLogger } from "./logging/index.js";
-import type { Logger } from "./logging/index.js";
 import {
   CredentialStore,
   CredentialSchema,
@@ -41,14 +32,6 @@ function parseAwaitPredecessorMs(value: string): number {
   return ms;
 }
 
-const SELF_REFERENCE_REASON = `it launches ${APP_NAME} itself`;
-
-function logSelfReferences(config: BridgeConfig, logger: Logger): void {
-  for (const name of findSelfReferences(config)) {
-    logger.info(`skipping server "${name}": ${SELF_REFERENCE_REASON}`, { component: "config" });
-  }
-}
-
 const program = new Command();
 
 program
@@ -64,28 +47,15 @@ program
   .action(async (options) => {
     let server: BridgeServer | undefined;
     let upstreamManager: UpstreamManager | undefined;
-    let configWatcher: ConfigWatcher | undefined;
 
     try {
-      // Config resolution: --config / MCP_BRIDGE_CONFIG → single-file load,
-      // otherwise try merged loader (bridge-owned config + client configs).
       const explicitPath = options.config || process.env.MCP_BRIDGE_CONFIG;
-      let config: Awaited<ReturnType<typeof loadMergedConfig>>["config"];
-      let watchPaths: string[];
-
-      if (explicitPath) {
-        // Backwards-compatible: explicit path provided
-        const configPath = resolveConfigPath({ configPath: options.config });
-        config = await loadConfig({ configPath });
-        watchPaths = [configPath];
-      } else {
-        // Try merged loader (bridge-owned config + client configs)
-        const merged = await loadMergedConfig();
-        config = merged.config;
-        watchPaths = merged.watchPaths;
-      }
+      const { config, skipped } = explicitPath
+        ? { config: await loadConfig({ configPath: explicitPath }), skipped: [] }
+        : await loadMergedConfig();
 
       const upstreams = resolveUpstreams(config);
+      const names = Object.keys(upstreams);
 
       const logger = createLogger({
         level: config._bridge.logLevel,
@@ -107,6 +77,7 @@ program
         for (const name of findSelfReferences(config)) {
           process.stderr.write(`  ${name} skipped: ${SELF_REFERENCE_REASON}\n`);
         }
+        for (const file of skipped) process.stderr.write(`  ${leftOutWarning(file)}\n`);
         return;
       }
 
@@ -119,18 +90,18 @@ program
         return;
       }
 
-      warnRemovedSettings(config, logger);
+      for (const { message } of skipped) logger.warn(`${message}; this client gets that file's servers only if the manager already has them`, { component: "config" });
+      warnAboutConfig(config, logger);
       if (options.discoveryMode !== undefined) {
         logger.warn("--discovery-mode no longer has any effect and is ignored; the bridge only exposes search_tools and run_tool", { component: "config" });
       }
-      logSelfReferences(config, logger);
       const toolRegistry = new ToolRegistry();
 
       // Start the manager daemon early so the first connects find it serving,
       // without holding up the client: recovering a wedged daemon can outlast
       // the client's initialize timeout, and each upstream keeps retrying on
       // its own.
-      if (Object.keys(upstreams).length > 0) {
+      if (names.length > 0) {
         ensureDaemonRunning({ logger }).catch((err: unknown) => {
           logger.error(`failed to start manager daemon: ${err instanceof Error ? err.message : String(err)}`, {
             component: "bridge",
@@ -146,6 +117,7 @@ program
       }
 
       const daemonSettings = config._bridge.daemon;
+      let logLevel = config._bridge.logLevel;
       const instanceLink = new InstanceLink({
         source: instanceSourceFor(explicitPath),
         env: instanceEnvFrom(process.env),
@@ -155,17 +127,21 @@ program
         heartbeatMs: daemonSettings.heartbeatMs,
         respawnLockWaitMs: daemonSettings.respawnLockWaitMs,
         reconnect: config._bridge.reconnect,
+        onLogLevel: (level) => {
+          if (level === logLevel) return;
+          logLevel = level;
+          logger.setLevel(level);
+          logger.info(`log level changed to ${level}`, { component: "config" });
+        },
       });
-      upstreamManager = new UpstreamManager({ config, toolRegistry, logger, instanceLink });
-
-      const policyEngine = new PolicyEngine(config._bridge.toolPolicy, serverBridgeConfigs(upstreams));
+      upstreamManager = new UpstreamManager({ names, toolRegistry, logger, instanceLink });
 
       server = new BridgeServer({
         toolRegistry,
         search: (params) => instanceLink.search(params),
-        policyEngine,
         logger,
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
+        upstreamsKnown: () => upstreamManager!.upstreamsKnown(),
         onClientsChanged: (listener) => upstreamManager!.onClientsChanged(listener),
         showStats: options.stats === true,
         onSearchStats: (stats) => {
@@ -174,74 +150,15 @@ program
             { component: "stats" },
           );
         },
-        buildPassthrough: () =>
-          renderPassthrough({
-            upstreams: resolveUpstreams(config),
-            getInstructions: (name) =>
-              upstreamManager!.getClient(name)?.instructions,
-            getTools: (name) =>
-              toolRegistry
-                .listRegisteredTools()
-                .filter((r) => r.source === name)
-                .map((r) => r.tool),
-            resolvePolicy: (name, toolName) =>
-              policyEngine.resolvePolicy(name, toolName),
-          }),
       });
       await server.start();
 
-      const serverCount = Object.keys(upstreams).length;
+      const serverCount = names.length;
       logger.info(`${APP_NAME} running — will connect to ${serverCount} upstream server${serverCount === 1 ? "" : "s"} once the client starts its session`, { component: "bridge" });
-
-      // Config hot-reload handler
-      const onConfigReload = async (newConfig: typeof config) => {
-        const diff = diffConfigs(config, newConfig);
-
-        // Bridge-level hot-reloadable settings
-        if (diff.bridge.logLevel) {
-          logger.setLevel(diff.bridge.logLevel);
-          logger.info(`log level changed to ${diff.bridge.logLevel}`, { component: "reload" });
-        }
-
-        warnRemovedSettings(newConfig, logger);
-        logSelfReferences(newConfig, logger);
-
-        if (diff.bridge.requiresRestart.length > 0) {
-          logger.warn(
-            `config changed for ${diff.bridge.requiresRestart.join(", ")} — restart required`,
-            { component: "reload" },
-          );
-        }
-
-        // Always update the policy engine with the full new state
-        const newUpstreams = resolveUpstreams(newConfig);
-        const newBridgeConfigs = serverBridgeConfigs(newUpstreams);
-        policyEngine.update(newConfig._bridge.toolPolicy, newBridgeConfigs);
-
-        if (diff.bridge.toolPolicy) {
-          logger.info(`tool policy changed to ${diff.bridge.toolPolicy}`, { component: "reload" });
-        }
-
-        // Server-level changes
-        const hasServerChanges =
-          diff.servers.added.length > 0 ||
-          diff.servers.removed.length > 0 ||
-          diff.servers.changed.length > 0;
-
-        if (hasServerChanges) {
-          await upstreamManager!.applyConfigDiff(diff, newConfig);
-        }
-
-        upstreamManager!.retryAuthPaused();
-
-        config = newConfig;
-      };
 
       // Connect upstreams in the background once the client starts its session
       // (a client that only checks the protocol version never triggers this) —
-      // tools appear as each server connects. Config watching starts only after
-      // initial connections settle to avoid race conditions between connectAll
-      // and applyConfigDiff.
+      // tools appear as each server connects.
       server.sessionStarted().then(() => upstreamManager!.connectAll()).then((result) => {
         const tools = toolRegistry.listRegisteredTools().length;
         if (result.failed.length === 0) {
@@ -254,21 +171,6 @@ program
         }
       }).catch(() => {
         // Individual failures already logged by UpstreamManager.
-      }).finally(() => {
-        // Start config watching after initial connections settle to avoid
-        // race conditions between connectAll and applyConfigDiff.
-        configWatcher = new ConfigWatcher({
-          configPaths: watchPaths,
-          loadConfig: async () => {
-            if (explicitPath) {
-              return loadConfig({ configPath: explicitPath });
-            }
-            const merged = await loadMergedConfig();
-            return merged.config;
-          },
-          logger,
-        });
-        configWatcher.start(onConfigReload, config);
       });
     } catch (err) {
       if (err instanceof ConfigError) {
@@ -289,7 +191,6 @@ program
       shuttingDown = true;
       setTimeout(() => process.exit(exitCode), SHUTDOWN_DEADLINE_MS).unref();
       try {
-        configWatcher?.stop();
         if (upstreamManager) {
           await upstreamManager.closeAll();
         }

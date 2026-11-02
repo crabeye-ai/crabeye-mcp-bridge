@@ -8,17 +8,18 @@
  *   response:     { id, result | error }        reply to request
  *   notification: { method, params? }           no `id`, no reply expected
  *
- * Notification frames carry what needs no reply: upstream snapshots and
- * logs to bridges, and cancellations to the daemon.
+ * Notification frames carry what needs no reply: upstream snapshots, logs
+ * and settings to bridges, and cancellations to the daemon.
  */
 
 import type { Tool } from "@modelcontextprotocol/client";
+import type { LogLevel } from "../logging/index.js";
 import type { SearchToolsParams, SearchToolsResponse } from "../search/index.js";
 import type { ConnectionStatus } from "../upstream/types.js";
 
-export const PROTOCOL_VERSION = 5;
-export const MIN_BRIDGE_PROTOCOL_VERSION = 5;
-export const MIN_DAEMON_PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
+export const MIN_BRIDGE_PROTOCOL_VERSION = 6;
+export const MIN_DAEMON_PROTOCOL_VERSION = 6;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
@@ -56,7 +57,8 @@ export type DaemonMethod =
   | "AUTH_CHANGED"
   | "UPSTREAM"
   | "UPSTREAM_REMOVED"
-  | "LOG";
+  | "LOG"
+  | "SETTINGS";
 
 export interface DaemonRequest {
   id: string;
@@ -122,6 +124,13 @@ export interface AttachParams {
 /** Sent after one `UPSTREAM` notification per name. */
 export interface AttachResult {
   upstreams: string[];
+  /** The log level the instance's config sets for its bridges. */
+  logLevel: LogLevel;
+}
+
+/** `SETTINGS.params`: what a reload changed in the settings the instance gives its bridges. */
+export interface SettingsParams {
+  logLevel: LogLevel;
 }
 
 /** Why a bridge can't use an upstream the daemon doesn't have. */
@@ -180,12 +189,13 @@ export interface AuthChangedResult {
   connections: number;
 }
 
-export type UpstreamLogLevel = "debug" | "info" | "warn" | "error";
+export type UpstreamLogLevel = LogLevel;
 
 export type UpstreamLogContext = Record<string, string | number | boolean>;
 
 export interface UpstreamLogParams {
-  upstream: string;
+  /** The upstream the line is about; absent for the instance's own lines, such as a config that fails to reload. */
+  upstream?: string;
   level: UpstreamLogLevel;
   message: string;
   context?: UpstreamLogContext;
@@ -257,6 +267,8 @@ export const ERROR_CODE_TOO_MANY_INSTANCES = "too_many_instances";
 export const ERROR_CODE_RESPONSE_TOO_LARGE = "response_too_large";
 /** The manager didn't make the call; the message is what the client should be told, as is. */
 export const ERROR_CODE_CALL_REFUSED = "call_refused";
+/** The call needs the client's approval; the message is the question to ask. Sent again with `approved` once given. */
+export const ERROR_CODE_APPROVAL_REQUIRED = "approval_required";
 
 export interface RestartParams {
   upstreamHash: string;

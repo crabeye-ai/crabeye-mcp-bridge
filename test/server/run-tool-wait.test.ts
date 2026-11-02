@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
-import { PolicyEngine } from "../../src/policy/policy-engine.js";
 import { CallRefusedError } from "../../src/upstream/call-errors.js";
 import type { StatusChangeCallback, UpstreamClient } from "../../src/upstream/types.js";
 import {
@@ -40,14 +39,13 @@ describe.each([false, true])("run_tool waits across reloads and cancellation (mo
     expect(leftoverListeners).toBe(0);
   });
 
-  async function connect(policyEngine?: PolicyEngine): Promise<Pair> {
+  async function connect(): Promise<Pair> {
     const registry = new ToolRegistry();
     registry.setToolsForSource("srv", [makeTool("srv__op")]);
     pair = await createTestPair({
       registry,
       modern,
       getUpstreamClient: upstreams.get,
-      policyEngine,
       onClientsChanged: upstreams.onClientsChanged,
     });
     return pair;
@@ -82,10 +80,27 @@ describe.each([false, true])("run_tool waits across reloads and cancellation (mo
     expect(down.callTool).not.toHaveBeenCalled();
   });
 
-  it("doesn't say a call was approved when its policy needed no approval", async () => {
+  it("calls an upstream the bridge learns of only once it knows which upstreams it has", async () => {
+    upstreams.set("srv", undefined);
+    let learn!: () => void;
+    const known = new Promise<void>((resolve) => (learn = resolve));
+    const registry = new ToolRegistry();
+    const upstreamsKnown = vi.fn(() => known);
+    pair = await createTestPair({ registry, modern, getUpstreamClient: upstreams.get, onClientsChanged: upstreams.onClientsChanged, upstreamsKnown });
+    const learned = makeMockUpstreamClient("srv", { callTool: vi.fn().mockResolvedValue({ content: [{ type: "text", text: "from learned" }] }) });
+
+    const call = pair.client.callTool(viaRunTool("srv__op"));
+    await vi.waitFor(() => expect(upstreamsKnown).toHaveBeenCalled());
+    upstreams.set("srv", learned);
+    learn();
+
+    expect((await call).content).toEqual([{ type: "text", text: "from learned" }]);
+  });
+
+  it("doesn't say a call was approved when the client wasn't asked", async () => {
     const upstream = makeMockUpstreamClient("srv");
     upstreams.set("srv", upstream);
-    const { client } = await connect(new PolicyEngine("always", {}));
+    const { client } = await connect();
 
     await client.callTool(viaRunTool("srv__op"));
 

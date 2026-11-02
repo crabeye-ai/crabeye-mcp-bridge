@@ -49,7 +49,7 @@ describe.skipIf(isWindows)("bridge process: upstream connections wait for the cl
     await rm(dir, { recursive: true, force: true });
   }, 20_000);
 
-  async function prepareWorkspace(upstreamKind: "http" | "stdio"): Promise<string> {
+  async function prepareWorkspace(upstreamKind: "http" | "stdio", bridgeSettings: Record<string, unknown> = {}): Promise<string> {
     dir = await mkdtemp("/tmp/cbe-session-");
     upstream = await startHeaderRecordingUpstream({ era: "modern" });
     const stub = join(dir, "stub.cjs");
@@ -58,12 +58,12 @@ describe.skipIf(isWindows)("bridge process: upstream connections wait for the cl
       ? { type: "streamable-http", url: upstream.url }
       : { command: process.execPath, args: [stub] };
     const configPath = join(dir, "client.json");
-    await writeFile(configPath, JSON.stringify({ mcpServers: { rec } }));
+    await writeFile(configPath, JSON.stringify({ mcpServers: { rec: { ...rec, _bridge: bridgeSettings } } }));
     return configPath;
   }
 
-  async function startBridge(upstreamKind: "http" | "stdio" = "http"): Promise<void> {
-    const configPath = await prepareWorkspace(upstreamKind);
+  async function startBridge(upstreamKind: "http" | "stdio" = "http", bridgeSettings: Record<string, unknown> = {}): Promise<void> {
+    const configPath = await prepareWorkspace(upstreamKind, bridgeSettings);
     const child = spawn(process.execPath, [cliScript, "--config", configPath], {
       stdio: "pipe",
       env: { ...process.env, HOME: dir },
@@ -88,8 +88,11 @@ describe.skipIf(isWindows)("bridge process: upstream connections wait for the cl
     return replies.get(message.id)!;
   }
 
-  it("sends nothing upstream when the client only probes the version and leaves", async () => {
-    await startBridge();
+  it.each([
+    ["", {}],
+    [", with passthrough configured", { passthrough: "tools" }],
+  ])("sends nothing upstream when the client only probes the version and leaves%s", async (_case, bridgeSettings) => {
+    await startBridge("http", bridgeSettings);
 
     expect(await request(VERSION_PROBE)).toMatchObject({ result: expect.any(Object) });
     await waitUntil(() => upstream.requests().length > 0, 1_000);

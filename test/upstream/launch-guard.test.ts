@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, onTestFinished } from "vite
 import { UPSTREAM_MARKER_ENV } from "../../src/constants.js";
 import { readParentPid } from "../../src/process/process-utils.js";
 import { launchedByAnotherBridge } from "../../src/upstream/launch-guard.js";
-import { AttachedBridge, fixtureSource, servingConfigs, spawnTestManager, stubServerFile, until, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
+import { AttachedBridge, fixtureSource, servingConfigs, spawnTestManager, stubServerFile, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { bundleForSubprocess } from "../_helpers/subprocess-bundle.js";
 
 let cli: string;
@@ -143,61 +143,4 @@ describe("skipped servers on the command line", () => {
     expect(result.stderr.match(/skipping server "b": it launches crabeye-mcp-bridge itself/g)).toHaveLength(1);
   });
 
-  async function reload(before: object, after: object, reloaded: string) {
-    const home = await mkdtemp(join(tmpdir(), "self-ref-reload-"));
-    const config = join(home, "config.json");
-    await writeFile(config, JSON.stringify(before));
-    const bridge = spawn(process.execPath, [cli, "--config", config], { env: { ...process.env, HOME: home }, cwd: home });
-    let stdout = "";
-    let stderr = "";
-    bridge.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    bridge.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    const skipLines = () => stderr.match(/skipping server "b": it launches crabeye-mcp-bridge itself/g)?.length ?? 0;
-    try {
-      bridge.stdin.write(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "initialize",
-          params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "reload-test", version: "1" } },
-        }) + "\n",
-      );
-      await until(() => stdout.includes('"id":1'), 15_000);
-      const atStartup = skipLines();
-      const write = () => void writeFile(config, JSON.stringify(after)).catch(() => {});
-      write();
-      const keepWriting = setInterval(write, 1_500);
-      try {
-        await until(() => stderr.includes(reloaded), 15_000);
-      } finally {
-        clearInterval(keepWriting);
-      }
-      await new Promise((r) => setTimeout(r, 500));
-      return { atStartup, total: skipLines(), stderr };
-    } finally {
-      bridge.kill();
-      await rm(home, { recursive: true, force: true });
-    }
-  }
-
-  it.skipIf(process.platform === "win32")("logs them under the new log level when a reload changes it", { timeout: 40_000 }, async () => {
-    const b = selfReferencing.mcpServers.b;
-    const run = await reload(
-      { mcpServers: { b }, _bridge: { logLevel: "warn" } },
-      { mcpServers: { b }, _bridge: { logLevel: "info" } },
-      "log level changed to info",
-    );
-
-    expect(run.atStartup).toBe(0);
-    expect(run.total).toBe(1);
-    expect(run.stderr).toMatch(/log level changed to info[\s\S]*skipping server "b"/);
-  });
-
-  it.skipIf(process.platform === "win32")("logs them again when the config reloads", { timeout: 40_000 }, async () => {
-    const b = selfReferencing.mcpServers.b;
-    const run = await reload({ mcpServers: { b } }, { mcpServers: { b }, _bridge: { logLevel: "debug" } }, "log level changed to debug");
-
-    expect(run.atStartup).toBe(1);
-    expect(run.total).toBe(2);
-  });
 });

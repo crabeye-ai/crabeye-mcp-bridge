@@ -251,6 +251,36 @@ describe("Instance", () => {
       expect(instance.status().upstreams).toEqual(["events", "local", "oauth", "plain"]);
     });
 
+    it("doesn't tell attachments again about a failed edit when a later reload fails the same way", async () => {
+      const instance = await open();
+      const bridge = recorder();
+      instance.attach(bridge);
+      deps.loadConfig = () => Promise.reject(new Error("Invalid JSON in config file"));
+      const failures = () => bridge.notifications.filter((n) => n.method === "LOG" && n.params.message === "failed to reload config");
+      await rewriteUntil(() => writeFile(configPath, "{ not json"), () => expect(failures()).toHaveLength(1));
+
+      await instance.reload();
+
+      expect(failures()).toHaveLength(1);
+    });
+
+    it("tells attachments about a failed reload again after an edit was put back", async () => {
+      const instance = await open();
+      const bridge = recorder();
+      instance.attach(bridge);
+      const load = deps.loadConfig;
+      const failures = () => bridge.notifications.filter((n) => n.method === "LOG" && n.params.message === "failed to reload config");
+      deps.loadConfig = () => Promise.reject(new Error("Invalid JSON in config file"));
+      await rewriteUntil(() => writeFile(configPath, "{ not json"), () => expect(failures()).toHaveLength(1));
+      deps.loadConfig = load;
+      await rewriteUntil(() => writeConfig(current), () => expect(log.debug).toHaveBeenCalledWith("config unchanged, skipping reload", expect.anything()));
+      deps.loadConfig = () => Promise.reject(new Error("Invalid JSON in config file"));
+
+      await instance.reload();
+
+      expect(failures()).toHaveLength(2);
+    });
+
     it("retries a server paused for authorization", async () => {
       await open();
       const plain = clients.find((c) => c.name === "plain")!;

@@ -14,6 +14,7 @@ import {
 } from "../daemon/index.js";
 import { DaemonRpcError } from "../daemon/client.js";
 import {
+  ERROR_CODE_APPROVAL_REQUIRED,
   ERROR_CODE_CALL_REFUSED,
   PROTOCOL_VERSION,
   type AttachParams,
@@ -21,13 +22,14 @@ import {
   type InstanceSource,
   type SearchToolsRequest,
   type SearchToolsResult,
+  type SettingsParams,
   type UpstreamLogParams,
   type UpstreamRemovedParams,
   type UpstreamSnapshot,
 } from "../daemon/protocol.js";
-import { createNoopLogger, type Logger } from "../logging/index.js";
+import { createNoopLogger, type Logger, type LogLevel } from "../logging/index.js";
 import { DEFAULT_RECONNECT_BASE_DELAY_MS, DEFAULT_RECONNECT_MAX_DELAY_MS } from "./base-client.js";
-import { CallRefusedError } from "./call-errors.js";
+import { ApprovalRequiredError, CallRefusedError } from "./call-errors.js";
 import { isConnectionStatus, type CallToolOptions } from "./types.js";
 import type { UpstreamReconnectInputs } from "./upstream-hash.js";
 
@@ -40,7 +42,10 @@ export function instanceSourceFor(explicitPath: string | undefined): InstanceSou
 }
 
 /** The link as the upstream manager and its stand-ins use it. */
-export type UpstreamLink = Pick<InstanceLink, "isAttached" | "attach" | "attachNow" | "snapshot" | "watch" | "callTool" | "retry" | "close">;
+export type UpstreamLink = Pick<
+  InstanceLink,
+  "isAttached" | "attach" | "attachNow" | "snapshot" | "watch" | "callTool" | "retry" | "close" | "upstreamNames" | "onUpstreamsChanged"
+>;
 
 /** What a stand-in hears about its upstream from the link. */
 export interface UpstreamView {
@@ -64,6 +69,8 @@ export interface InstanceLinkOptions {
   respawnLockWaitMs: number;
   /** Backoff between attempts to attach again after the daemon couldn't be reached. */
   reconnect?: UpstreamReconnectInputs;
+  /** The log level the instance's config sets, on each attach and whenever a reload changes it. */
+  onLogLevel?: (level: LogLevel) => void;
   _socketPath?: string;
   _ensureDaemon?: (opts?: EnsureAttemptOptions) => Promise<void>;
 }
@@ -79,12 +86,15 @@ export class InstanceLink {
   private readonly _socketPath: string;
   private readonly _ensureDaemon: (opts?: EnsureAttemptOptions) => Promise<void>;
   private readonly _snapshots = new Map<string, UpstreamSnapshot>();
+  private readonly _namesListeners = new Set<() => void>();
   private readonly _views = new Map<string, Set<UpstreamView>>();
   private readonly _pendingCalls = new Set<(err: Error) => void>();
   private _supervisor: DaemonLivenessSupervisor | null = null;
   private _attaching: Promise<void> | null = null;
   private _respawning: Deferred | null = null;
   private _attached = false;
+  /** What the instance sent while an attach was in flight, which wins over the attach reply. */
+  private _heardWhileAttaching: { snapshots: Set<string>; settings: boolean } | null = null;
   private _closed = false;
   private _failures = 0;
   private _lastFailure: { at: number; error: Error } | null = null;
@@ -104,6 +114,17 @@ export class InstanceLink {
 
   snapshot(name: string): UpstreamSnapshot | undefined {
     return this._snapshots.get(name);
+  }
+
+  /** The upstreams the instance has, as of the last attach and the changes it reported since. */
+  upstreamNames(): string[] {
+    return [...this._snapshots.keys()];
+  }
+
+  /** Fires when the instance gains or loses an upstream; returns an unsubscribe. */
+  onUpstreamsChanged(listener: () => void): () => void {
+    this._namesListeners.add(listener);
+    return () => this._namesListeners.delete(listener);
   }
 
   watch(name: string, view: UpstreamView): () => void {
@@ -137,13 +158,15 @@ export class InstanceLink {
   /**
    * Asks the daemon to try the upstream now and tells its stand-ins where it
    * stands afterwards. The daemon sends every change before its reply, so the
-   * latest snapshot is at least as new as the reply and wins over it.
+   * latest snapshot is at least as new as the reply and wins over it, and an
+   * upstream removed meanwhile stays removed.
    */
   async retry(name: string): Promise<UpstreamSnapshot> {
     const reply = await this._attachedSupervisor().call("RETRY", { upstream: name }, NO_TIMEOUT);
     const snapshot = snapshotOf(reply);
     if (snapshot === null) throw new Error(`malformed RETRY reply for "${name}"`);
-    const latest = this._snapshots.get(name) ?? snapshot;
+    const latest = this._snapshots.get(name);
+    if (latest === undefined) return snapshot;
     this._onSnapshot(latest);
     return latest;
   }
@@ -264,16 +287,25 @@ export class InstanceLink {
       env: this._opts.env,
       childEnv: this._opts.childEnv,
     };
-    const result = (await supervisor.call("ATTACH", params)) as AttachResult;
+    const heard = { snapshots: new Set<string>(), settings: false };
+    this._heardWhileAttaching = heard;
+    let result: AttachResult;
+    try {
+      result = (await supervisor.call("ATTACH", params)) as AttachResult;
+    } finally {
+      if (this._heardWhileAttaching === heard) this._heardWhileAttaching = null;
+    }
     if (this._closed || this._supervisor !== supervisor) throw new Error(LINK_CLOSED);
-    const hosted = new Set(result.upstreams);
+    const hosted = new Set([...result.upstreams, ...heard.snapshots]);
     this._attached = true;
     this._failures = 0;
     this._lastFailure = null;
+    if (!heard.settings && isLogLevel(result.logLevel)) this._opts.onLogLevel?.(result.logLevel);
     for (const name of new Set([...this._snapshots.keys(), ...this._views.keys()])) {
       if (!hosted.has(name)) this._onRemoved(name);
     }
     for (const snapshot of this._snapshots.values()) this._notifySnapshot(snapshot);
+    this._notifyNamesChanged();
   }
 
   private async _attachAgain(supervisor: DaemonLivenessSupervisor): Promise<void> {
@@ -301,11 +333,17 @@ export class InstanceLink {
     else if (method === "LOG") {
       const log = logOf(params);
       if (log !== null) this._writeLog(log);
+    } else if (method === "SETTINGS" && isSettings(params)) {
+      if (this._heardWhileAttaching !== null) this._heardWhileAttaching.settings = true;
+      this._opts.onLogLevel?.(params.logLevel);
     }
   }
 
   private _onSnapshot(snapshot: UpstreamSnapshot): void {
+    this._heardWhileAttaching?.snapshots.add(snapshot.name);
+    const added = !this._snapshots.has(snapshot.name);
     this._snapshots.set(snapshot.name, snapshot);
+    if (added) this._notifyNamesChanged();
     if (this._attached) this._notifySnapshot(snapshot);
   }
 
@@ -313,8 +351,12 @@ export class InstanceLink {
     for (const view of [...(this._views.get(snapshot.name) ?? [])]) view.onSnapshot(snapshot);
   }
 
+  private _notifyNamesChanged(): void {
+    for (const listener of [...this._namesListeners]) listener();
+  }
+
   private _onRemoved(name: string): void {
-    this._snapshots.delete(name);
+    if (this._snapshots.delete(name)) this._notifyNamesChanged();
     for (const view of [...(this._views.get(name) ?? [])]) view.onRemoved();
   }
 
@@ -339,7 +381,7 @@ export class InstanceLink {
   }
 
   private _scheduleAttach(): void {
-    if (this._closed || this._retryTimer !== undefined || this._views.size === 0) return;
+    if (this._closed || this._retryTimer !== undefined || (this._views.size === 0 && this._namesListeners.size === 0)) return;
     const delay = Math.min(this._baseDelay() * 2 ** this._failures, this._maxDelay());
     this._failures++;
     this._retryTimer = setTimeout(() => {
@@ -363,7 +405,8 @@ export class InstanceLink {
 
   private _writeLog({ upstream, level, message, context, stderr }: UpstreamLogParams): void {
     const { component, ...rest } = context ?? {};
-    const log = this._logger.child({ component: typeof component === "string" ? component : "upstream", server: upstream });
+    const fallback = upstream === undefined ? "config" : "upstream";
+    const log = this._logger.child({ component: typeof component === "string" ? component : fallback, ...(upstream !== undefined && { server: upstream }) });
     const details = { ...rest, ...(stderr !== undefined && { stderr }) };
     log[level](message, Object.keys(details).length > 0 ? details : undefined);
   }
@@ -404,14 +447,24 @@ function logOf(value: unknown): UpstreamLogParams | null {
   if (typeof value !== "object" || value === null) return null;
   const { upstream, level, message, stderr } = value as Partial<Record<keyof UpstreamLogParams, unknown>>;
   if (stderr !== undefined && !(Array.isArray(stderr) && stderr.every((line) => typeof line === "string"))) return null;
-  if (typeof upstream !== "string" || typeof message !== "string") return null;
-  const known = level === "debug" || level === "info" || level === "warn" || level === "error";
-  return { ...(value as UpstreamLogParams), level: known ? level : "debug" };
+  if ((upstream !== undefined && typeof upstream !== "string") || typeof message !== "string") return null;
+  return { ...(value as UpstreamLogParams), level: isLogLevel(level) ? level : "debug" };
 }
 
-/** A call the manager refused comes back as the refusal, for the bridge to pass on as is. */
+/** A call the manager refused comes back as the refusal, for the bridge to pass on as is, and one that needs approval as the question to ask. */
 function callError(err: unknown): Error {
-  return err instanceof DaemonRpcError && err.code === ERROR_CODE_CALL_REFUSED ? new CallRefusedError(err.message) : toError(err);
+  if (!(err instanceof DaemonRpcError)) return toError(err);
+  if (err.code === ERROR_CODE_CALL_REFUSED) return new CallRefusedError(err.message);
+  if (err.code === ERROR_CODE_APPROVAL_REQUIRED) return new ApprovalRequiredError(err.message);
+  return err;
+}
+
+function isSettings(value: unknown): value is SettingsParams {
+  return typeof value === "object" && value !== null && isLogLevel((value as { logLevel?: unknown }).logLevel);
+}
+
+function isLogLevel(value: unknown): value is LogLevel {
+  return value === "debug" || value === "info" || value === "warn" || value === "error";
 }
 
 function isSearchResult(value: unknown): value is SearchToolsResult {

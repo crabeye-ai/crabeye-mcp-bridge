@@ -1,6 +1,6 @@
 # How it works
 
-When the AI assistant starts its session, every configured upstream server is started or connected and the bridge discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. A per-user [manager](stdio-manager.md) process shared by every bridge starts every STDIO server and connects every upstream, once for all bridges. A bridge starts the manager as soon as its config has an upstream. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
+When the AI assistant starts its session, every configured upstream server is started or connected and the bridge discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. A per-user [manager](stdio-manager.md) process shared by every bridge starts every STDIO server and connects every upstream, once for all bridges. A bridge starts the manager as soon as its config has an upstream, or else when its client starts a session. Each bridge does little itself: it checks its config when it starts and reports a config that doesn't load, then leaves the servers, search, rate limits, tool policy and config edits to the manager. What it keeps is what concerns its own client: answering it, asking it to approve calls the tool policy marks `prompt`, cancelling calls it cancels, and `--stats`. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
 
 The bridge exposes exactly two tools to the AI assistant, and that list never changes during a session:
 
@@ -37,7 +37,7 @@ The bridge advertises its own `instructions` string to clients during the MCP `i
 
 Upstream `instructions` are read from each upstream's `initialize` response (or its answer about the protocol versions it speaks). The manager connects every upstream once, so every bridge gets the same instructions from the manager's one connection.
 
-When an upstream connects after the bridge starts, or when `_bridge.passthrough` changes via config hot-reload, the bridge regenerates this string. The change applies to the **next** client `initialize` only — MCP has no mechanism to push an updated instructions string to a connected session.
+The manager renders the passthrough blocks from the servers it has connected and the tool policy. A change applies to the **next** client `initialize` only — MCP has no mechanism to push an updated instructions string to a connected session.
 
 ## Examples
 

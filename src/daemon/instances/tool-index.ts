@@ -47,6 +47,11 @@ export class ToolIndex {
     this._search.refresh();
   }
 
+  /** The tools of server `name`, under their namespaced names. */
+  tools(name: string): Tool[] {
+    return this._registry.listRegisteredTools().filter(({ source }) => source === name).map(({ tool }) => tool);
+  }
+
   search(params: SearchToolsParams): SearchToolsResponse {
     return this._search.search(params);
   }

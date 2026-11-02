@@ -115,8 +115,8 @@ function sanitize(s: string): string {
  * zod parse rejects circular `inputSchema` shapes, but a hostile upstream
  * could still slip a `BigInt` through `passthrough()`-ed properties. Convert
  * BigInt to decimal-string form and fall back to `"[unserializable]"` on
- * anything else — a render-time crash here would otherwise propagate out of
- * `BridgeServer` construction and abort startup.
+ * anything else — a render-time crash here would otherwise throw out of
+ * `renderPassthrough` for every server.
  */
 function safeStringify(v: unknown): string {
   try {

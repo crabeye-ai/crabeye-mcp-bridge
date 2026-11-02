@@ -144,7 +144,7 @@ describe("loadDaemonSettings", () => {
     const settings = await loadDaemonSettings();
     expect(settings.logLevel).toBe(DEFAULT_LOG_LEVEL);
     expect(settings.daemon.idleMs).toBe(DEFAULT_IDLE_MS);
-    expect(settings.loadError).toMatch(/^✖ .*\n {2}→ at _bridge\.logLevel$/);
+    expect(settings.loadError).toMatch(/^Config validation failed: _bridge\.logLevel: /);
   });
 
   it("derives the shutdown wait from the configured kill grace", async () => {

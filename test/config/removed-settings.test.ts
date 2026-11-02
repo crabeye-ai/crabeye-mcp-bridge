@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { BridgeConfigSchema } from "../../src/config/schema.js";
-import { findRemovedSettings, warnRemovedSettings } from "../../src/config/removed-settings.js";
+import { findRemovedSettings, warnAboutConfig } from "../../src/config/removed-settings.js";
 import { spyLogger } from "../_helpers/spy-logger.js";
 
 const RETRIES_FOREVER = "upstreams now retry indefinitely with capped backoff";
@@ -34,7 +34,7 @@ describe("findRemovedSettings", () => {
   });
 });
 
-describe("warnRemovedSettings", () => {
+describe("warnAboutConfig", () => {
   it("logs one warning per removed setting, naming every place it is set", () => {
     const logger = spyLogger();
     const config = BridgeConfigSchema.parse({
@@ -45,7 +45,7 @@ describe("warnRemovedSettings", () => {
       _bridge: { daemon: { autoForkDrainTimeoutMs: 5 }, reconnect: { maxReconnectAttempts: 1 } },
     });
 
-    warnRemovedSettings(config, logger);
+    warnAboutConfig(config, logger);
 
     expect(logger.warn.mock.calls).toEqual([
       [
@@ -57,10 +57,18 @@ describe("warnRemovedSettings", () => {
     ]);
   });
 
+  it("logs that a server launching the bridge itself is skipped", () => {
+    const logger = spyLogger();
+
+    warnAboutConfig(BridgeConfigSchema.parse({ mcpServers: { self: { command: "npx", args: ["crabeye-mcp-bridge"] } } }), logger);
+
+    expect(logger.info).toHaveBeenCalledWith('skipping server "self": it launches crabeye-mcp-bridge itself', { component: "config" });
+  });
+
   it("logs nothing when no removed setting is set", () => {
     const logger = spyLogger();
 
-    warnRemovedSettings(BridgeConfigSchema.parse({ mcpServers: { a: { command: "node" } } }), logger);
+    warnAboutConfig(BridgeConfigSchema.parse({ mcpServers: { a: { command: "node" } } }), logger);
 
     expect(logger.warn).not.toHaveBeenCalled();
   });

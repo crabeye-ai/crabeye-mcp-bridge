@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { isSelfReference } from "../../src/config/self-reference.js";
-import { diffConfigs } from "../../src/config/config-diff.js";
 import { BridgeConfigSchema, findSelfReferences, resolveUpstreams, type StdioServerConfig } from "../../src/config/schema.js";
 
 const server = (command: string, args: string[] = [], cwd?: string): StdioServerConfig =>
@@ -279,7 +278,7 @@ describe("isSelfReference", () => {
       await writeFile(join(later, "dist", "index.js"), "");
       const after = BridgeConfigSchema.parse(raw);
 
-      expect(diffConfigs(before, after).servers.removed).toEqual(["x"]);
+      expect([Object.keys(resolveUpstreams(before)), Object.keys(resolveUpstreams(after))]).toEqual([["x"], []]);
     });
 
     it("keeps an existing script under a folder whose name starts with the bridge's", async () => {

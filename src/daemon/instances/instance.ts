@@ -1,16 +1,21 @@
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { ConfigWatcher } from "../../config/config-watcher.js";
-import { isHttpServer, resolveUpstreams, serverBridgeConfigs, type BridgeConfig, type RateLimitConfig, type ServerConfig } from "../../config/schema.js";
+import { ConfigError, describeConfigError } from "../../config/loader.js";
+import { leftOutWarning, type SkippedFile } from "../../config/merged-loader.js";
+import { findRemovedSettings, warnAboutConfig } from "../../config/removed-settings.js";
+import { findSelfReferences, isHttpServer, resolveUpstreams, serverBridgeConfigs, type BridgeConfig, type RateLimitConfig, type ServerConfig } from "../../config/schema.js";
 import type { CredentialStore } from "../../credentials/credential-store.js";
 import type { Logger } from "../../logging/index.js";
 import { PolicyEngine } from "../../policy/index.js";
 import type { SearchToolsParams, SearchToolsResponse } from "../../search/index.js";
+import { renderPassthrough } from "../../server/passthrough.js";
 import { defaultLimitReachedMessage, resolveRateLimitConfig } from "../../server/rate-limit-resolution.js";
 import { awaitConnectedClient } from "../../server/upstream-wait.js";
-import { CallRefusedError, requiresConfirmationError } from "../../upstream/call-errors.js";
+import { ApprovalRequiredError, CallRefusedError } from "../../upstream/call-errors.js";
 import { resolveReconnectInputs } from "../../upstream/upstream-hash.js";
 import type {
   InstanceSource,
+  SettingsParams,
   StatusInstance,
   UpstreamLogParams,
   UpstreamRemovedParams,
@@ -18,12 +23,15 @@ import type {
 } from "../protocol.js";
 import { httpUpstreamIdentity, stdioUpstreamKey } from "./identity.js";
 import { hostedView, takeSlotFor, type HostedView } from "./hosted-calls.js";
+import { ReportingLogger } from "./pooled-upstream.js";
 import { ToolIndex } from "./tool-index.js";
 import type { Lease, PoolSpec, UpstreamPool } from "./upstream-pool.js";
 
 export interface LoadedConfig {
   config: BridgeConfig;
   watchPaths: string[];
+  /** Each listed file that exists but was left out of `config`. */
+  skipped?: SkippedFile[];
 }
 
 /** The client variables an instance reads, and the environment its STDIO servers start with. */
@@ -43,7 +51,8 @@ export interface InstanceDeps {
 export type InstanceNotification =
   | { method: "UPSTREAM"; params: UpstreamSnapshot }
   | { method: "UPSTREAM_REMOVED"; params: UpstreamRemovedParams }
-  | { method: "LOG"; params: UpstreamLogParams };
+  | { method: "LOG"; params: UpstreamLogParams }
+  | { method: "SETTINGS"; params: SettingsParams };
 
 /** Where an instance sends what its bridges need to hear: one per attached socket. */
 export interface InstanceAttachment {
@@ -58,7 +67,11 @@ export interface HostedCallOptions {
 
 /** One of an instance's upstreams, under the name the instance gives it. */
 export interface HostedUpstream {
-  /** Waits for a slot under the server's rate limit and for the server to connect, checks the policy again, then calls it. */
+  /**
+   * Checks the policy, waits for a slot under the server's rate limit and for
+   * the server to connect, checks the policy again, then calls it. Rejects
+   * with `ApprovalRequiredError` when the call needs approval it wasn't given.
+   */
   callTool(params: { name: string; arguments?: Record<string, unknown> }, options: HostedCallOptions): Promise<CallToolResult>;
   retry(): Promise<UpstreamSnapshot>;
 }
@@ -74,7 +87,7 @@ interface Hosted {
  * The daemon's copy of one config, shared by every bridge that would load it.
  * Holds a pooled connection for each server, the index `search_tools`
  * searches and the tool policy calls are checked against, and follows edits
- * to the files it loaded.
+ * to the files it loaded, telling its bridges what they need to hear of them.
  */
 export class Instance {
   readonly source: InstanceSource;
@@ -83,6 +96,8 @@ export class Instance {
   private readonly _deps: InstanceDeps;
   private readonly _store: CredentialStore;
   private readonly _log: Logger;
+  /** Logs to the manager log, and sends warnings and errors to every attached bridge too. */
+  private readonly _configLog: Logger;
   private readonly _attachments = new Set<InstanceAttachment>();
   private readonly _hosted = new Map<string, Hosted>();
   private readonly _hostedChanged = new Set<() => void>();
@@ -94,6 +109,11 @@ export class Instance {
   private _applying: Promise<void> = Promise.resolve();
   private _reloadRunning: Promise<void> | undefined;
   private _reloadQueued: Promise<void> | undefined;
+  private _lastReloadError: string | undefined;
+  /** The listed files the current config left out. */
+  private _skipped: SkippedFile[] = [];
+  /** The listed files the current config read. */
+  private _included = new Set<string>();
   private _closed = false;
 
   private constructor(source: InstanceSource, { env, childEnv }: InstanceEnv, loaded: LoadedConfig, deps: InstanceDeps) {
@@ -103,6 +123,9 @@ export class Instance {
     this._deps = deps;
     this._config = loaded.config;
     this._log = deps.logger.child({ component: "instance" });
+    this._configLog = new ReportingLogger(this._log, (level, message, context) =>
+      this._broadcast({ method: "LOG", params: { level, message, ...(Object.keys(context).length > 0 && { context }) } }),
+    );
     this._store = deps.createCredentialStore(env);
     const servers = resolveUpstreams(loaded.config);
     this._policy = new PolicyEngine(loaded.config._bridge.toolPolicy, serverBridgeConfigs(servers));
@@ -111,6 +134,7 @@ export class Instance {
       this._host(name, this._specFor(name, config));
       this._index.setCategory(name, config._bridge?.category);
     }
+    this._recordSkipped(loaded);
     this._watch(loaded.watchPaths);
   }
 
@@ -127,6 +151,21 @@ export class Instance {
   attach(attachment: InstanceAttachment): void {
     this._attachments.add(attachment);
     for (const [name, { lease }] of this._hosted) attachment.send({ method: "UPSTREAM", params: { ...lease.upstream.snapshot(), name } });
+  }
+
+  /**
+   * Attaches a bridge, reloading the config first when `reload` is set, then
+   * warns it about each listed file that was already left out before that
+   * reload and still is; a file the reload left out was announced to every
+   * attachment as it happened.
+   */
+  async admit(attachment: InstanceAttachment, reload: boolean): Promise<void> {
+    this.attach(attachment);
+    const before = new Set(this._skipped.map(({ path }) => path));
+    if (reload) await this.reload();
+    for (const file of this._skipped) {
+      if (before.has(file.path)) attachment.send({ method: "LOG", params: { level: "warn", message: leftOutWarning(file) } });
+    }
   }
 
   upstreamNames(): string[] {
@@ -150,6 +189,21 @@ export class Instance {
 
   search(params: SearchToolsParams): SearchToolsResponse {
     return this._index.search(params);
+  }
+
+  /** The settings the config gives the instance's bridges. */
+  settings(): SettingsParams {
+    return { logLevel: this._config._bridge.logLevel };
+  }
+
+  /** The `_bridge.passthrough` blocks for a bridge's instructions, from what the servers have reported so far. */
+  passthrough(): string {
+    return renderPassthrough({
+      upstreams: resolveUpstreams(this._config),
+      getInstructions: (name) => this._hosted.get(name)?.lease.upstream.snapshot().instructions,
+      getTools: (name) => this._index.tools(name),
+      resolvePolicy: (name, toolName) => this._policy.resolvePolicy(name, toolName),
+    });
   }
 
   /**
@@ -183,6 +237,9 @@ export class Instance {
   }
 
   private async _call(name: string, params: { name: string; arguments?: Record<string, unknown> }, { signal, approved }: HostedCallOptions): Promise<CallToolResult> {
+    const before = this._policy.evaluate(name, params.name, params.arguments);
+    if (before.kind === "deny") throw new CallRefusedError(before.reason);
+    if (before.kind === "prompt" && approved !== true) throw new ApprovalRequiredError(before.message);
     await takeSlotFor(name, (current) => this._hosted.get(current)?.lease, signal);
     const upstream = await awaitConnectedClient(name, {
       getClient: (current) => this._hosted.get(current)?.view,
@@ -190,9 +247,9 @@ export class Instance {
       signal,
       logger: this._log,
     });
-    const decision = this._policy.evaluate(name, params.name, params.arguments);
-    if (decision.kind === "deny") throw new CallRefusedError(decision.reason);
-    if (decision.kind === "prompt" && approved !== true) throw requiresConfirmationError(name, params.name);
+    const after = this._policy.evaluate(name, params.name, params.arguments);
+    if (after.kind === "deny") throw new CallRefusedError(after.reason);
+    if (after.kind === "prompt" && approved !== true) throw new ApprovalRequiredError(after.message);
     return upstream.callTool(params, { signal });
   }
 
@@ -205,8 +262,9 @@ export class Instance {
     this._watchPaths = watchPaths;
     this._watcher = new ConfigWatcher({
       configPaths: watchPaths,
-      loadConfig: async () => (await this._deps.loadConfig(this.source)).config,
-      logger: this._log,
+      loadConfig: async () => (await this._loadComplete()).config,
+      onLoadError: (err) => this._reportLoadError(err),
+      logger: this._configLog,
       debounceMs: this._deps.watchDebounceMs,
     });
     this._watcher.start((config) => this._enqueue(config), this._config);
@@ -223,9 +281,9 @@ export class Instance {
   private async _loadAndApply(): Promise<void> {
     let loaded: LoadedConfig;
     try {
-      loaded = await this._deps.loadConfig(this.source);
+      loaded = await this._loadComplete();
     } catch (err) {
-      this._log.warn("failed to reload config", { error: err instanceof Error ? err.message : String(err) });
+      this._reportLoadError(err);
       return;
     }
     await this._enqueue(loaded.config);
@@ -238,6 +296,35 @@ export class Instance {
     this._watcher?.stop();
     this._watch([...this._watchPaths, ...added]);
     this._watcher?.checkNow();
+  }
+
+  /**
+   * Loads the config, refusing one that leaves out a file the current config
+   * included, so that a reload keeps the last good config instead of dropping
+   * that file's servers. Records which files the loaded config leaves out.
+   */
+  private async _loadComplete(): Promise<LoadedConfig> {
+    const loaded = await this._deps.loadConfig(this.source);
+    const lost = (loaded.skipped ?? []).filter(({ path }) => this._included.has(path));
+    if (lost.length > 0) throw new ConfigError(lost.map(({ message }) => message).join("; "));
+    this._lastReloadError = undefined;
+    this._recordSkipped(loaded);
+    return loaded;
+  }
+
+  private _recordSkipped(loaded: LoadedConfig): void {
+    const skipped = loaded.skipped ?? [];
+    const isSkipped = (path: string) => skipped.some((file) => file.path === path);
+    for (const file of skipped) if (!this._skipped.some(({ path }) => path === file.path)) this._configLog.warn(leftOutWarning(file));
+    this._skipped = skipped;
+    this._included = new Set(loaded.watchPaths.filter((path) => !isSkipped(path)));
+  }
+
+  /** Tells the manager log and every bridge that a reload failed, once while the same error lasts. */
+  private _reportLoadError(err: unknown): void {
+    const error = describeConfigError(err);
+    if (error !== this._lastReloadError) this._configLog.warn("failed to reload config", { error });
+    this._lastReloadError = error;
   }
 
   private _enqueue(config: BridgeConfig): Promise<void> {
@@ -254,6 +341,9 @@ export class Instance {
     this._config = next;
     const servers = resolveUpstreams(next);
     this._policy.update(next._bridge.toolPolicy, serverBridgeConfigs(servers));
+    if (configWarnings(next) !== configWarnings(previous)) warnAboutConfig(next, this._configLog);
+    if (next._bridge.logLevel !== previous._bridge.logLevel) this._broadcast({ method: "SETTINGS", params: this.settings() });
+    if (next._bridge.logFormat !== previous._bridge.logFormat) this._configLog.warn("_bridge.logFormat changed; restart the AI clients to apply it");
     const toRelease: Hosted[] = [];
     for (const [name, config] of Object.entries(servers)) {
       const spec = this._specFor(name, config);
@@ -341,4 +431,9 @@ export class Instance {
 function release(hosted: Hosted): void {
   hosted.unsubscribe();
   hosted.lease.release();
+}
+
+/** What `warnAboutConfig` would say about `config`, to warn again only when it changes. */
+function configWarnings(config: BridgeConfig): string {
+  return JSON.stringify([findRemovedSettings(config), findSelfReferences(config)]);
 }

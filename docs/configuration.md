@@ -138,7 +138,7 @@ The literal `true` is not accepted — pick a level explicitly. Headings use the
 
 `_bridge.passthroughMaxBytes` (optional, positive integer) caps the per-server rendered block in UTF-8 bytes. Excess content is truncated at a codepoint boundary and `…(truncated)` is appended. The marker itself is not counted toward the cap.
 
-Passthrough does not change tool exposure or routing — `tools/list` and `search_tools` behave exactly as before. Toggling `passthrough` at runtime regenerates the bridge instructions for the next client `initialize`; existing sessions are unaffected because MCP has no mid-session push for instructions.
+Passthrough does not change tool exposure or routing — `tools/list` and `search_tools` behave exactly as before. Toggling `passthrough` at runtime makes the manager render the blocks again for the next client `initialize`; existing sessions are unaffected because MCP has no mid-session push for instructions.
 
 > **Trust note.** Enabling `passthrough` for a server lets that server's author influence your LLM's system prompt — its `instructions` text and tool descriptions are interpolated verbatim. The bridge sanitises control / bidi / zero-width characters and applies a per-server byte cap, but it does not validate the *content* against prompt-injection. Only enable passthrough for servers you trust as much as the LLM client itself.
 
@@ -152,7 +152,7 @@ The bridge reads upstream definitions from these top-level keys (in priority ord
 4. `context_servers` (Zed)
 5. `mcpServers`
 
-Self-exclusion applies to `mcpServers` and `context_servers`: the bridge skips any entry that launches the bridge itself, so it doesn't start a copy of itself. An entry counts as the bridge when its command line runs the `crabeye-mcp-bridge` command, the `@crabeye-ai/crabeye-mcp-bridge` package (through `npx`, `pnpm dlx`, `bunx` and similar, including inside `cmd /c` or `sh -c`), or one of the bridge's own entry files. A server is not skipped just because a path, an option value (such as `--repo crabeye-ai/crabeye-mcp-bridge`) or a sentence in one of its arguments mentions `crabeye-mcp-bridge`. Each skipped entry is logged at info level when the config loads or reloads, and `--validate` lists it.
+Self-exclusion applies to `mcpServers` and `context_servers`: the bridge skips any entry that launches the bridge itself, so it doesn't start a copy of itself. An entry counts as the bridge when its command line runs the `crabeye-mcp-bridge` command, the `@crabeye-ai/crabeye-mcp-bridge` package (through `npx`, `pnpm dlx`, `bunx` and similar, including inside `cmd /c` or `sh -c`), or one of the bridge's own entry files. A server is not skipped just because a path, an option value (such as `--repo crabeye-ai/crabeye-mcp-bridge`) or a sentence in one of its arguments mentions `crabeye-mcp-bridge`. Each skipped entry is logged at info level when the bridge starts, and in the manager log when the config reloads; `--validate` lists it.
 
 The bridge can't run as an upstream of another bridge: a bridge started that way exits with an error explaining why. Entries under the other keys are never skipped, so a bridge listed there fails to start.
 

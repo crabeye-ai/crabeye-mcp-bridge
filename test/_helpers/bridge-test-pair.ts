@@ -4,6 +4,8 @@ import type { JSONRPCMessage, Tool } from "@modelcontextprotocol/client";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { BridgeServer } from "../../src/server/bridge-server.js";
 import type { BridgeServerOptions } from "../../src/server/bridge-server.js";
+import type { PolicyEngine } from "../../src/policy/index.js";
+import { ApprovalRequiredError, CallRefusedError } from "../../src/upstream/call-errors.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
 import { localSearch } from "./local-search.js";
 
@@ -15,10 +17,23 @@ export function makeTool(name: string, description?: string): Tool {
   };
 }
 
-export async function createTestPair(options?: Partial<BridgeServerOptions> & { registry?: ToolRegistry; modern?: boolean }) {
-  const { registry, modern, ...serverOptions } = options ?? {};
+/** `client` as the manager's instance calls it: refused when `policy` denies the tool, and asking for approval when it prompts and the call wasn't approved. */
+export function policed(client: UpstreamClient, policy: PolicyEngine): UpstreamClient {
+  return {
+    ...client,
+    callTool: async (params, options) => {
+      const decision = policy.evaluate(client.name, params.name, params.arguments);
+      if (decision.kind === "deny") throw new CallRefusedError(decision.reason);
+      if (decision.kind === "prompt" && options?.approved !== true) throw new ApprovalRequiredError(decision.message);
+      return client.callTool(params, options);
+    },
+  };
+}
+
+export async function createTestPair(options?: Partial<BridgeServerOptions> & { registry?: ToolRegistry; modern?: boolean; policy?: PolicyEngine }) {
+  const { registry, modern, policy, ...serverOptions } = options ?? {};
   const toolRegistry = registry ?? new ToolRegistry();
-  const server = new BridgeServer({ search: localSearch(toolRegistry, serverOptions.policyEngine), ...serverOptions, toolRegistry });
+  const server = new BridgeServer({ search: localSearch(toolRegistry, policy), ...serverOptions, toolRegistry });
 
   const client = new Client(
     { name: "test-client", version: "1.0.0" },

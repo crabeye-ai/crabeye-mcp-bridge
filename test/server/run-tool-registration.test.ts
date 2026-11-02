@@ -1,8 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Client, InMemoryTransport as ClientInMemoryTransport, type Transport } from "@modelcontextprotocol/client";
 import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
-import { BridgeConfigSchema, type ServerConfig } from "../../src/config/schema.js";
-import { diffConfigs } from "../../src/config/config-diff.js";
 import { UpstreamManager } from "../../src/upstream/upstream-manager.js";
 import { BaseUpstreamClient } from "../../src/upstream/base-client.js";
 import type { UpstreamClient } from "../../src/upstream/types.js";
@@ -11,6 +9,7 @@ import { BridgeServer } from "../../src/server/bridge-server.js";
 import { transportKeepingFirstMessageHandler } from "../_helpers/transports.js";
 import { errorResult } from "../_helpers/run-tool.js";
 import { localSearch } from "../_helpers/local-search.js";
+import { FakeInstanceLink } from "../_helpers/fake-instance-link.js";
 
 function inMemoryUpstream(): InMemoryTransport {
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -31,10 +30,6 @@ function inMemoryClient(name: string): UpstreamClient {
   return new InMemoryUpstreamClient({ name });
 }
 
-function bridgeConfig(servers: Record<string, unknown>) {
-  return BridgeConfigSchema.parse({ mcpServers: servers });
-}
-
 function runEcho(client: Client, source: string) {
   return client.callTool({ name: "run_tool", arguments: { name: `${source}__echo`, arguments: {} } });
 }
@@ -42,23 +37,25 @@ function runEcho(client: Client, source: string) {
 describe("upstream registration", () => {
   let cleanups: Array<() => unknown> = [];
   let manager: UpstreamManager;
+  let link: FakeInstanceLink;
 
   afterEach(async () => {
     for (const cleanup of cleanups.reverse()) await cleanup();
     cleanups = [];
   });
 
-  function startManager(servers: Record<string, unknown>, toolRegistry = new ToolRegistry()): void {
-    manager = new UpstreamManager({ config: bridgeConfig(servers), toolRegistry, _clientFactory: inMemoryClient });
+  function startManager(names: string[], toolRegistry = new ToolRegistry()): void {
+    link = new FakeInstanceLink();
+    manager = new UpstreamManager({ names, toolRegistry, instanceLink: link, _clientFactory: inMemoryClient });
     cleanups.push(() => manager.closeAll());
   }
 
   async function startBridge(
-    servers: Record<string, unknown>,
+    names: string[],
     wrapTransport: (transport: ClientInMemoryTransport) => Transport = (transport) => transport,
   ): Promise<Client> {
     const toolRegistry = new ToolRegistry();
-    startManager(servers, toolRegistry);
+    startManager(names, toolRegistry);
     const server = new BridgeServer({
       toolRegistry,
       search: localSearch(toolRegistry),
@@ -77,40 +74,31 @@ describe("upstream registration", () => {
   }
 
   describe("run_tool as a modern client's first request after its version probe", () => {
-    it.each([
-      ["a STDIO server", { command: "node", args: ["server.js"] }],
-      ["a STDIO server whose env reads the credential store", { command: "node", args: ["server.js"], env: { TOKEN: "${credential:token}" } }],
-      ["an HTTP server", { type: "streamable-http", url: "http://127.0.0.1:1/mcp" }],
-    ] as Array<[string, ServerConfig | Record<string, unknown>]>)("reaches %s", async (_name, alpha) => {
-      const client = await startBridge({ alpha });
+    it("reaches a server", async () => {
+      const client = await startBridge(["alpha"]);
 
       expect((await runEcho(client, "alpha")).content).toEqual([{ type: "text", text: "echoed" }]);
     });
 
-    it("reaches a STDIO server whose env reads the credential store when the transport drops the session watcher", async () => {
-      const client = await startBridge(
-        { alpha: { command: "node", args: ["server.js"], env: { TOKEN: "${credential:token}" } } },
-        transportKeepingFirstMessageHandler,
-      );
+    it("reaches a server when the transport drops the session watcher", async () => {
+      const client = await startBridge(["alpha"], transportKeepingFirstMessageHandler);
 
       expect((await runEcho(client, "alpha")).content).toEqual([{ type: "text", text: "echoed" }]);
     });
 
     it("reports a server that is not configured as not found", async () => {
-      const client = await startBridge({ alpha: { command: "node", args: ["server.js"] } });
+      const client = await startBridge(["alpha"]);
 
       expect(await runEcho(client, "ghost")).toMatchObject(errorResult("Upstream server not found: ghost"));
     });
   });
 
-  it("run_tool reaches a STDIO server that a reload is still adding", async () => {
-    const before = { beta: { command: "node", args: ["other.js"] } };
-    const client = await startBridge(before);
+  it("run_tool reaches a server the instance has just gained", async () => {
+    const client = await startBridge(["beta"]);
     await client.listTools();
-    const next = bridgeConfig({ ...before, alpha: { command: "node", args: ["server.js"], env: { TOKEN: "${credential:token}" } } });
-    const reload = manager.applyConfigDiff(diffConfigs(bridgeConfig(before), next), next);
+
+    link.setUpstreams(["alpha", "beta"]);
 
     expect((await runEcho(client, "alpha")).content).toEqual([{ type: "text", text: "echoed" }]);
-    await reload;
   });
 });

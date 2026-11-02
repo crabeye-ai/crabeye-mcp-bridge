@@ -1,5 +1,8 @@
+import { APP_NAME } from "../constants.js";
 import type { Logger } from "../logging/index.js";
-import { resolveUpstreams, type BridgeConfig, type ServerConfig } from "./schema.js";
+import { findSelfReferences, resolveUpstreams, type BridgeConfig, type ServerConfig } from "./schema.js";
+
+export const SELF_REFERENCE_REASON = `it launches ${APP_NAME} itself`;
 
 const RETRIES_FOREVER = "upstreams now retry indefinitely with capped backoff";
 const ONE_SHARED_PROCESS = "every bridge shares one process per STDIO server";
@@ -58,10 +61,14 @@ export function findRemovedSettings(config: BridgeConfig): RemovedSettingInUse[]
   );
 }
 
-export function warnRemovedSettings(config: BridgeConfig, logger: Logger): void {
+/** Logs the settings in `config` that have no effect: removed settings, and servers that would launch the bridge itself. */
+export function warnAboutConfig(config: BridgeConfig, logger: Logger): void {
   for (const { setting, locations, reason } of findRemovedSettings(config)) {
     logger.warn(`${setting} no longer has any effect and is ignored (${locations.join(", ")}); ${reason}`, {
       component: "config",
     });
+  }
+  for (const name of findSelfReferences(config)) {
+    logger.info(`skipping server "${name}": ${SELF_REFERENCE_REASON}`, { component: "config" });
   }
 }

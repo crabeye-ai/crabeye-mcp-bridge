@@ -8,6 +8,14 @@ export class CallRefusedError extends Error {
   }
 }
 
+/** A call the client has to approve first; the message is the question to ask it. */
+export class ApprovalRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApprovalRequiredError";
+  }
+}
+
 /** What a client is told when a call can't be made, wherever the bridge or the manager finds out. */
 export function reauthorizationError(source: string, serverName: string): CallRefusedError {
   return new CallRefusedError(
@@ -26,8 +34,4 @@ export function removedError(source: string): CallRefusedError {
 
 export function unavailableError(source: string): CallRefusedError {
   return new CallRefusedError(`Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`);
-}
-
-export function requiresConfirmationError(source: string, toolName: string): CallRefusedError {
-  return new CallRefusedError(`Tool ${source}__${toolName} now requires confirmation after a configuration change; please retry`);
 }

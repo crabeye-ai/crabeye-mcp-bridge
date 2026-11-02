@@ -1,7 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { diffConfigs } from "../../../src/config/config-diff.js";
-import { loadConfig } from "../../../src/config/loader.js";
-import { loadMergedConfig } from "../../../src/config/merged-loader.js";
 import { InstanceUpstreamClient } from "../../../src/upstream/instance-upstream-client.js";
 import { ECHOED } from "../../_helpers/counting-http-upstream.js";
 import { settledWithin } from "../../_helpers/processes.js";
@@ -115,30 +112,14 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     await rewriteJsonUntil("client.json", { mcpServers: { svc: { url: svc.url }, fresh: { url: fresh.url } } }, async () =>
       expect((await status()).instances[0]!.upstreams).toEqual(["fresh", "svc"]),
     );
-    for (const each of [a, b]) {
-      const next = (await loadMergedConfig({ bridgeConfigPath: bridgeConfig })).config;
-      await each.manager.applyConfigDiff(diffConfigs(each.config, next), next);
-    }
 
-    expect(a.tools()).toContain("fresh__echo");
-    expect(b.tools()).toContain("fresh__echo");
+    await vi.waitFor(() => {
+      expect(a.tools()).toContain("fresh__echo");
+      expect(b.tools()).toContain("fresh__echo");
+    });
     expect(await a.call("fresh")).toEqual(ECHOED);
     expect(await b.call("fresh")).toEqual(ECHOED);
     expect(fresh.count("tools/list")).toBe(1);
-  });
-
-  it("loads a server a client asks for before the daemon's own watcher has seen the edit", async () => {
-    await daemon({ watchDebounceMs: 60_000 });
-    const [svc, fresh] = [await upstream(), await upstream()];
-    const config = await writeJson("bridge.json", { mcpServers: { svc: { url: svc.url } } });
-    const a = await bridge(config);
-
-    await writeJson("bridge.json", { mcpServers: { svc: { url: svc.url }, fresh: { url: fresh.url } } });
-    const next = await loadConfig({ configPath: config });
-    await a.manager.applyConfigDiff(diffConfigs(a.config, next), next);
-
-    expect(a.client("fresh").status).toBe("connected");
-    expect(await a.call("fresh")).toEqual(ECHOED);
   });
 
   it("closes the connection idleMs after the last client leaves, and reuses it for a client attaching before then", async () => {

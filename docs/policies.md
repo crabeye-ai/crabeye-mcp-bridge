@@ -38,7 +38,7 @@ Policies cascade in this order (first match wins):
 
 In this example, all Linear tools require confirmation except `list_issues` (runs freely) and `delete_issue` (blocked). Tools from other servers use the global default (`"always"`).
 
-Your MCP client only sees `search_tools` and `run_tool`, so permission rules it keeps per tool can't tell upstream tools apart. Allowing `run_tool` in your client permits every upstream tool these policies allow, so set `"prompt"` or `"never"` on the tools that need a guard.
+Your MCP client only sees `search_tools` and `run_tool`, so permission rules it keeps per tool can't tell upstream tools apart. Allowing `run_tool` in your client permits every upstream tool these policies allow, so set `"prompt"` or `"never"` on the tools that need a guard. `"prompt"` makes the assistant ask you before each call; it doesn't stop other programs running as your user, which can reach the manager directly. `"never"` blocks a tool for everyone.
 
 ## Rate limiting
 

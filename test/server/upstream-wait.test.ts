@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { awaitConnectedClient, WAIT_FOR_RESPAWN_MS } from "../../src/server/upstream-wait.js";
+import { atMostRespawnWait, awaitConnectedClient, WAIT_FOR_RESPAWN_MS } from "../../src/server/upstream-wait.js";
 import type { ConnectionStatus, StatusChangeCallback, UpstreamClient } from "../../src/upstream/types.js";
 import { FakeUpstreams } from "../_helpers/bridge-test-pair.js";
 
@@ -23,6 +23,25 @@ class FakeClient {
     return this as unknown as UpstreamClient;
   }
 }
+
+describe("atMostRespawnWait", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stops waiting for work that never settles once the respawn wait has passed", async () => {
+    vi.useFakeTimers();
+    let done = false;
+    const waiting = atMostRespawnWait(new Promise<void>(() => {})).then(() => (done = true));
+
+    await vi.advanceTimersByTimeAsync(WAIT_FOR_RESPAWN_MS - 1);
+    expect(done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await waiting;
+
+    expect(done).toBe(true);
+  });
+});
 
 describe("awaitConnectedClient", () => {
   let clients: FakeUpstreams;

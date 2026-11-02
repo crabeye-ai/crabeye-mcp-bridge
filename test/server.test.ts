@@ -257,12 +257,12 @@ describe("tools/list", () => {
 // --- search_tools ---
 
 describe("search_tools", () => {
-  it("searches with the bridge's own policy when no search service is given", async () => {
+  it("shows a tool the policy disables as disabled in search results", async () => {
     const registry = new ToolRegistry();
     registry.setToolsForSource("linear", [makeTool("linear__create_issue"), makeTool("linear__delete_issue")]);
     const { client, cleanup } = await createTestPair({
       registry,
-      policyEngine: new PolicyEngine("always", { linear: { toolPolicy: "always", tools: { delete_issue: "never" } } }),
+      policy: new PolicyEngine("always", { linear: { toolPolicy: "always", tools: { delete_issue: "never" } } }),
     });
 
     const result = await client.callTool({ name: "search_tools", arguments: { queries: [{ provider: "linear", expand_tools: true }] } });

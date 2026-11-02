@@ -4,7 +4,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadConfig } from "../../src/config/loader.js";
 import { loadMergedConfig } from "../../src/config/merged-loader.js";
-import type { BridgeConfig } from "../../src/config/schema.js";
+import { resolveUpstreams, type BridgeConfig } from "../../src/config/schema.js";
 import { CredentialStore } from "../../src/credentials/credential-store.js";
 import { createKeychainAdapter, type KeychainAdapter } from "../../src/credentials/keychain.js";
 import type { StatusResult } from "../../src/daemon/protocol.js";
@@ -184,7 +184,7 @@ export function useSharedHttpFixture(): SharedHttpFixture {
       const config = kind === "file" ? await loadConfig({ configPath: path }) : (await loadMergedConfig({ bridgeConfigPath: path })).config;
       const registry = new ToolRegistry();
       const manager = new UpstreamManager({
-        config,
+        names: Object.keys(resolveUpstreams(config)),
         toolRegistry: registry,
         logger,
         instanceLink: new InstanceLink({

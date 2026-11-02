@@ -35,7 +35,14 @@ function flattenZodIssue(
   return [{ path: fullPath.join("."), message: issue.message }];
 }
 
-function formatZodIssues(error: z.ZodError): ConfigIssue[] {
+/** A config loading error as one line: its message, then each issue's path and message. */
+export function describeConfigError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  if (!(err instanceof ConfigError) || err.issues.length === 0) return err.message;
+  return `${err.message}: ${err.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`;
+}
+
+export function formatZodIssues(error: z.ZodError): ConfigIssue[] {
   return error.issues.flatMap((issue) => flattenZodIssue(issue));
 }
 

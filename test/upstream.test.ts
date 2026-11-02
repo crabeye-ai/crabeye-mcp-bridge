@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Server, InMemoryTransport } from "@modelcontextprotocol/server";
 import type { Tool, CallToolResult, Transport } from "@modelcontextprotocol/server";
-import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
+import { BridgeConfigSchema, resolveUpstreams, type BridgeConfig } from "../src/config/schema.js";
 import { HttpUpstreamClient } from "../src/upstream/http-client.js";
 import { UpstreamManager } from "../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
@@ -419,7 +419,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, mockServer.server).client,
     });
@@ -442,7 +442,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, mockServer.server).client,
     });
@@ -467,7 +467,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => {
         if (name === "remote") {
@@ -499,7 +499,7 @@ describe("UpstreamManager", () => {
 
     let clientRef: HttpUpstreamClient | undefined;
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => {
         const { client } = createLinkedClient(name, mockServer.server);
@@ -537,7 +537,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => {
         if (name === "server-a") {
@@ -572,7 +572,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, mockServer.server).client,
     });
@@ -602,7 +602,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
     });
@@ -634,7 +634,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
     });
@@ -672,7 +672,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
     });
@@ -706,7 +706,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
     });
@@ -736,7 +736,7 @@ describe("UpstreamManager", () => {
     });
 
     const manager = new UpstreamManager({
-      config,
+      names: Object.keys(resolveUpstreams(config)),
       toolRegistry,
       _clientFactory: (name) => createLinkedClient(name, servers[name].server).client,
     });

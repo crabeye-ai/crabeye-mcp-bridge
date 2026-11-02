@@ -4,7 +4,7 @@ import type { CredentialStore } from "../../../src/credentials/credential-store.
 import { takeSlotFor } from "../../../src/daemon/instances/hosted-calls.js";
 import { Instance, type InstanceNotification } from "../../../src/daemon/instances/instance.js";
 import type { Lease } from "../../../src/daemon/instances/upstream-pool.js";
-import { CallRefusedError } from "../../../src/upstream/call-errors.js";
+import { ApprovalRequiredError, CallRefusedError } from "../../../src/upstream/call-errors.js";
 import { UpstreamPool } from "../../../src/daemon/instances/upstream-pool.js";
 import type { InstanceSource } from "../../../src/daemon/protocol.js";
 import { WAIT_FOR_RESPAWN_MS } from "../../../src/server/upstream-wait.js";
@@ -223,9 +223,9 @@ describe("An instance's tool calls", () => {
     });
 
     it.each([
-      ["disables its tool", { toolPolicy: "never" }, "Tool svc__op is disabled by policy"],
-      ["makes its tool need approval", { toolPolicy: "prompt" }, "Tool svc__op now requires confirmation after a configuration change; please retry"],
-    ])("refuses it when a reload %s meanwhile", async (_case, policy, message) => {
+      ["refuses it when a reload disables its tool", { toolPolicy: "never" }, new CallRefusedError("Tool svc__op is disabled by policy")],
+      ["asks for approval when a reload makes its tool need it", { toolPolicy: "prompt" }, new ApprovalRequiredError('Allow svc__op to run?\n\nArguments:\n{\n  "q": 1\n}')],
+    ])("%s meanwhile", async (_case, policy, outcome) => {
       const instance = await open();
       const waiting = await waitingForReconnect(instance);
 
@@ -233,7 +233,7 @@ describe("An instance's tool calls", () => {
       clients[0]!.setStatus("connected");
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(waiting.outcome()).toEqual(new CallRefusedError(message));
+      expect(waiting.outcome()).toEqual(outcome);
       expect(clients[0]!.calls).toHaveLength(1);
     });
   });
@@ -280,15 +280,26 @@ describe("An instance's tool calls", () => {
     expect(clients[0]!.calls).toHaveLength(1);
   });
 
-  it("refuses a call whose tool now needs approval unless the client approved it", async () => {
-    configs.set("/home/u/a.json", { mcpServers: { svc: limited(10, { toolPolicy: "prompt" }) } });
+  it("asks for approval of a call whose tool needs it without taking a rate-limit slot, and runs it once approved", async () => {
+    configs.set("/home/u/a.json", { mcpServers: { svc: limited(1, { toolPolicy: "prompt" }) } });
     const instance = await open();
 
     const unapproved = await call(instance);
     const approved = await call(instance, { approved: true });
 
-    expect(unapproved.outcome()).toEqual(new CallRefusedError("Tool svc__op now requires confirmation after a configuration change; please retry"));
+    expect(unapproved.outcome()).toEqual(new ApprovalRequiredError('Allow svc__op to run?\n\nArguments:\n{\n  "q": 1\n}'));
     expect(approved.outcome()).toBe("called");
+  });
+
+  it("refuses a call to a tool the policy disables at once, without waiting for a rate-limit slot", async () => {
+    const instance = await open();
+    await call(instance);
+    await reload(instance, "/home/u/a.json", { mcpServers: { svc: limited(1, { tools: { op: "never" } }) } });
+
+    const refused = await call(instance);
+
+    expect(refused.outcome()).toEqual(new CallRefusedError("Tool svc__op is disabled by policy"));
+    expect(clients[0]!.calls).toHaveLength(1);
   });
 
   it("gives up a cancelled call's place without refusing it, and the next waiting call gets the slot", async () => {

@@ -189,6 +189,19 @@ describe("STDIO upstreams the manager runs for bridges", { timeout: 90_000 }, ()
       for (const bridge of [first, second]) await until(() => /DEBUG +\[upstream:stub\] seen-by-every-client/.test(bridge.stderr()), 10_000);
     });
 
+    it("runs a client's first call on a server of a listed file it can't read, which the manager already has", async () => {
+      await workspace();
+      const clientFile = await configFile("client.json", { stub: stubServer() });
+      await writeFile(join(dir, CREDENTIALS_DIR, BRIDGE_CONFIG_FILENAME), JSON.stringify({ configPaths: [clientFile], _bridge: { daemon: { killGraceMs: 0 } } }));
+      const first = await connect(null);
+      expect(await text(first, "plain")).toBe("called plain");
+      await writeFile(clientFile, "{ not json");
+
+      const second = await connect(null);
+
+      expect(await text(second, "plain")).toBe("called plain");
+    });
+
     it("shares one child between clients on the default config", async () => {
       await workspace();
       const clientFile = await configFile("client.json", { stub: stubServer() });

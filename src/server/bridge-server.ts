@@ -19,13 +19,12 @@ import { ToolRegistry } from "./tool-registry.js";
 import { parseNamespacedName } from "./tool-namespacing.js";
 import { ApprovalFlow } from "./policy-approval.js";
 import { ClientMetadata } from "./client-metadata.js";
-import { awaitConnectedClient, untilSettledOrCancelled } from "./upstream-wait.js";
-import { CallRefusedError, cancelledError, reauthorizationError } from "../upstream/call-errors.js";
+import { atMostRespawnWait, awaitConnectedClient, untilSettledOrCancelled } from "./upstream-wait.js";
+import { ApprovalRequiredError, CallRefusedError, cancelledError, reauthorizationError } from "../upstream/call-errors.js";
 import type { UpstreamClient } from "../upstream/types.js";
 import { searchToolDefinition, runToolDefinition } from "../search/tool-definitions.js";
 import type { RunToolParams, SearchToolsParams, SearchToolsResponse } from "../search/index.js";
 import { searchQueriesProblem } from "../search/limits.js";
-import type { PolicyDecision, PolicyEngine } from "../policy/index.js";
 import { SessionStats } from "./session-stats.js";
 import type { SessionStatsSnapshot } from "./session-stats.js";
 import type { Logger } from "../logging/index.js";
@@ -59,18 +58,14 @@ export interface BridgeServerOptions {
   toolRegistry?: ToolRegistry;
   /** Answers `search_tools`. */
   search: (params: SearchToolsParams) => Promise<SearchToolsResponse>;
-  policyEngine?: PolicyEngine;
   getUpstreamClient?: (name: string) => UpstreamClient | undefined;
+  /** Settles once the bridge knows which upstreams it has; a call to an unknown one waits for it before failing. */
+  upstreamsKnown?: () => Promise<void>;
   onClientsChanged?: (listener: () => void) => () => void;
   logger?: Logger;
   showStats?: boolean;
   onSearchStats?: (stats: SessionStatsSnapshot) => void;
-  /**
-   * Optional renderer for the per-server `_bridge.passthrough` blocks.
-   * When provided, the returned string is appended after the base bridge
-   * instructions on every regenerate. Empty string means no servers
-   * contributed (or no upstreams are connected yet).
-   */
+  /** The `_bridge.passthrough` blocks to append to the base instructions when a client connects; empty means none. */
   buildPassthrough?: () => string;
 }
 
@@ -114,15 +109,10 @@ type ToolCallOutcome = CallToolResult | InputRequiredResult | Promise<CallToolRe
 
 const BRIDGE_TOOLS = [searchToolDefinition, runToolDefinition];
 
-function throwIfDenied(decision: PolicyDecision | undefined): void {
-  if (decision?.kind === "deny") throw new Error(decision.reason);
-}
-
 export class BridgeServer {
   private handle: StdioServerHandle | undefined;
   private toolRegistry: ToolRegistry;
   private search: (params: SearchToolsParams) => Promise<SearchToolsResponse>;
-  private policyEngine: PolicyEngine | undefined;
   private sessionStats: SessionStats;
   private approval = new ApprovalFlow();
   private options: BridgeServerOptions;
@@ -135,7 +125,6 @@ export class BridgeServer {
       this.markSessionStarted = resolve;
     });
     this.toolRegistry = options.toolRegistry ?? new ToolRegistry();
-    this.policyEngine = options.policyEngine;
     this.search = options.search;
     this.sessionStats = new SessionStats(this.toolRegistry, BRIDGE_TOOLS);
   }
@@ -252,16 +241,7 @@ export class BridgeServer {
     }
 
     const toolKey = `${parsed.source}__${parsed.toolName}`;
-    const decision = this.policyEngine?.evaluate(parsed.source, parsed.toolName, args);
-    throwIfDenied(decision);
-    const needsApproval = decision?.kind === "prompt";
-    if (needsApproval) {
-      if (!connection.client.supportsFormElicitation(ctx)) {
-        throw new Error(`Tool ${toolKey} requires confirmation but the client does not support elicitation`);
-      }
-      const outcome = await this.approval.resolve(toolKey, args, decision.request, ctx);
-      if (outcome !== "approved") return outcome;
-    }
+    const approved = this.approval.answered(toolKey, args, ctx) === "approved";
 
     const getClient = this.options.getUpstreamClient;
     if (!getClient) {
@@ -269,7 +249,7 @@ export class BridgeServer {
     }
 
     const signal = ctx.mcpReq.signal;
-    if (!getClient(parsed.source)) await untilSettledOrCancelled(this.sessionStart, signal);
+    if (!getClient(parsed.source)) await untilSettledOrCancelled(this.sessionStart.then(() => atMostRespawnWait(this.options.upstreamsKnown?.() ?? Promise.resolve())), signal);
     if (!getClient(parsed.source)) {
       throw new Error(`Upstream server not found: ${parsed.source}`);
     }
@@ -281,9 +261,15 @@ export class BridgeServer {
       logger: this.options.logger?.child({ component: "bridge" }),
     });
     try {
-      return await client.callTool({ name: parsed.toolName, arguments: args }, { signal, ...(needsApproval && { approved: true }) });
+      return await client.callTool({ name: parsed.toolName, arguments: args }, { signal, ...(approved && { approved: true }) });
     } catch (err) {
       if (signal.aborted) throw cancelledError();
+      if (err instanceof ApprovalRequiredError) {
+        if (!connection.client.supportsFormElicitation(ctx)) {
+          throw new Error(`Tool ${toolKey} requires confirmation but the client does not support elicitation`);
+        }
+        return this.approval.ask(toolKey, args, err.message);
+      }
       if (err instanceof CallRefusedError) throw err;
       if (client.status === "auth_required") throw reauthorizationError(parsed.source, client.name);
       const message = err instanceof Error ? err.message : String(err);

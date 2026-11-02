@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigWatcher } from "../src/config/config-watcher.js";
 import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
-import { loadConfig } from "../src/config/loader.js";
+import { ConfigError, loadConfig } from "../src/config/loader.js";
 import { spyLogger } from "./_helpers/spy-logger.js";
 
 function makeTmpDir(): string {
@@ -277,5 +277,28 @@ describe("ConfigWatcher", () => {
 
     await waitFor(() => received.length >= 1);
     expect(received.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("names the fields at fault when the config stops loading", async () => {
+    const dir = makeTmpDir();
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const configPath = join(dir, "config.json");
+    writeConfig(configPath, validConfig());
+    const logger = spyLogger();
+    const watcher = new ConfigWatcher({
+      configPaths: [configPath],
+      loadConfig: async () => {
+        throw new ConfigError("Config validation failed", [{ path: "mcpServers.a.url", message: "Invalid URL" }]);
+      },
+      debounceMs: 50,
+      logger,
+    });
+    cleanups.push(() => watcher.stop());
+    watcher.start(() => {});
+
+    watcher.checkNow();
+
+    await waitFor(() => logger.warn.mock.calls.some(([message]) => message === "failed to reload config"));
+    expect(logger.warn).toHaveBeenCalledWith("failed to reload config", { component: "config-watcher", error: "Config validation failed: mcpServers.a.url: Invalid URL" });
   });
 });

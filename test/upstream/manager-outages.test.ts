@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from "vitest";
 import type { Tool } from "@modelcontextprotocol/client";
 import { UpstreamManager } from "../../src/upstream/upstream-manager.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
-import { BridgeConfigSchema, type BridgeConfig } from "../../src/config/schema.js";
 import { spyLogger } from "../_helpers/spy-logger.js";
 import type {
   ConnectionStatus,
@@ -51,19 +50,12 @@ class FakeUpstream implements UpstreamClient {
   }
 }
 
-function config(servers: string[]): BridgeConfig {
-  return BridgeConfigSchema.parse({
-    mcpServers: Object.fromEntries(servers.map((name) => [name, { type: "streamable-http", url: `http://localhost/${name}` }])),
-    _bridge: { healthCheckInterval: 0, toolPolicy: "always" },
-  });
-}
-
 async function managerWith(names: string[], logger = spyLogger()) {
   const registry = new ToolRegistry();
   const clients = new Map<string, FakeUpstream>();
   const created: FakeUpstream[] = [];
   const manager = new UpstreamManager({
-    config: config(names),
+    names,
     toolRegistry: registry,
     logger,
     _clientFactory: (name) => {
@@ -107,58 +99,6 @@ describe("UpstreamManager during upstream outages", () => {
     jira.become("connected");
     jira.become("auth_required");
     expect(pauseWarnings()).toBe(2);
-    await manager.closeAll();
-  });
-
-  it("retries only the upstreams paused for authorization", async () => {
-    const { manager, clients } = await managerWith(["jira", "linear", "notes"]);
-    clients.get("jira")!.become("auth_required");
-    clients.get("linear")!.become("disconnected");
-
-    manager.retryAuthPaused();
-
-    expect(clients.get("jira")!.retryNow).toHaveBeenCalledOnce();
-    expect(clients.get("linear")!.retryNow).not.toHaveBeenCalled();
-    expect(clients.get("notes")!.retryNow).not.toHaveBeenCalled();
-    await manager.closeAll();
-  });
-
-  it("keeps a paused upstream that a reload reports as changed, and retries it", async () => {
-    const { manager, registry, clients, created } = await managerWith(["jira"]);
-    const paused = clients.get("jira")!;
-    paused.become("auth_required");
-
-    await manager.applyConfigDiff(
-      {
-        servers: { added: [], removed: [], changed: [{ name: "jira", config: config(["jira"]).mcpServers.jira! }] },
-        bridge: { requiresRestart: [] },
-      },
-      config(["jira"]),
-    );
-    manager.retryAuthPaused();
-
-    expect(paused.closed).toBe(false);
-    expect(created).toHaveLength(1);
-    expect(manager.getClient("jira")).toBe(paused);
-    expect(paused.retryNow).toHaveBeenCalledTimes(1);
-    expect(registry.listTools().map((t) => t.name)).toEqual(["jira__lookup"]);
-    await manager.closeAll();
-  });
-
-  it("does not retry a paused upstream that was removed from the config", async () => {
-    const { manager, clients } = await managerWith(["jira", "notes"]);
-    clients.get("jira")!.become("auth_required");
-
-    await manager.applyConfigDiff(
-      {
-        servers: { added: [], removed: ["jira"], changed: [] },
-        bridge: { requiresRestart: [] },
-      },
-      config(["notes"]),
-    );
-    manager.retryAuthPaused();
-
-    expect(clients.get("jira")!.retryNow).not.toHaveBeenCalled();
     await manager.closeAll();
   });
 });

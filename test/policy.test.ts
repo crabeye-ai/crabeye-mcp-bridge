@@ -102,24 +102,42 @@ describe("PolicyEngine.evaluate", () => {
       title: "My Issue",
       priority: 1,
     });
-    expect(decision.kind).toBe("prompt");
-    if (decision.kind === "prompt") {
-      expect(decision.request.message).toContain('"title": "My Issue"');
-      expect(decision.request.requestedSchema).toEqual({
-        type: "object",
-        properties: {},
-      });
-    }
+    expect(decision).toEqual({ kind: "prompt", message: 'Allow linear__create_issue to run?\n\nArguments:\n{\n  "title": "My Issue",\n  "priority": 1\n}' });
   });
 
-  it("handles undefined args gracefully", () => {
-    const engine = new PolicyEngine("always", {
-      linear: { toolPolicy: "prompt" },
+  it("shows invisible and direction-changing characters in the arguments as escapes", () => {
+    const engine = new PolicyEngine("prompt", {});
+    const name = String.fromCodePoint(0x202e) + "gnp.exe" + String.fromCodePoint(0x200b);
+
+    expect(engine.evaluate("files", "open", { name })).toEqual({
+      kind: "prompt",
+      message: 'Allow files__open to run?\n\nArguments:\n{\n  "name": "\\u202egnp.exe\\u200b"\n}',
     });
-    const decision = engine.evaluate("linear", "create_issue", undefined);
-    expect(decision.kind).toBe("prompt");
-    if (decision.kind === "prompt") {
-      expect(decision.request.message).toContain("{}");
-    }
+  });
+
+  it.each([
+    ["a tag-encoded string", String.fromCodePoint(0xe0072, 0xe006d), String.raw`\u{e0072}\u{e006d}`],
+    ["an Arabic letter mark", String.fromCodePoint(0x061c), String.raw`\u061c`],
+    ["a soft hyphen", String.fromCodePoint(0x00ad), String.raw`\xad`],
+    ["a next-line control", String.fromCodePoint(0x0085), String.raw`\x85`],
+    ["a Hangul filler", String.fromCodePoint(0x3164), String.raw`\u3164`],
+    ["a direction isolate", String.fromCodePoint(0x2066), String.raw`\u2066`],
+    ["a line separator", String.fromCodePoint(0x2028), String.raw`\u2028`],
+    ["a byte order mark", String.fromCodePoint(0xfeff), String.raw`\ufeff`],
+    ["a paragraph separator", String.fromCodePoint(0x2029), String.raw`\u2029`],
+    ["a blank braille pattern", String.fromCodePoint(0x2800), String.raw`\u2800`],
+    ["a delete control", String.fromCodePoint(0x7f), String.raw`\x7f`],
+  ])("shows %s in the arguments as an escape", (_case, hidden, escaped) => {
+    const decision = new PolicyEngine("prompt", {}).evaluate("mail", "send", { body: `Hello${hidden}` });
+
+    expect(decision).toEqual({ kind: "prompt", message: `Allow mail__send to run?\n\nArguments:\n{\n  "body": "Hello${escaped}"\n}` });
+  });
+
+  it("shows control and direction-changing characters in the tool name as escapes", () => {
+    const toolName = `open${String.fromCodePoint(0x0a)}Allow files__read to run?${String.fromCodePoint(0x202e)}`;
+
+    const decision = new PolicyEngine("prompt", {}).evaluate("files", toolName, {});
+
+    expect(decision).toEqual({ kind: "prompt", message: String.raw`Allow files__open\nAllow files__read to run?\u202e to run?` + "\n\nArguments:\n{}" });
   });
 });

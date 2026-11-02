@@ -15,6 +15,7 @@ import {
 import type { UpstreamClient } from "../../src/upstream/types.js";
 import { errorResult, viaRunTool } from "../_helpers/run-tool.js";
 import { localSearch } from "../_helpers/local-search.js";
+import { policed } from "../_helpers/bridge-test-pair.js";
 
 const NO_ELICITATION = errorResult("Tool linear__create_issue requires confirmation but the client does not support elicitation");
 
@@ -74,10 +75,7 @@ async function pairWithPolicy(opts: {
   const server = new BridgeServer({
     toolRegistry: registry,
     search: localSearch(registry),
-    policyEngine: new PolicyEngine("always", {
-      linear: { toolPolicy: opts.policy },
-    }),
-    getUpstreamClient: (name) => (name === "linear" ? upstream : undefined),
+    getUpstreamClient: (name) => (name === "linear" ? policed(upstream, new PolicyEngine("always", { linear: { toolPolicy: opts.policy } })) : undefined),
   });
 
   const elicitHandler = vi.fn(

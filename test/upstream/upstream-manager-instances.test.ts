@@ -1,18 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BridgeConfigSchema, type BridgeConfig } from "../../src/config/schema.js";
-import { diffConfigs } from "../../src/config/config-diff.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
 import { InstanceUpstreamClient } from "../../src/upstream/instance-upstream-client.js";
 import { UpstreamManager } from "../../src/upstream/upstream-manager.js";
 import { FakeInstanceLink } from "../_helpers/fake-instance-link.js";
 import { tool } from "../_helpers/scripted-upstream-client.js";
-
-const PLAIN = { url: "http://127.0.0.1:1/plain" };
-const OAUTH = { url: "http://127.0.0.1:1/oauth", _bridge: { auth: { type: "oauth2" } } };
-
-function config(servers: Record<string, unknown>, bridge: Record<string, unknown> = {}): BridgeConfig {
-  return BridgeConfigSchema.parse({ mcpServers: servers, _bridge: bridge });
-}
 
 function fakeLink(): FakeInstanceLink {
   const link = new FakeInstanceLink();
@@ -30,9 +21,9 @@ describe("UpstreamManager with a daemon instance", () => {
     manager = undefined;
   });
 
-  it("connects every HTTP upstream through the instance link, with or without _bridge.auth", async () => {
+  it("connects every upstream through the instance link", async () => {
     const registry = new ToolRegistry();
-    manager = new UpstreamManager({ config: config({ plain: PLAIN, oauth: OAUTH }), toolRegistry: registry, instanceLink: fakeLink() });
+    manager = new UpstreamManager({ names: ["plain", "oauth"], toolRegistry: registry, instanceLink: fakeLink() });
 
     const result = await manager.connectAll();
 
@@ -42,28 +33,26 @@ describe("UpstreamManager with a daemon instance", () => {
     expect(registry.listRegisteredTools().map((t) => t.tool.name).sort()).toEqual(["oauth__oauth_tool", "plain__plain_tool"]);
   });
 
-  it("keeps a server's stand-in when a reload changes how it connects, leaving the change to the manager", async () => {
+  it("knows its upstreams once the instance link has attached, and at once when it can't attach", async () => {
     const link = fakeLink();
-    const before = config({ svc: { ...PLAIN, _bridge: { auth: { type: "oauth2", scopes: ["read"] } } } });
-    const after = config({ svc: { ...PLAIN, _bridge: { auth: { type: "oauth2", scopes: ["write"] }, category: "tracker" } } });
-    const registry = new ToolRegistry();
-    manager = new UpstreamManager({ config: before, toolRegistry: registry, instanceLink: link });
-    await manager.connectAll();
-    const first = manager.getClient("svc");
-    const clientsChanged = vi.fn();
-    manager.onClientsChanged(clientsChanged);
+    let attached!: () => void;
+    link.attachNow.mockReturnValueOnce(new Promise<void>((resolve) => (attached = resolve)));
+    manager = new UpstreamManager({ names: [], toolRegistry: new ToolRegistry(), instanceLink: link });
+    let known = false;
 
-    await manager.applyConfigDiff(diffConfigs(before, after), after);
+    const knowing = manager.upstreamsKnown().then(() => (known = true));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(known).toBe(false);
+    attached();
+    await knowing;
+    link.attachNow.mockRejectedValueOnce(new Error("daemon unreachable"));
 
-    expect(manager.getClient("svc")).toBe(first);
-    expect(first!.status).toBe("connected");
-    expect(link.viewsOf("svc")).toHaveLength(1);
-    expect(clientsChanged).not.toHaveBeenCalled();
+    await expect(manager.upstreamsKnown()).resolves.toBeUndefined();
   });
 
   it("closes the link with the upstreams", async () => {
     const link = fakeLink();
-    manager = new UpstreamManager({ config: config({ plain: PLAIN }), toolRegistry: new ToolRegistry(), instanceLink: link });
+    manager = new UpstreamManager({ names: ["plain"], toolRegistry: new ToolRegistry(), instanceLink: link });
     await manager.connectAll();
 
     await manager.closeAll();

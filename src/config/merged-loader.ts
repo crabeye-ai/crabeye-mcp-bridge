@@ -3,7 +3,7 @@ import { BridgeConfigSchema, type BridgeConfig } from "./schema.js";
 import { loadBridgeOwnedConfig, type BridgeOwnedConfig } from "./bridge-config.js";
 import { deepMerge } from "./deep-merge.js";
 import { parseJsoncString } from "./jsonc.js";
-import { ConfigError } from "./loader.js";
+import { ConfigError, formatZodIssues } from "./loader.js";
 
 /** Keys we extract from client config files. */
 const KNOWN_KEYS = [
@@ -35,6 +35,19 @@ export interface MergedLoaderOptions {
 export interface MergedLoaderResult {
   config: BridgeConfig;
   watchPaths: string[];
+  /** Each listed client config file that exists but was left out, because it can't be read or isn't JSON. */
+  skipped: SkippedFile[];
+}
+
+export interface SkippedFile {
+  path: string;
+  /** Why it was left out, naming the file. */
+  message: string;
+}
+
+/** The warning that `file` was left out of the config. */
+export function leftOutWarning(file: SkippedFile): string {
+  return `${file.message}; its servers are left out`;
 }
 
 export async function loadMergedConfig(
@@ -49,18 +62,26 @@ export async function loadMergedConfig(
   }
 
   const watchPaths: string[] = [];
+  const skipped: SkippedFile[] = [];
   const layers: Array<Record<string, unknown>> = [];
 
   // Layer 1: client configs from configPaths (in order, later wins)
   if (bridgeOwned) {
     for (const configPath of bridgeOwned.configPaths) {
+      const raw = await readFile(configPath, "utf-8").catch((err: NodeJS.ErrnoException) => err);
+      if (raw instanceof Error && raw.code === "ENOENT") continue;
+      watchPaths.push(configPath);
+      if (raw instanceof Error) {
+        skipped.push({
+          path: configPath,
+          message: `Failed to read config file: ${configPath} (${raw.code ?? "unknown error"})`,
+        });
+        continue;
+      }
       try {
-        const raw = await readFile(configPath, "utf-8");
-        const json = parseJsoncString(raw) as Record<string, unknown>;
-        layers.push(pickKnownKeys(json));
-        watchPaths.push(configPath);
+        layers.push(pickKnownKeys(parseJsoncString(raw) as Record<string, unknown>));
       } catch {
-        // Skip unreadable files — they may have been removed
+        skipped.push({ path: configPath, message: `Invalid JSON in config file: ${configPath}` });
       }
     }
 
@@ -92,10 +113,10 @@ export async function loadMergedConfig(
   const result = BridgeConfigSchema.safeParse(merged);
 
   if (!result.success) {
-    throw new ConfigError("Merged config validation failed");
+    throw new ConfigError("Merged config validation failed", formatZodIssues(result.error));
   }
 
-  return { config: result.data, watchPaths };
+  return { config: result.data, watchPaths, skipped };
 }
 
 function pickBridgeOverrides(

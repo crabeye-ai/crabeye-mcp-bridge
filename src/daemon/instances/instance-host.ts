@@ -1,11 +1,12 @@
 import { stat } from "node:fs/promises";
-import { ConfigError, loadConfig } from "../../config/loader.js";
+import { ConfigError, describeConfigError, loadConfig } from "../../config/loader.js";
 import { loadMergedConfig } from "../../config/merged-loader.js";
 import { CredentialStore } from "../../credentials/credential-store.js";
 import { createKeychainAdapter } from "../../credentials/keychain.js";
 import type { Logger } from "../../logging/index.js";
 import {
   ERROR_CODE_ALREADY_ATTACHED,
+  ERROR_CODE_APPROVAL_REQUIRED,
   ERROR_CODE_BRIDGE_UNSUPPORTED,
   ERROR_CODE_CALL_REFUSED,
   ERROR_CODE_DAEMON_STOPPING,
@@ -31,7 +32,7 @@ import {
 } from "../protocol.js";
 import { SearchTimeoutError, searchQueriesProblem } from "../../search/limits.js";
 import type { FrameChannel } from "../transport.js";
-import { CallRefusedError } from "../../upstream/call-errors.js";
+import { ApprovalRequiredError, CallRefusedError } from "../../upstream/call-errors.js";
 import type { CreateHttpClient } from "./http-connection.js";
 import { instanceKey } from "./identity.js";
 import { Instance, type InstanceAttachment, type InstanceDeps, type InstanceEnv, type InstanceNotification, type LoadedConfig } from "./instance.js";
@@ -130,7 +131,7 @@ export class InstanceHost {
     try {
       opened = await this._open(key, params.source, { env: params.env, childEnv: params.childEnv });
     } catch (err) {
-      const reason = describeLoadError(err);
+      const reason = describeConfigError(err);
       this._log.warn("could not load config for bridge", { config: params.source.kind, error: reason });
       return errorResponse(id, ERROR_CODE_INSTANCE_LOAD_FAILED, reason);
     } finally {
@@ -150,10 +151,9 @@ export class InstanceHost {
       send: (notification: InstanceNotification) => channel.send(notification),
     };
     this._attachments.set(channel, attachment);
-    instance.attach(attachment);
-    if (!fresh) await instance.reload();
+    await instance.admit(attachment, !fresh);
     this._log.info("bridge attached", { config: params.source.kind, bridges: instance.attachmentCount });
-    const result: AttachResult = { upstreams: instance.upstreamNames() };
+    const result: AttachResult = { upstreams: instance.upstreamNames(), ...instance.settings() };
     return { id, result };
   }
 
@@ -177,6 +177,7 @@ export class InstanceHost {
       );
       return { id, result };
     } catch (err) {
+      if (err instanceof ApprovalRequiredError) return errorResponse(id, ERROR_CODE_APPROVAL_REQUIRED, err.message);
       if (err instanceof CallRefusedError && !controller.signal.aborted) return errorResponse(id, ERROR_CODE_CALL_REFUSED, err.message);
       return errorResponse(id, ERROR_CODE_UPSTREAM_ERROR, callFailure(err, controller.signal));
     } finally {
@@ -336,12 +337,6 @@ async function loadSource(source: InstanceSource): Promise<LoadedConfig> {
   if (found !== undefined && !found.isFile()) throw new ConfigError(`Config file is not a regular file: ${source.path}`);
   if (source.kind === "merged") return loadMergedConfig({ bridgeConfigPath: source.path });
   return { config: await loadConfig({ configPath: source.path }), watchPaths: [source.path] };
-}
-
-function describeLoadError(err: unknown): string {
-  if (!(err instanceof Error)) return String(err);
-  if (!(err instanceof ConfigError) || err.issues.length === 0) return err.message;
-  return `${err.message}: ${err.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`;
 }
 
 function unknownUpstream(id: string, name: string): DaemonResponse {

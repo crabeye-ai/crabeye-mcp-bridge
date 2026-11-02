@@ -15,6 +15,7 @@ import type { QueryResult } from "../src/search/index.js";
 import type { UpstreamClient } from "../src/upstream/types.js";
 import { errorResult } from "./_helpers/run-tool.js";
 import { localSearch } from "./_helpers/local-search.js";
+import { policed } from "./_helpers/bridge-test-pair.js";
 
 function makeTool(name: string, description?: string): Tool {
   return {
@@ -640,11 +641,11 @@ describe("BridgeServer search_tools and run_tool", () => {
       } satisfies CallToolResult),
     });
 
+    const policedLinear = opts?.policyEngine ? policed(linearClient, opts.policyEngine) : linearClient;
     const server = new BridgeServer({
       toolRegistry,
       search: localSearch(toolRegistry, opts?.policyEngine),
-      policyEngine: opts?.policyEngine,
-      getUpstreamClient: (name) => (name === "linear" ? linearClient : undefined),
+      getUpstreamClient: (name) => (name === "linear" ? policedLinear : undefined),
     });
 
     const client = new Client(

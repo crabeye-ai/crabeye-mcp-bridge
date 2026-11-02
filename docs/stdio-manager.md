@@ -54,7 +54,7 @@ What `search_tools` and `run_tool` show doesn't change, except:
 * a regex the manager can't match in linear time is searched as plain text (see [Regex search](how-it-works.md#regex-search));
 * a search has limits on its size and running time (see [Multiple queries](how-it-works.md#multiple-queries)).
 
-The manager keeps one search index for each copy of a config, which every bridge using that copy searches, and enforces each server's rate limit once for every client (see [Rate limiting](policies.md#rate-limiting)). Each bridge still asks its own client to approve calls the tool policy marks `prompt`, and applies its passthrough settings. Cancelling a call cancels it at the server, and each server's instructions reach every client.
+The manager keeps one search index for each copy of a config, which every bridge using that copy searches, and enforces each server's rate limit once for every client (see [Rate limiting](policies.md#rate-limiting)). It also decides the tool policy for every client and renders the passthrough blocks; each bridge asks its own client to approve calls the policy marks `prompt`, and such a call takes no rate-limit slot before it is approved. Cancelling a call cancels it at the server, and each server's instructions reach every client.
 
 ## HTTP and SSE upstreams
 
@@ -82,7 +82,7 @@ The manager:
 * reads a `clientSecret` from the variables of the client the connection is for, never from its own environment;
 * connects a server again for every bridge as soon as `crabeye-mcp-bridge auth <server>` or `auth --remove <server>` changes its stored credentials.
 
-When an HTTP or SSE server's URL, headers or `_bridge.auth` change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Rate limits and categories in that file likewise apply to every client of a config once any of its clients restarts, and so does a tool policy that disables a tool or asks for approval; one that allows more applies to each client when it restarts. Everything else in that file takes effect for each client when that client restarts. The same goes for a STDIO server's settings and the global `_bridge.reconnect` in that file: the manager follows edits to the client config files it lists and to a `--config` file, but reads `config.json` itself again only when a client starts.
+When an HTTP or SSE server's URL, headers or `_bridge.auth` change in `~/.crabeye-mcp-bridge/config.json`, its connection follows the edit for every client once any client restarts. If the edit removes the server, clients that haven't restarted can't use it until they restart. A changed `healthCheckInterval` also applies to these connections once any client restarts, while changed reconnect settings apply only to connections opened after the edit. Rate limits, categories, tool policies, passthrough settings and the log level in that file likewise apply to every client of a config once any of its clients restarts. Everything else in that file, such as `_bridge.logFormat`, takes effect for each client when that client restarts. The same goes for a STDIO server's settings and the global `_bridge.reconnect` in that file: the manager follows edits to the client config files it lists and to a `--config` file, but reads `config.json` itself again only when a client starts.
 
 The [manager log](#manager-log) records what happens to these upstreams. Their warnings and errors also show in the log of each bridge using them (the AI client's MCP log), tagged with the server name. A warning that is only given once, such as the `"sse"` deprecation, shows in the bridges using the upstream at that moment.
 
@@ -154,13 +154,13 @@ All knobs live under `_bridge.daemon.*` in the bridge config:
 
 ## What happens when I edit my MCP config and save?
 
-The manager follows edits to the client config files and `--config` files it loaded and applies them once for every bridge. An edit to `~/.crabeye-mcp-bridge/config.json` itself applies once any client restarts.
+The manager follows edits to the client config files and `--config` files it loaded and applies them once for every bridge; bridges don't watch config files themselves. An edit to `~/.crabeye-mcp-bridge/config.json` itself applies once any client restarts. An edit that leaves the config invalid is ignored, keeping the last config that loaded, and the error shows in the manager log and in every client's log. That includes a client config file listed in `config.json` that stops being valid JSON. A listed file that wasn't read before, because it was missing or already invalid, is left out with a warning instead, and edits to the other files still apply. A client that starts while such a file is invalid gets that file's servers only if the manager already has them, and its log says so. A changed `_bridge.logFormat` needs each client to restart.
 
 1. **A change to how a STDIO server is started or connected** (its `command`, `args`, `env`, `cwd` or `_bridge.reconnect`, or the global `_bridge.reconnect`) starts the server again with the new settings. The old process stops once no config uses it any more (after `graceMs`). **No manual action needed.**
 
 2. **A change that only renames a server, or adds a second name for the same command,** keeps the running server.
 
-3. **A change to nothing the manager starts the server with** (e.g. you only edited `_bridge.toolPolicy`, or you upgraded the server's program on disk in place) keeps the running server. Changes to tool policies, categories and rate limits apply to every client at once, but running the new program needs:
+3. **A change to nothing the manager starts the server with** (e.g. you only edited `_bridge.toolPolicy`, or you upgraded the server's program on disk in place) keeps the running server. Changes to tool policies, categories, rate limits, passthrough settings and the log level apply to every client at once, but running the new program needs:
 
    ```bash
    crabeye-mcp-bridge daemon restart-upstream <upstreamHash>

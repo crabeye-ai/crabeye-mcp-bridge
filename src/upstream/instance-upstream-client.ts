@@ -59,8 +59,9 @@ export class InstanceUpstreamClient implements UpstreamClient {
 
   /** Settles once the daemon has tried the upstream: resolves when connected, rejects with the reason otherwise. */
   async connect(): Promise<void> {
-    if (this._closed) throw new Error(`client "${this.name}" is closed`);
+    this._throwIfClosed();
     await this._link.attach();
+    this._throwIfClosed();
     const known = this._link.snapshot(this.name);
     if (known !== undefined) this._apply(known);
     if (this._status !== "connected") {
@@ -113,6 +114,10 @@ export class InstanceUpstreamClient implements UpstreamClient {
   onToolsChanged(callback: ToolsChangedCallback): () => void {
     this._toolsListeners.add(callback);
     return () => this._toolsListeners.delete(callback);
+  }
+
+  private _throwIfClosed(): void {
+    if (this._closed) throw new Error(`client "${this.name}" is closed`);
   }
 
   private _wantsRetry(): boolean {

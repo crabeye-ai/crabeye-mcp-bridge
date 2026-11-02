@@ -11,6 +11,7 @@ import {
   type DaemonConfig,
 } from "./schema.js";
 import { parseJsoncString } from "./jsonc.js";
+import { ConfigError, describeConfigError, formatZodIssues } from "./loader.js";
 import type { LogLevel } from "../logging/index.js";
 
 export const BridgeOwnedConfigSchema = z.object({
@@ -28,19 +29,26 @@ export function getBridgeConfigPath(): string {
   return join(homedir(), CREDENTIALS_DIR, BRIDGE_CONFIG_FILENAME);
 }
 
+/** The bridge-owned config, or null when there is none; throws `ConfigError` when it can't be read, isn't JSON or isn't valid. */
 export async function loadBridgeOwnedConfig(path: string = getBridgeConfigPath()): Promise<BridgeOwnedConfig | null> {
   let raw: string;
   try {
     raw = await readFile(path, "utf-8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    throw new ConfigError(`Failed to read config file: ${path} (${code ?? "unknown error"})`);
   }
 
-  const json = parseJsoncString(raw);
-  return BridgeOwnedConfigSchema.parse(json);
+  let json: unknown;
+  try {
+    json = parseJsoncString(raw);
+  } catch {
+    throw new ConfigError(`Invalid JSON in config file: ${path}`);
+  }
+  const result = BridgeOwnedConfigSchema.safeParse(json);
+  if (!result.success) throw new ConfigError("Config validation failed", formatZodIssues(result.error));
+  return result.data;
 }
 
 export interface DaemonSettings {
@@ -55,18 +63,13 @@ export async function loadDaemonSettings(): Promise<DaemonSettings> {
   try {
     config = await loadBridgeOwnedConfig();
   } catch (err) {
-    loadError = describeLoadError(err);
+    loadError = describeConfigError(err);
   }
   return {
     daemon: DaemonConfigSchema.parse(config?._bridge?.daemon ?? {}),
     logLevel: config?._bridge?.logLevel ?? DEFAULT_LOG_LEVEL,
     ...(loadError !== undefined && { loadError }),
   };
-}
-
-function describeLoadError(err: unknown): string {
-  if (err instanceof z.ZodError) return z.prettifyError(err);
-  return err instanceof Error ? err.message : String(err);
 }
 
 export async function loadDaemonShutdownWaitMs(): Promise<number> {

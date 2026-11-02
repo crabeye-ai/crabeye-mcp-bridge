@@ -10,7 +10,7 @@ import { netTransport } from "../../src/daemon/net-transport.js";
 import { encodeFrame, FrameDecoder, type StatusResult, type UpstreamSnapshot } from "../../src/daemon/protocol.js";
 import { getBridgeConfigPath } from "../../src/config/bridge-config.js";
 import { InstanceLink, instanceSourceFor, type UpstreamView } from "../../src/upstream/instance-link.js";
-import { CallRefusedError } from "../../src/upstream/call-errors.js";
+import { ApprovalRequiredError } from "../../src/upstream/call-errors.js";
 import { spawnTestManager, type DaemonFixture } from "../_helpers/daemon-fixtures.js";
 import { ScriptedUpstreamClient, tool } from "../_helpers/scripted-upstream-client.js";
 import { recordingLogger, type LoggedLine } from "../_helpers/spy-logger.js";
@@ -122,14 +122,12 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
     expect(view.events).toEqual(["snapshot:connected"]);
   });
 
-  it("runs a call to a tool whose policy needs approval only when the bridge says its client approved it", async () => {
+  it("asks for approval of a call whose tool needs it, and runs it once the bridge says its client approved it", async () => {
     servers = { svc: { url: "https://svc.example.com/mcp", _bridge: { toolPolicy: "prompt" } } };
     const l = link();
     await l.attach();
 
-    await expect(l.callTool("svc", { name: "search" })).rejects.toEqual(
-      new CallRefusedError("Tool svc__search now requires confirmation after a configuration change; please retry"),
-    );
+    await expect(l.callTool("svc", { name: "search" })).rejects.toEqual(new ApprovalRequiredError("Allow svc__search to run?\n\nArguments:\n{}"));
     expect(await l.callTool("svc", { name: "search" }, { approved: true })).toEqual({ content: [{ type: "text", text: "called search" }] });
     expect(clients.find((c) => c.name === "svc")!.calls).toHaveLength(1);
   });
