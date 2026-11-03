@@ -101,6 +101,7 @@ Claude Code auto-registers the bridge as an MCP server. If you haven't configure
 - **Policies.** Per-tool / per-server / global tool policies (`always` / `prompt` / `never`), rate limiting. See [docs/policies.md](docs/policies.md).
 - **STDIO manager.** STDIO, HTTP and SSE upstreams routed through a per-user manager process so multiple bridges share a single subprocess or connection per upstream. See [docs/stdio-manager.md](docs/stdio-manager.md).
 - **CLI.** `init`, `restore`, `credential`, `daemon`, `--validate`. See [docs/cli.md](docs/cli.md).
+- **Upgrading from 1.x.** What changes in 2.0 and 3.0 with the MCP 2026-07-28 protocol. See [docs/upgrade-to-2026-07-28.md](docs/upgrade-to-2026-07-28.md).
 
 ## License
 
