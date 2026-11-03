@@ -106,14 +106,14 @@ export class Instance {
   private _config: BridgeConfig;
   private _watcher: ConfigWatcher | undefined;
   private _watchPaths: readonly string[] = [];
-  private _applying: Promise<void> = Promise.resolve();
   private _reloadRunning: Promise<void> | undefined;
   private _reloadQueued: Promise<void> | undefined;
   private _lastReloadError: string | undefined;
   /** The listed files the current config left out. */
   private _skipped: SkippedFile[] = [];
-  /** The listed files the current config read. */
+  /** The config files the current config read. */
   private _included = new Set<string>();
+  private _applyFailed = false;
   private _closed = false;
 
   private constructor(source: InstanceSource, { env, childEnv }: InstanceEnv, loaded: LoadedConfig, deps: InstanceDeps) {
@@ -154,15 +154,18 @@ export class Instance {
   }
 
   /**
-   * Attaches a bridge, reloading the config first when `reload` is set, then
-   * warns it about each listed file that was already left out before that
-   * reload and still is; a file the reload left out was announced to every
-   * attachment as it happened.
+   * Attaches a bridge, reloading the config and retrying servers paused for
+   * authorization first when `reload` is set, then warns it about each listed
+   * file that was already left out before that reload and still is; a file
+   * the reload left out was announced to every attachment as it happened.
    */
   async admit(attachment: InstanceAttachment, reload: boolean): Promise<void> {
     this.attach(attachment);
     const before = new Set(this._skipped.map(({ path }) => path));
-    if (reload) await this.reload();
+    if (reload) {
+      await this.reload();
+      this._retryPaused();
+    }
     for (const file of this._skipped) {
       if (before.has(file.path)) attachment.send({ method: "LOG", params: { level: "warn", message: leftOutWarning(file) } });
     }
@@ -208,8 +211,8 @@ export class Instance {
 
   /**
    * Loads the config again and applies what changed, keeping the current one
-   * when it doesn't load. Calls made while a reload runs share one reload
-   * that starts after it.
+   * when it doesn't load, and starts following any file it newly lists. Calls
+   * made while a reload runs share one reload that starts after it.
    */
   reload(): Promise<void> {
     if (this._reloadQueued !== undefined) return this._reloadQueued;
@@ -230,7 +233,6 @@ export class Instance {
     if (this._closed) return;
     this._closed = true;
     this._watcher?.stop();
-    await this._applying;
     for (const name of [...this._hosted.keys()]) this._unhost(name);
     this._attachments.clear();
     this._index.close();
@@ -260,14 +262,8 @@ export class Instance {
 
   private _watch(watchPaths: string[]): void {
     this._watchPaths = watchPaths;
-    this._watcher = new ConfigWatcher({
-      configPaths: watchPaths,
-      loadConfig: async () => (await this._loadComplete()).config,
-      onLoadError: (err) => this._reportLoadError(err),
-      logger: this._configLog,
-      debounceMs: this._deps.watchDebounceMs,
-    });
-    this._watcher.start((config) => this._enqueue(config), this._config);
+    this._watcher = new ConfigWatcher({ configPaths: watchPaths, logger: this._configLog, debounceMs: this._deps.watchDebounceMs });
+    this._watcher.start(() => void this.reload());
   }
 
   private _startReload(): Promise<void> {
@@ -279,36 +275,34 @@ export class Instance {
   }
 
   private async _loadAndApply(): Promise<void> {
+    if (this._closed) return;
     let loaded: LoadedConfig;
     try {
       loaded = await this._loadComplete();
     } catch (err) {
-      this._reportLoadError(err);
+      if (!this._closed) this._reportLoadError(err);
       return;
     }
-    await this._enqueue(loaded.config);
     if (this._closed) return;
+    this._recordSkipped(loaded);
+    this._applyIfChanged(loaded.config);
     const added = loaded.watchPaths.filter((path) => !this._watchPaths.includes(path));
-    if (added.length === 0) {
-      this._watcher?.markApplied(loaded.config);
-      return;
-    }
+    if (added.length === 0) return;
     this._watcher?.stop();
     this._watch([...this._watchPaths, ...added]);
-    this._watcher?.checkNow();
+    void this.reload();
   }
 
   /**
    * Loads the config, refusing one that leaves out a file the current config
    * included, so that a reload keeps the last good config instead of dropping
-   * that file's servers. Records which files the loaded config leaves out.
+   * that file's servers.
    */
   private async _loadComplete(): Promise<LoadedConfig> {
     const loaded = await this._deps.loadConfig(this.source);
     const lost = (loaded.skipped ?? []).filter(({ path }) => this._included.has(path));
     if (lost.length > 0) throw new ConfigError(lost.map(({ message }) => message).join("; "));
     this._lastReloadError = undefined;
-    this._recordSkipped(loaded);
     return loaded;
   }
 
@@ -327,13 +321,16 @@ export class Instance {
     this._lastReloadError = error;
   }
 
-  private _enqueue(config: BridgeConfig): Promise<void> {
-    this._applying = this._applying
-      .then(() => {
-        if (!this._closed) this._apply(config);
-      })
-      .catch((err: unknown) => this._log.error("failed to apply config", { error: err instanceof Error ? err.message : String(err) }));
-    return this._applying;
+  private _applyIfChanged(config: BridgeConfig): void {
+    if (!this._applyFailed && JSON.stringify(config) === JSON.stringify(this._config)) return;
+    this._log.info("applying changed config");
+    try {
+      this._apply(config);
+      this._applyFailed = false;
+    } catch (err) {
+      this._applyFailed = true;
+      this._log.error("failed to apply config", { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   private _apply(next: BridgeConfig): void {
@@ -371,6 +368,10 @@ export class Instance {
     if (interval !== previous._bridge.healthCheckInterval) {
       for (const { lease } of this._hosted.values()) lease.setHealthCheckInterval(interval);
     }
+    this._retryPaused();
+  }
+
+  private _retryPaused(): void {
     for (const { lease } of this._hosted.values()) lease.upstream.retryIfPaused();
   }
 

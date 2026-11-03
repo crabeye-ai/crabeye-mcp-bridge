@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { BridgeConfigSchema, type BridgeConfig } from "./schema.js";
-import { loadBridgeOwnedConfig, type BridgeOwnedConfig } from "./bridge-config.js";
+import { getBridgeConfigPath, loadBridgeOwnedConfig, type BridgeOwnedConfig } from "./bridge-config.js";
 import { deepMerge } from "./deep-merge.js";
 import { parseJsoncString } from "./jsonc.js";
 import { ConfigError, formatZodIssues } from "./loader.js";
@@ -53,7 +53,8 @@ export function leftOutWarning(file: SkippedFile): string {
 export async function loadMergedConfig(
   options?: MergedLoaderOptions,
 ): Promise<MergedLoaderResult> {
-  const bridgeOwned = await loadBridgeOwnedConfig(options?.bridgeConfigPath);
+  const bridgeConfigPath = options?.bridgeConfigPath ?? getBridgeConfigPath();
+  const bridgeOwned = await loadBridgeOwnedConfig(bridgeConfigPath);
 
   if (!bridgeOwned && !options?.configOverridePath) {
     throw new ConfigError(
@@ -64,6 +65,8 @@ export async function loadMergedConfig(
   const watchPaths: string[] = [];
   const skipped: SkippedFile[] = [];
   const layers: Array<Record<string, unknown>> = [];
+
+  if (bridgeOwned) watchPaths.push(bridgeConfigPath);
 
   // Layer 1: client configs from configPaths (in order, later wins)
   if (bridgeOwned) {

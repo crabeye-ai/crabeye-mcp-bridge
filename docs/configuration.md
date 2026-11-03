@@ -156,6 +156,8 @@ Self-exclusion applies to `mcpServers` and `context_servers`: the bridge skips a
 
 The bridge can't run as an upstream of another bridge: a bridge started that way exits with an error explaining why. Entries under the other keys are never skipped, so a bridge listed there fails to start.
 
+The manager follows edits to your MCP config files and to `~/.crabeye-mcp-bridge/config.json`, and applies them to every AI client without a restart. A few settings, such as `_bridge.logFormat` and the `_bridge.daemon` settings, still need a restart; see [What happens when I edit my MCP config and save?](stdio-manager.md#what-happens-when-i-edit-my-mcp-config-and-save).
+
 ## Supported clients in `init`
 
 The `init` command scans for these config files (first existing path per client wins):

@@ -122,6 +122,35 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     expect(fresh.count("tools/list")).toBe(1);
   });
 
+  it("serves a server added to config.json, and one from a client file added to its list, to every attached client while a call runs, keeping the connection they share", async () => {
+    await daemon();
+    const [svc, fresh, more] = [await upstream(), await upstream(), await upstream()];
+    const clientFile = await writeJson("client.json", { mcpServers: { svc: { url: svc.url } } });
+    const otherFile = await writeJson("other.json", { mcpServers: { more: { url: more.url } } });
+    const bridgeConfig = await writeJson("config.json", { configPaths: [clientFile] });
+    const [a, b] = [await bridge(bridgeConfig, { kind: "merged" }), await bridge(bridgeConfig, { kind: "merged" })];
+    const slow = a.client("svc").callTool({ name: "slow" });
+    slow.catch(() => {});
+    await vi.waitFor(() => expect(svc.count("tools/call")).toBe(1));
+
+    await rewriteJsonUntil("config.json", { configPaths: [clientFile], servers: { fresh: { url: fresh.url } } }, async () =>
+      expect((await status()).instances[0]!.upstreams).toEqual(["fresh", "svc"]),
+    );
+    await rewriteJsonUntil("config.json", { configPaths: [clientFile, otherFile], servers: { fresh: { url: fresh.url } } }, async () =>
+      expect((await status()).instances[0]!.upstreams).toEqual(["fresh", "more", "svc"]),
+    );
+
+    await vi.waitFor(() => {
+      expect(a.tools()).toEqual(expect.arrayContaining(["fresh__echo", "more__echo"]));
+      expect(b.tools()).toEqual(expect.arrayContaining(["fresh__echo", "more__echo"]));
+    });
+    expect(await b.call("fresh")).toEqual(ECHOED);
+    expect(await a.call("more")).toEqual(ECHOED);
+    expect(await settledWithin(slow, 200)).toBe(false);
+    expect(svc.cancellations()).toBe(0);
+    expect(svc.count("tools/list")).toBe(1);
+  });
+
   it("closes the connection idleMs after the last client leaves, and reuses it for a client attaching before then", async () => {
     await daemon({ idleMs: 2_000 });
     const server = await upstream();

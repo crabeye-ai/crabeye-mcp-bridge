@@ -44,14 +44,14 @@ describe("loadMergedConfig", () => {
     await expect(loadMergedConfig()).rejects.toThrow(/init/);
   });
 
-  it("reads the bridge config at the given path instead of the one in the home directory", async () => {
+  it("reads the bridge config at the given path instead of the one in the home directory, and watches it with the files it lists", async () => {
     const client = await writeConfig("client.json", { mcpServers: { svc: { url: "http://localhost:1/mcp" } } });
     const bridgeConfigPath = await writeConfig("config.json", { configPaths: [client] });
 
     const { config, watchPaths } = await loadMergedConfig({ bridgeConfigPath });
 
     expect(config.mcpServers).toHaveProperty("svc");
-    expect(watchPaths).toEqual([client]);
+    expect(watchPaths).toEqual([bridgeConfigPath, client]);
   });
 
   it("leaves out a listed client file that isn't JSON, saying why and still watching it, and a missing one silently", async () => {
@@ -63,7 +63,7 @@ describe("loadMergedConfig", () => {
     const { config, watchPaths, skipped } = await loadMergedConfig({ bridgeConfigPath });
 
     expect(Object.keys(config.mcpServers ?? {})).toEqual(["svc"]);
-    expect(watchPaths).toEqual([client, broken]);
+    expect(watchPaths).toEqual([bridgeConfigPath, client, broken]);
     expect(skipped).toEqual([{ path: broken, message: `Invalid JSON in config file: ${broken}` }]);
   });
 
@@ -74,7 +74,7 @@ describe("loadMergedConfig", () => {
 
     const { watchPaths, skipped } = await loadMergedConfig({ bridgeConfigPath });
 
-    expect(watchPaths).toEqual([locked]);
+    expect(watchPaths).toEqual([bridgeConfigPath, locked]);
     expect(skipped).toEqual([{ path: locked, message: `Failed to read config file: ${locked} (EACCES)` }]);
   });
 

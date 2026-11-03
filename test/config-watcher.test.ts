@@ -1,23 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync, type FSWatcher } from "node:fs";
-import { join } from "node:path";
+import { writeFileSync, mkdtempSync, renameSync, rmSync, type FSWatcher } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigWatcher } from "../src/config/config-watcher.js";
-import { BridgeConfigSchema, type BridgeConfig } from "../src/config/schema.js";
-import { ConfigError, loadConfig } from "../src/config/loader.js";
-import { spyLogger } from "./_helpers/spy-logger.js";
+import { spyLogger, type SpyLogger } from "./_helpers/spy-logger.js";
 
-function makeTmpDir(): string {
-  return mkdtempSync(join(tmpdir(), "config-watcher-test-"));
-}
-
-function writeConfig(path: string, config: Record<string, unknown>): void {
-  writeFileSync(path, JSON.stringify(config));
-}
-
-function validConfig(servers: Record<string, unknown> = {}): Record<string, unknown> {
-  return { mcpServers: servers };
-}
+const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms));
 
 function waitFor(
   predicate: () => boolean,
@@ -43,262 +31,115 @@ describe("ConfigWatcher", () => {
     cleanups.length = 0;
   });
 
-  it("fires listener on config file change", async () => {
-    const dir = makeTmpDir();
+  function fileIn(name: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "config-watcher-test-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    const content = validConfig();
-    writeConfig(configPath, content);
+    const path = join(dir, name);
+    writeFileSync(path, "{}");
+    return path;
+  }
 
-    const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({
-      configPaths: [configPath],
-      loadConfig: () => loadConfig({ configPath }),
-      debounceMs: 50,
-    });
+  function watcherOn(paths: string[], options: { debounceMs?: number; logger?: SpyLogger } = {}) {
+    let changes = 0;
+    const watcher = new ConfigWatcher({ configPaths: paths, debounceMs: options.debounceMs ?? 50, logger: options.logger });
     cleanups.push(() => watcher.stop());
+    return { watcher, start: () => watcher.start(() => changes++), changes: () => changes };
+  }
 
-    // Seed with initial config to avoid false positives from stale fs events
-    watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(content));
+  /** Starts watching, then waits out the events macOS replays for writes made just before the watch began. */
+  async function startedOn(paths: string[], options: { debounceMs?: number; logger?: SpyLogger } = {}) {
+    const watched = watcherOn(paths, options);
+    watched.start();
+    await settle();
+    const before = watched.changes();
+    return { ...watched, since: () => watched.changes() - before };
+  }
 
-    // Give fs.watch time to fully initialize
-    await new Promise((r) => setTimeout(r, 100));
+  it("calls back when a watched file changes", async () => {
+    const configPath = fileIn("config.json");
+    const { since } = await startedOn([configPath]);
 
-    // Modify the config
-    writeConfig(configPath, validConfig({
-      linear: { type: "streamable-http", url: "http://localhost:3000" },
-    }));
+    writeFileSync(configPath, '{"mcpServers":{}}');
 
-    await waitFor(() => received.length >= 1);
-    expect(received[0].mcpServers).toHaveProperty("linear");
+    await waitFor(() => since() >= 1);
   });
 
-  it("debounces rapid changes", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    const content = validConfig();
-    writeConfig(configPath, content);
+  it("calls back once for a burst of edits", async () => {
+    const configPath = fileIn("config.json");
+    const { since } = await startedOn([configPath], { debounceMs: 100 });
 
-    const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({
-      configPaths: [configPath],
-      loadConfig: () => loadConfig({ configPath }),
-      debounceMs: 100,
-    });
-    cleanups.push(() => watcher.stop());
+    for (let i = 0; i < 5; i++) writeFileSync(configPath, JSON.stringify({ i }));
 
-    watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(content));
-
-    // Give fs.watch time to fully initialize
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Rapid-fire 5 changes within debounce window
-    for (let i = 0; i < 5; i++) {
-      writeConfig(configPath, validConfig({
-        [`server-${i}`]: { type: "streamable-http", url: `http://localhost:${3000 + i}` },
-      }));
-    }
-
-    await waitFor(() => received.length >= 1);
-    // Wait a bit more to confirm no additional calls
-    await new Promise((r) => setTimeout(r, 200));
-
-    // Should have fired only once (debounced)
-    expect(received).toHaveLength(1);
+    await waitFor(() => since() >= 1);
+    await settle(200);
+    expect(since()).toBe(1);
   });
 
-  it("skips reload when content is unchanged (seeded via initialConfig)", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    const content = validConfig({
-      svc: { type: "streamable-http", url: "http://localhost:3000" },
-    });
-    writeConfig(configPath, content);
+  it("calls back when an editor saves by renaming a new file over the watched one", async () => {
+    const configPath = fileIn("config.json");
+    const staged = join(dirname(configPath), "config.json.tmp");
+    writeFileSync(staged, '{"mcpServers":{}}');
+    const { since } = await startedOn([configPath]);
 
-    const initialConfig = BridgeConfigSchema.parse(content);
+    renameSync(staged, configPath);
 
-    const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({
-      configPaths: [configPath],
-      loadConfig: () => loadConfig({ configPath }),
-      debounceMs: 50,
-    });
-    cleanups.push(() => watcher.stop());
-
-    // Seed _lastJson via initialConfig — no-op saves should be skipped
-    watcher.start((config) => { received.push(config); }, initialConfig);
-
-    // Give fs.watch time to fully initialize
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Touch the file without changing content — should be skipped
-    writeConfig(configPath, content);
-    await new Promise((r) => setTimeout(r, 200));
-    expect(received).toHaveLength(0);
-
-    // Actually change the content — should fire
-    writeConfig(configPath, validConfig({
-      svc: { type: "streamable-http", url: "http://localhost:4000" },
-    }));
-    await waitFor(() => received.length >= 1);
-    expect(received).toHaveLength(1);
+    await waitFor(() => since() >= 1);
   });
 
-  it("counts an edit back to the earlier config as a change after a config was applied without it", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    const first = validConfig();
-    writeConfig(configPath, first);
-    const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({ configPaths: [configPath], loadConfig: () => loadConfig({ configPath }), debounceMs: 50 });
-    cleanups.push(() => watcher.stop());
-    watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(first));
-    await new Promise((r) => setTimeout(r, 100));
+  it("ignores an edit to another file in the same directory", async () => {
+    const configPath = fileIn("config.json");
+    const sibling = join(dirname(configPath), "credentials.json");
+    writeFileSync(sibling, "{}");
+    const { since } = await startedOn([configPath]);
 
-    watcher.markApplied(BridgeConfigSchema.parse(validConfig({ svc: { type: "streamable-http", url: "http://localhost:3000" } })));
-    writeConfig(configPath, first);
+    writeFileSync(sibling, '{"other":true}');
+    await settle();
 
-    await waitFor(() => received.length >= 1);
-    expect(received[0]!.mcpServers).toEqual({});
+    expect(since()).toBe(0);
   });
 
-  it("stops watching a directory whose watcher fails, logging why, instead of throwing", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    writeConfig(configPath, validConfig());
+  it("doesn't call back after it stops", async () => {
+    const configPath = fileIn("config.json");
+    const { watcher, since } = await startedOn([configPath]);
+    watcher.stop();
+
+    writeFileSync(configPath, '{"mcpServers":{}}');
+    await settle(200);
+
+    expect(since()).toBe(0);
+  });
+
+  it("watches config files in several directories", async () => {
+    const second = fileIn("config2.json");
+    const { since } = await startedOn([fileIn("config1.json"), second]);
+
+    writeFileSync(second, '{"mcpServers":{}}');
+
+    await waitFor(() => since() >= 1);
+  });
+
+  it("warns about a directory it can't watch and still watches the others", async () => {
     const logger = spyLogger();
-    const watcher = new ConfigWatcher({ configPaths: [configPath], loadConfig: () => loadConfig({ configPath }), debounceMs: 50, logger });
-    cleanups.push(() => watcher.stop());
-    watcher.start(() => {});
+    const configPath = fileIn("config.json");
+    const missing = join(dirname(configPath), "missing", "client.json");
+    const { since } = await startedOn([missing, configPath], { logger });
+
+    writeFileSync(configPath, '{"mcpServers":{}}');
+
+    await waitFor(() => since() >= 1);
+    expect(logger.warn).toHaveBeenCalledWith("failed to watch directory", expect.objectContaining({ path: join(dirname(configPath), "missing") }));
+  });
+
+  it("stops watching a directory whose watcher fails, logging why, instead of throwing", () => {
+    const logger = spyLogger();
+    const configPath = fileIn("config.json");
+    const { watcher, start } = watcherOn([configPath], { logger });
+    start();
     const [fsWatcher] = (watcher as unknown as { _watchers: FSWatcher[] })._watchers;
 
     expect(() => fsWatcher!.emit("error", new Error("EPERM: operation not permitted, watch"))).not.toThrow();
 
-    expect(logger.warn).toHaveBeenCalledWith("stopped watching config directory", expect.objectContaining({ path: dir, error: "EPERM: operation not permitted, watch" }));
+    expect(logger.warn).toHaveBeenCalledWith("stopped watching config directory", expect.objectContaining({ path: dirname(configPath), error: "EPERM: operation not permitted, watch" }));
     expect((watcher as unknown as { _watchers: FSWatcher[] })._watchers).toEqual([]);
-  });
-
-  it("survives invalid JSON without crashing", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    const content = validConfig();
-    writeConfig(configPath, content);
-
-    const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({
-      configPaths: [configPath],
-      loadConfig: () => loadConfig({ configPath }),
-      debounceMs: 50,
-    });
-    cleanups.push(() => watcher.stop());
-
-    watcher.start((config) => { received.push(config); }, BridgeConfigSchema.parse(content));
-
-    // Give fs.watch time to fully initialize
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Write invalid JSON
-    writeFileSync(configPath, "{bad json");
-    await new Promise((r) => setTimeout(r, 200));
-
-    // Should not have fired
-    expect(received).toHaveLength(0);
-
-    // Write valid config — should recover
-    writeConfig(configPath, validConfig({
-      svc: { type: "streamable-http", url: "http://localhost:3000" },
-    }));
-    await waitFor(() => received.length >= 1);
-    expect(received).toHaveLength(1);
-  });
-
-  it("stop() prevents further notifications", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    writeConfig(configPath, validConfig());
-
-    const received: BridgeConfig[] = [];
-    const watcher = new ConfigWatcher({
-      configPaths: [configPath],
-      loadConfig: () => loadConfig({ configPath }),
-      debounceMs: 50,
-    });
-
-    watcher.start((config) => { received.push(config); });
-    watcher.stop();
-
-    writeConfig(configPath, validConfig({
-      svc: { type: "streamable-http", url: "http://localhost:3000" },
-    }));
-    await new Promise((r) => setTimeout(r, 200));
-
-    expect(received).toHaveLength(0);
-  });
-
-  it("watches multiple config files across directories", async () => {
-    const dir1 = makeTmpDir();
-    const dir2 = makeTmpDir();
-    cleanups.push(() => rmSync(dir1, { recursive: true, force: true }));
-    cleanups.push(() => rmSync(dir2, { recursive: true, force: true }));
-
-    const path1 = join(dir1, "config1.json");
-    const path2 = join(dir2, "config2.json");
-    writeConfig(path1, validConfig());
-    writeConfig(path2, validConfig());
-
-    let reloadCount = 0;
-    const watcher = new ConfigWatcher({
-      configPaths: [path1, path2],
-      loadConfig: async () => {
-        reloadCount++;
-        return BridgeConfigSchema.parse(validConfig({
-          svc: { type: "streamable-http", url: `http://localhost:${3000 + reloadCount}` },
-        }));
-      },
-      debounceMs: 50,
-    });
-    cleanups.push(() => watcher.stop());
-
-    const received: BridgeConfig[] = [];
-    watcher.start((config) => { received.push(config); });
-
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Change the second file — should trigger reload
-    writeConfig(path2, validConfig({
-      other: { type: "streamable-http", url: "http://localhost:9999" },
-    }));
-
-    await waitFor(() => received.length >= 1);
-    expect(received.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it("names the fields at fault when the config stops loading", async () => {
-    const dir = makeTmpDir();
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const configPath = join(dir, "config.json");
-    writeConfig(configPath, validConfig());
-    const logger = spyLogger();
-    const watcher = new ConfigWatcher({
-      configPaths: [configPath],
-      loadConfig: async () => {
-        throw new ConfigError("Config validation failed", [{ path: "mcpServers.a.url", message: "Invalid URL" }]);
-      },
-      debounceMs: 50,
-      logger,
-    });
-    cleanups.push(() => watcher.stop());
-    watcher.start(() => {});
-
-    watcher.checkNow();
-
-    await waitFor(() => logger.warn.mock.calls.some(([message]) => message === "failed to reload config"));
-    expect(logger.warn).toHaveBeenCalledWith("failed to reload config", { component: "config-watcher", error: "Config validation failed: mcpServers.a.url: Invalid URL" });
   });
 });

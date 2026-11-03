@@ -219,6 +219,30 @@ describe("STDIO upstreams the manager runs for bridges", { timeout: 90_000 }, ()
       expect(methods.filter((method) => method === "tools/list")).toHaveLength(1);
     });
 
+    it("follows an edit to config.json for every client on the default config, adding a server while a call runs and disabling tools", async () => {
+      await workspace();
+      const clientFile = await configFile("client.json", { stub: stubServer() });
+      const bridgeConfig = join(dir, CREDENTIALS_DIR, BRIDGE_CONFIG_FILENAME);
+      const writeBridgeConfig = (extra: { servers?: Record<string, unknown>; toolPolicy?: string } = {}) =>
+        writeFile(bridgeConfig, JSON.stringify({ configPaths: [clientFile], servers: extra.servers, _bridge: { daemon: { killGraceMs: 0 }, toolPolicy: extra.toolPolicy } }));
+      await writeBridgeConfig();
+      const [first, second] = [await connect(null), await connect(null)];
+      expect(await text(first, "plain")).toBe("called plain");
+      const slow = text(first, "slow", { ms: 3_000 });
+
+      await writeBridgeConfig({ servers: { added: stubServer() } });
+      await until(async () => (await status()).instances[0]!.upstreams.includes("added"), 20_000);
+
+      for (const bridge of [first, second]) await until(async () => (await call(bridge, "plain", {}, "added")).isError !== true, 20_000);
+      expect(await slow).toBe("slow done");
+
+      await writeBridgeConfig({ servers: { added: stubServer() }, toolPolicy: "never" });
+
+      for (const bridge of [first, second]) {
+        await until(async () => JSON.stringify(await call(bridge, "plain")).includes("Tool stub__plain is disabled by policy"), 20_000);
+      }
+    });
+
     it("lists the STDIO upstream with its type and state in daemon status", async () => {
       await workspace();
       const bridge = await connect(await configFile("client.json", { stub: stubServer() }));

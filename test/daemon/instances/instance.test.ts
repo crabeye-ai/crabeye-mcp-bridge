@@ -9,6 +9,7 @@ import { UpstreamPool } from "../../../src/daemon/instances/upstream-pool.js";
 import { Instance, type InstanceDeps, type InstanceNotification } from "../../../src/daemon/instances/instance.js";
 import type { InstanceSource } from "../../../src/daemon/protocol.js";
 import type { Logger } from "../../../src/logging/index.js";
+import { watching } from "../../_helpers/fs-watch-tracker.js";
 import { rewriteUntil } from "../../_helpers/rewrite-until.js";
 import { ScriptedStdioClient, ScriptedUpstreamClient, stdioPoolOptions } from "../../_helpers/scripted-upstream-client.js";
 import { spyLogger, type SpyLogger } from "../../_helpers/spy-logger.js";
@@ -24,25 +25,7 @@ const MIXED = {
 
 const WATCHED = { timeout: 10_000, interval: 200 };
 
-const watchers = vi.hoisted(() => [] as Array<{ dir: string; closed: boolean }>);
-
-vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
-  const watch = ((dir: string, ...rest: unknown[]) => {
-    const watcher = (actual.watch as (...args: unknown[]) => import("node:fs").FSWatcher)(dir, ...rest);
-    const entry = { dir, closed: false };
-    watchers.push(entry);
-    const close = watcher.close.bind(watcher);
-    watcher.close = () => {
-      entry.closed = true;
-      close();
-    };
-    return watcher;
-  }) as typeof actual.watch;
-  return { ...actual, watch, default: { ...actual, watch } };
-});
-
-const watching = (dir: string): boolean => watchers.some((watcher) => watcher.dir === dir && !watcher.closed);
+vi.mock("node:fs", async (importOriginal) => (await import("../../_helpers/fs-watch-tracker.js")).trackWatch(await importOriginal()));
 
 function recorder(): { notifications: InstanceNotification[]; send: (n: InstanceNotification) => void } {
   const notifications: InstanceNotification[] = [];
@@ -272,8 +255,13 @@ describe("Instance", () => {
       const failures = () => bridge.notifications.filter((n) => n.method === "LOG" && n.params.message === "failed to reload config");
       deps.loadConfig = () => Promise.reject(new Error("Invalid JSON in config file"));
       await rewriteUntil(() => writeFile(configPath, "{ not json"), () => expect(failures()).toHaveLength(1));
-      deps.loadConfig = load;
-      await rewriteUntil(() => writeConfig(current), () => expect(log.debug).toHaveBeenCalledWith("config unchanged, skipping reload", expect.anything()));
+      let loads = 0;
+      deps.loadConfig = async (source) => {
+        const result = await load(source);
+        loads++;
+        return result;
+      };
+      await rewriteUntil(() => writeConfig(current), () => expect(loads).toBeGreaterThan(0));
       deps.loadConfig = () => Promise.reject(new Error("Invalid JSON in config file"));
 
       await instance.reload();
@@ -291,6 +279,35 @@ describe("Instance", () => {
         () => writeConfig({ ...MIXED, _bridge: { toolPolicy: "never" } }),
         () => expect(plain.retries).toBeGreaterThan(retries),
       );
+    });
+
+    it("doesn't retry a server paused for authorization on a save that changes nothing", async () => {
+      const instance = await open();
+      const plain = clients.find((c) => c.name === "plain")!;
+      plain.setStatus("auth_required", new Error("needs auth"));
+      const retries = plain.retries;
+      let loads = 0;
+      const loadConfig = deps.loadConfig;
+      deps.loadConfig = (source) => {
+        loads++;
+        return loadConfig(source);
+      };
+
+      await rewriteUntil(() => writeConfig(MIXED), () => expect(loads).toBeGreaterThan(0));
+      await instance.reload();
+
+      expect(plain.retries).toBe(retries);
+    });
+
+    it("retries a server paused for authorization when a bridge attaches, though the config didn't change", async () => {
+      const instance = await open();
+      const plain = clients.find((c) => c.name === "plain")!;
+      plain.setStatus("auth_required", new Error("needs auth"));
+      const retries = plain.retries;
+
+      await instance.admit(recorder(), true);
+
+      expect(plain.retries).toBeGreaterThan(retries);
     });
   });
 
