@@ -48,6 +48,7 @@ const tools = {
     setInterval(() => {}, 1e6);
   },
   cwd: (id) => text(id, process.cwd()),
+  process: (id) => text(id, JSON.stringify({ argv: process.argv.slice(2), pid: process.pid, ppid: process.ppid })),
   "ignore-pings": (id) => {
     answersPings = false;
     text(id, "ignoring pings");

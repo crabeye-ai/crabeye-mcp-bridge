@@ -12,7 +12,7 @@ export const TASKKILL_TIMEOUT_MS = 5000;
 export const READ_PROCESS_INFO_MAX_MS = Math.max(2 * PS_TIMEOUT_MS, POWERSHELL_TIMEOUT_MS);
 
 export interface KillProcessTreeOptions {
-  /** Time to wait after the graceful signal before escalating to force-kill. */
+  /** Time to wait after the graceful signal before escalating to force-kill. On Windows, 0 skips the graceful `taskkill`. */
   gracefulMs?: number;
   /** Time to wait after the force-kill before giving up. */
   forceMs?: number;
@@ -48,6 +48,11 @@ export function processExists(pid: number): boolean {
   }
 }
 
+/** The full path of `file` in Windows' System32 folder, so that no copy in the working folder or on PATH runs instead. */
+export function system32Path(file: string): string {
+  return `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\${file}`;
+}
+
 export function parsePid(text: string): number | null {
   const n = Number.parseInt(text.trim(), 10);
   return Number.isFinite(n) && n > 0 ? n : null;
@@ -55,7 +60,8 @@ export function parsePid(text: string): number | null {
 
 /**
  * Kill `pid` and any descendants. POSIX uses two-phase process-group SIGTERM →
- * SIGKILL; Windows uses `taskkill /T` followed by `taskkill /T /F`.
+ * SIGKILL; Windows uses `taskkill /T` followed by `taskkill /T /F`, or only the
+ * latter when `gracefulMs` is 0.
  *
  * Returns true once the process is no longer alive.
  */
@@ -70,8 +76,10 @@ export async function killProcessTree(
   if (!canSignalProcess(pid)) return true;
 
   if (process.platform === "win32") {
-    await runTaskkill(pid, false).catch(() => {});
-    if (await waitForExit(pid, gracefulMs, pollMs)) return true;
+    if (gracefulMs > 0) {
+      await runTaskkill(pid, false).catch(() => {});
+      if (await waitForExit(pid, gracefulMs, pollMs)) return true;
+    }
     await runTaskkill(pid, true).catch(() => {});
     await waitForExit(pid, forceMs, pollMs);
     return !canSignalProcess(pid);
@@ -113,7 +121,7 @@ export async function readParentPid(pid: number): Promise<number | null> {
     }
     if (process.platform === "win32") {
       const { stdout } = await execFileAsync(
-        `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+        system32Path("WindowsPowerShell\\v1.0\\powershell.exe"),
         ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`],
         { timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true },
       );
@@ -221,7 +229,7 @@ async function readPosixProcessInfo(pid: number): Promise<ProcessInfo | null> {
 async function runTaskkill(pid: number, force: boolean): Promise<void> {
   const args = ["/PID", String(pid), "/T"];
   if (force) args.push("/F");
-  await execFileAsync("taskkill", args, { timeout: TASKKILL_TIMEOUT_MS });
+  await execFileAsync(system32Path("taskkill.exe"), args, { timeout: TASKKILL_TIMEOUT_MS });
 }
 
 async function readWindowsProcessInfo(pid: number): Promise<ProcessInfo | null> {
@@ -238,7 +246,7 @@ async function readWindowsProcessInfo(pid: number): Promise<ProcessInfo | null> 
   let stdout: string;
   try {
     const result = await execFileAsync(
-      "powershell.exe",
+      system32Path("WindowsPowerShell\\v1.0\\powershell.exe"),
       ["-NoProfile", "-NonInteractive", "-Command", script],
       { timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true },
     );

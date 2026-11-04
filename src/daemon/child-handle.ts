@@ -1,7 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { STDERR_DRAIN_MS, StderrCapture } from "./stderr-capture.js";
 import { RateLimitedReport } from "./rate-limited-report.js";
 import { DEFAULT_KILL_GRACE_MS } from "../constants.js";
+import { killProcessTree } from "../process/process-utils.js";
+import { spawnServer } from "./spawn-server.js";
 
 /**
  * Per-child stdin queue cap. MCP stdio messages are small (<10 KiB typical);
@@ -103,7 +105,7 @@ export class ChildHandle {
     this.startedAt = Date.now();
 
     try {
-      this.child = spawn(opts.command, opts.args, {
+      this.child = spawnServer(opts.command, opts.args, {
         env: opts.env,
         cwd: opts.cwd,
         stdio: ["pipe", "pipe", "pipe"],
@@ -116,7 +118,7 @@ export class ChildHandle {
 
     this.child.on("error", (err) => {
       if (!this.closed) opts.onError(err);
-      if (this.child.pid === undefined) this.reportFailedStart(err);
+      if (this.child.pid === undefined || this.errorReplacedExit) this.reportFailedStart(err);
     });
 
     this.child.once("exit", (code, signal) => {
@@ -184,11 +186,12 @@ export class ChildHandle {
   }
 
   /**
-   * Kill the child with SIGTERM, then SIGKILL after `killGraceMs`. Resolves once
-   * the child has exited or the kill window has elapsed. Later calls return the
-   * first kill, with its grace. A child that never started gets no signal:
-   * until Node reports its failed start, signalling it would signal pid 0, the
-   * daemon's whole process group.
+   * Kill the child with SIGTERM, then SIGKILL after `killGraceMs`; on Windows, first
+   * end its whole process tree, such as the server behind a `.cmd` shim. Resolves
+   * once the child has exited or the kill window after the tree kill has elapsed.
+   * Later calls return the first kill, with its grace. A child that never started
+   * gets no signal: until Node reports its failed start, signalling it would signal
+   * pid 0, the daemon's whole process group.
    */
   kill(killGraceMs = DEFAULT_KILL_GRACE_MS): Promise<void> {
     this.killing ??= this.terminate(killGraceMs);
@@ -199,6 +202,7 @@ export class ChildHandle {
     this.nonJsonLines.flush();
     this.closed = true;
     if (this.child.pid === undefined || hasExited(this.child)) return;
+    if (process.platform === "win32") await killProcessTree(this.child.pid, { gracefulMs: 0, forceMs: 0 });
 
     try {
       this._lastSignalSent = "SIGTERM";
@@ -207,7 +211,7 @@ export class ChildHandle {
       /* already gone */
     }
 
-    const exited = await waitForExit(this.child, killGraceMs);
+    const exited = await this.waitForExit(killGraceMs);
     if (exited) return;
 
     try {
@@ -216,7 +220,21 @@ export class ChildHandle {
     } catch {
       /* gone between checks */
     }
-    await waitForExit(this.child, killGraceMs);
+    await this.waitForExit(killGraceMs);
+  }
+
+  private waitForExit(timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(hasExited(this.child)), timeoutMs);
+      void this.exited.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  private get errorReplacedExit(): boolean {
+    return this._exitStatus === null && hasExited(this.child);
   }
 
   private reportFailedStart(err: Error): void {
@@ -299,24 +317,6 @@ export class ChildHandle {
       nl = this.stdoutBuffer.indexOf("\n");
     }
   }
-}
-
-function waitForExit(
-  child: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-): Promise<boolean> {
-  if (hasExited(child)) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const onExit = (): void => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-    const timer = setTimeout(() => {
-      child.off("exit", onExit);
-      resolve(hasExited(child));
-    }, timeoutMs);
-    child.once("exit", onExit);
-  });
 }
 
 function hasExited(child: ChildProcessWithoutNullStreams): boolean {
