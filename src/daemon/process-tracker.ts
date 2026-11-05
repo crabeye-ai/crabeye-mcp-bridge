@@ -94,6 +94,10 @@ export class ProcessTracker {
 
   async reapStale(shouldStop: () => boolean = () => false): Promise<ReapResult> {
     const entries = await this._read();
+    if (process.platform === "win32") {
+      await this.clear();
+      return { total: entries.length, killed: 0, skipped: 0 };
+    }
     let killed = 0;
     let skipped = 0;
 

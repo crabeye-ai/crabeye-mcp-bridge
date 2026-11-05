@@ -1,16 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import {
-  ProcessTracker,
-  type TrackedProcess,
-} from "../../src/daemon/process-tracker.js";
+import { ProcessTracker } from "../../src/daemon/process-tracker.js";
 import { spyLogger } from "../_helpers/spy-logger.js";
-import type {
-  KillProcessTreeOptions,
-  ProcessInfo,
-} from "../../src/process/process-utils.js";
+import { FakeProcessTable, makeEntry, makeTracker } from "../_helpers/process-table.js";
 
 function tempPath(): string {
   return join(
@@ -18,67 +12,6 @@ function tempPath(): string {
     `crabeye-proc-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     "processes.json",
   );
-}
-
-interface FakeProc {
-  alive: boolean;
-  cmdline: string;
-  startTime: number | null;
-}
-
-class FakeProcessTable {
-  procs = new Map<number, FakeProc>();
-  killCalls: Array<{ pid: number; opts: KillProcessTreeOptions }> = [];
-
-  spawn(pid: number, cmdline: string, startTime: number | null = null): void {
-    this.procs.set(pid, { alive: true, cmdline, startTime });
-  }
-
-  isAlive = (pid: number): boolean => {
-    const p = this.procs.get(pid);
-    return !!p?.alive;
-  };
-
-  killProcessTree = async (
-    pid: number,
-    opts: KillProcessTreeOptions,
-  ): Promise<boolean> => {
-    this.killCalls.push({ pid, opts });
-    const p = this.procs.get(pid);
-    if (!p || !p.alive) return false;
-    p.alive = false;
-    return true;
-  };
-
-  readProcessInfo = async (pid: number): Promise<ProcessInfo | null> => {
-    const p = this.procs.get(pid);
-    if (!p || !p.alive) return null;
-    return { cmdline: p.cmdline, startTime: p.startTime };
-  };
-}
-
-function makeEntry(overrides: Partial<TrackedProcess> = {}): TrackedProcess {
-  return {
-    pid: 12345,
-    command: "node",
-    args: ["server.js"],
-    server: "test",
-    startedAt: 1_700_000_000_000,
-    ...overrides,
-  };
-}
-
-function makeTracker(
-  filePath: string,
-  fake: FakeProcessTable,
-): ProcessTracker {
-  return new ProcessTracker({
-    filePath,
-    _isProcessAlive: fake.isAlive,
-    _killProcessTree: fake.killProcessTree,
-    _readProcessInfo: fake.readProcessInfo,
-    _waitMs: 0,
-  });
 }
 
 describe("ProcessTracker", () => {
@@ -184,6 +117,28 @@ describe("ProcessTracker", () => {
   });
 
   describe("reapStale", () => {
+    it("leaves every recorded process running on Windows, whether or not it can be read, and clears the record", async () => {
+      const realPlatform = process.platform;
+      Object.defineProperty(process, "platform", { value: "win32" });
+      try {
+        const fake = new FakeProcessTable();
+        fake.spawn(100, "node /server.js", 1_700_000_000_000);
+        fake.spawn(200, "node server.js");
+        const readInfo = vi.spyOn(fake, "readProcessInfo").mockImplementation(async (pid) => (pid === 200 ? null : { cmdline: "node /server.js", startTime: 1_700_000_000_000 }));
+        const tracker = makeTracker(filePath, fake);
+        await tracker.register(makeEntry({ pid: 100, args: ["/server.js"], startedAt: 1_700_000_000_000 }));
+        await tracker.register(makeEntry({ pid: 200 }));
+
+        expect(await tracker.reapStale()).toEqual({ total: 2, killed: 0, skipped: 0 });
+
+        expect(fake.killCalls).toEqual([]);
+        expect(readInfo).not.toHaveBeenCalled();
+        expect(await tracker.list()).toEqual([]);
+      } finally {
+        Object.defineProperty(process, "platform", { value: realPlatform });
+      }
+    });
+
     it("kills tracked alive process whose start time is at or before recorded", async () => {
       const fake = new FakeProcessTable();
       // Live start time = recorded - 100ms (kernel timed spawn slightly before

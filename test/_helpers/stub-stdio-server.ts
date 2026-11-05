@@ -19,6 +19,10 @@ const text = (id, value) => reply(id, { result: { content: [{ type: "text", text
 let answersPings = true;
 const tools = {
   slow: (id, args) => setTimeout(() => text(id, "slow done"), args.ms),
+  stay: (id) => {
+    setInterval(() => {}, 1e6);
+    text(id, "staying");
+  },
   stderr: (id, args) => process.stderr.write(args.text + "\\n", () => text(id, "written")),
   crash: (id, args) => {
     if (args.keepStderrOpen) {
