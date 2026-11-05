@@ -80,6 +80,17 @@ jobs:
           "CBE_SECOND_PASSWORD=$password" >> $env:GITHUB_ENV
       - run: npx vitest run test/daemon/foreign-pipe-processes.test.ts
 
+  test-macos-keychain:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run test/credentials/mac-keychain-round-trip.test.ts
+
   build:
     runs-on: ubuntu-latest
     steps:

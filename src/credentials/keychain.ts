@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
@@ -19,76 +19,46 @@ export interface KeychainAdapter {
 
 // --- Helpers ---
 
-function execCommand(
-  command: string,
-  args: string[],
-): Promise<string> {
+function runTool(label: string, command: string, args: string[], stdin?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
-      { timeout: EXEC_TIMEOUT },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(
-            new CredentialError(
-              `${command} failed: ${stderr?.trim() || error.message}`,
-              { cause: error },
-            ),
-          );
-          return;
-        }
-        resolve(stdout.trim());
-      },
-    );
-  });
-}
-
-function spawnWithStdin(
-  command: string,
-  args: string[],
-  stdin: string,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { timeout: EXEC_TIMEOUT });
+    const child = spawn(command, args);
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, EXEC_TIMEOUT);
+    const settle = (finish: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      finish();
+    };
+    const fail = (reason: string): void => {
+      const detail = stderr.trim();
+      settle(() => reject(new CredentialError(`${label} failed: ${detail ? `${reason}: ${detail}` : reason}`)));
+    };
 
-    child.stdout.on("data", (data: Buffer) => {
+    child.on("error", (error: NodeJS.ErrnoException) => fail(`could not be started (${error.code ?? "unknown error"})`));
+    child.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
     });
-    child.stderr.on("data", (data: Buffer) => {
+    child.stderr?.on("data", (data: Buffer) => {
       stderr += data.toString();
     });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      reject(
-        new CredentialError(`${command} failed: ${error.message}`, {
-          cause: error,
-        }),
-      );
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      if (code !== 0) {
-        reject(
-          new CredentialError(
-            `${command} exited with code ${code}: ${stderr.trim()}`,
-          ),
-        );
-        return;
-      }
-      resolve(stdout.trim());
+    child.on("close", (code, signal) => {
+      if (code === 0) settle(() => resolve(stdout.trim()));
+      else if (timedOut) fail(`timed out after ${EXEC_TIMEOUT / 1000}s`);
+      else if (signal !== null) fail(`was killed by ${signal}`);
+      else fail(`exited with code ${code}`);
     });
 
     // Suppress EPIPE if child exits before we finish writing.
     // The actual exit code/error is handled by the 'close'/'error' listeners.
-    child.stdin.on("error", () => {});
-    child.stdin.write(stdin);
-    child.stdin.end();
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(stdin);
   });
 }
 
@@ -131,16 +101,36 @@ export class EnvKeychain implements KeychainAdapter {
 
 // --- MacKeychain ---
 
+export interface MacKeychainOptions {
+  /** Test override for the keychain file, instead of the default keychain. */
+  _keychain?: string;
+  /** Test override for the service name the key is stored under. */
+  _service?: string;
+}
+
 export class MacKeychain implements KeychainAdapter {
+  private readonly service: string;
+  private readonly keychainArgs: string[];
+
+  constructor(options: MacKeychainOptions = {}) {
+    this.service = options._service ?? SERVICE;
+    this.keychainArgs = options._keychain === undefined ? [] : [options._keychain];
+  }
+
+  private security(args: string[], stdin?: string): Promise<string> {
+    return runTool("security", "security", args, stdin);
+  }
+
   async getKey(): Promise<Buffer | undefined> {
     try {
-      const hex = await execCommand("security", [
+      const hex = await this.security([
         "find-generic-password",
         "-s",
-        SERVICE,
+        this.service,
         "-a",
         ACCOUNT,
         "-w",
+        ...this.keychainArgs,
       ]);
       return parseHexKey(hex, "macOS keychain");
     } catch (err) {
@@ -153,26 +143,21 @@ export class MacKeychain implements KeychainAdapter {
   }
 
   async setKey(key: Buffer): Promise<void> {
-    const hex = key.toString("hex");
-    await execCommand("security", [
-      "add-generic-password",
-      "-s",
-      SERVICE,
-      "-a",
-      ACCOUNT,
-      "-w",
-      hex,
-      "-U",
-    ]);
+    const keychainSuffix = this.keychainArgs.map((path) => ` "${path}"`).join("");
+    await this.security(["-i"], `add-generic-password -s ${this.service} -a ${ACCOUNT} -w ${key.toString("hex")} -U${keychainSuffix}\n`);
+    if (!(await this.getKey())?.equals(key)) {
+      throw new CredentialError("security failed: the master key was not stored in the keychain");
+    }
   }
 
   async deleteKey(): Promise<void> {
-    await execCommand("security", [
+    await this.security([
       "delete-generic-password",
       "-s",
-      SERVICE,
+      this.service,
       "-a",
       ACCOUNT,
+      ...this.keychainArgs,
     ]);
   }
 }
@@ -180,22 +165,24 @@ export class MacKeychain implements KeychainAdapter {
 // --- LinuxKeychain ---
 
 export class LinuxKeychain implements KeychainAdapter {
+  private secretTool(args: string[], stdin?: string): Promise<string> {
+    return runTool("secret-tool", "secret-tool", args, stdin);
+  }
+
   async getKey(): Promise<Buffer | undefined> {
     try {
-      const hex = await execCommand("secret-tool", [
+      const hex = await this.secretTool([
         "lookup",
         "service",
         SERVICE,
         "account",
         ACCOUNT,
       ]);
-      // secret-tool returns empty stdout when key not found (before exiting 1)
       if (!hex) return undefined;
       return parseHexKey(hex, "secret-tool");
     } catch (err) {
       // secret-tool exits 1 with empty stderr when key doesn't exist.
-      // execCommand formats this as "secret-tool failed: Command failed: ..."
-      if (err instanceof CredentialError && /secret-tool failed:.*Command failed/i.test(err.message)) {
+      if (err instanceof CredentialError && err.message === "secret-tool failed: exited with code 1") {
         return undefined;
       }
       throw err;
@@ -203,9 +190,7 @@ export class LinuxKeychain implements KeychainAdapter {
   }
 
   async setKey(key: Buffer): Promise<void> {
-    const hex = key.toString("hex");
-    await spawnWithStdin(
-      "secret-tool",
+    await this.secretTool(
       [
         "store",
         "--label",
@@ -215,12 +200,12 @@ export class LinuxKeychain implements KeychainAdapter {
         "account",
         ACCOUNT,
       ],
-      hex,
+      key.toString("hex"),
     );
   }
 
   async deleteKey(): Promise<void> {
-    await execCommand("secret-tool", [
+    await this.secretTool([
       "clear",
       "service",
       SERVICE,
@@ -243,9 +228,13 @@ export class WindowsKeychain implements KeychainAdapter {
 
   private encodedCommand(script: string): string[] {
     // -EncodedCommand accepts a Base64-encoded UTF-16LE string, avoiding
-    // any injection via interpolated paths or values.
+    // any injection via interpolated paths.
     const encoded = Buffer.from(script, "utf16le").toString("base64");
     return ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded];
+  }
+
+  private powershell(script: string, stdin?: string): Promise<string> {
+    return runTool("powershell", "powershell", this.encodedCommand(script), stdin);
   }
 
   async getKey(): Promise<Buffer | undefined> {
@@ -254,8 +243,8 @@ export class WindowsKeychain implements KeychainAdapter {
         LOAD_DPAPI +
         `$bytes = [IO.File]::ReadAllBytes('${this.escapeSingleQuote(this.filePath)}')\n` +
         `$decrypted = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, 'CurrentUser')\n` +
-        `[BitConverter]::ToString($decrypted).Replace('-','')`;
-      const hex = await execCommand("powershell", this.encodedCommand(script));
+        `[Console]::Out.Write([BitConverter]::ToString($decrypted).Replace('-',''))`;
+      const hex = await this.powershell(script);
       return parseHexKey(hex, "DPAPI");
     } catch (err) {
       // FileNotFoundException when the DPAPI file doesn't exist yet
@@ -269,21 +258,20 @@ export class WindowsKeychain implements KeychainAdapter {
   async setKey(key: Buffer): Promise<void> {
     const dir = join(homedir(), CREDENTIALS_DIR);
     await mkdir(dir, { recursive: true });
-    const hex = key.toString("hex");
     const escapedPath = this.escapeSingleQuote(this.filePath);
     const script =
       LOAD_DPAPI +
-      `$hex = '${hex}'\n` +
+      `$hex = [Console]::In.ReadLine()\n` +
+      `if ($hex -notmatch '^[0-9a-f]{64}$') { [Console]::Error.WriteLine('no master key on stdin'); exit 3 }\n` +
       `$bytes = [byte[]]::new($hex.Length / 2)\n` +
       `for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i*2, 2), 16) }\n` +
       `$encrypted = [Security.Cryptography.ProtectedData]::Protect($bytes, $null, 'CurrentUser')\n` +
       `[IO.File]::WriteAllBytes('${escapedPath}', $encrypted)`;
-    await execCommand("powershell", this.encodedCommand(script));
+    await this.powershell(script, `${key.toString("hex")}\n`);
   }
 
   async deleteKey(): Promise<void> {
-    const script = `Remove-Item -LiteralPath '${this.escapeSingleQuote(this.filePath)}' -Force -ErrorAction Stop`;
-    await execCommand("powershell", this.encodedCommand(script));
+    await this.powershell(`Remove-Item -LiteralPath '${this.escapeSingleQuote(this.filePath)}' -Force -ErrorAction Stop`);
   }
 }
 
