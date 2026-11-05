@@ -68,6 +68,7 @@ jobs:
       - run: npx vitest run test/daemon/instances/keychain-processes.test.ts
       - run: npx vitest run test/daemon/instances/child-env.test.ts test/daemon/instances/stdio-processes.test.ts
       - run: npx vitest run test/daemon/instances/stdio-windows-shims-processes.test.ts
+      - run: npx vitest run test/daemon/instances/stdio-windows-children-processes.test.ts
       - name: Create a second local user
         shell: pwsh
         run: |

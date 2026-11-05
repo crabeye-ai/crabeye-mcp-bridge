@@ -1,7 +1,7 @@
 import { spawn as realSpawn, type ChildProcess } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const taskkill = vi.hoisted(() => ({ calls: [] as string[][], exitCode: 0 }));
+const taskkill = vi.hoisted(() => ({ calls: [] as string[][], options: [] as unknown[], exitCode: 0 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -11,6 +11,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     spawn: (command: string, args: string[], options?: object) => {
       if (!command.endsWith("\\System32\\taskkill.exe")) return actual.spawn(command, args, options ?? {});
       taskkill.calls.push([command, ...args]);
+      taskkill.options.push(options);
       const child = new EventEmitter();
       setImmediate(() => child.emit("exit", taskkill.exitCode));
       return child;
@@ -35,6 +36,7 @@ describe.skipIf(process.platform === "win32")("terminateDaemon on Windows", () =
     await new Promise((r) => setTimeout(r, 200));
     Object.defineProperty(process, "platform", { value: "win32" });
     taskkill.calls = [];
+    taskkill.options = [];
   });
 
   afterEach(() => {
@@ -50,6 +52,7 @@ describe.skipIf(process.platform === "win32")("terminateDaemon on Windows", () =
     expect(await terminateDaemon(daemon.pid!, { graceMs: 2_000 })).toBe("terminated");
 
     expect(taskkill.calls).toEqual([[system32Path("taskkill.exe"), "/F", "/PID", String(daemon.pid)]]);
+    expect(taskkill.options).toEqual([expect.objectContaining({ windowsHide: true })]);
     expect(kill.mock.calls.filter(([, signal]) => signal !== 0 && signal !== undefined)).toEqual([]);
   });
 

@@ -112,7 +112,7 @@ describe("keychain commands", () => {
         command: "security",
         args: ["-i"],
         stdin: `add-generic-password -s crabeye-mcp-bridge -a master-key -w ${HEX} -U\n`,
-        options: undefined,
+        options: { windowsHide: true },
       });
       expect(tools.calls[1]!.args).toEqual(["find-generic-password", "-s", "crabeye-mcp-bridge", "-a", "master-key", "-w"]);
       expect(tools.calls.flatMap((call) => call.args).join(" ")).not.toContain(HEX);

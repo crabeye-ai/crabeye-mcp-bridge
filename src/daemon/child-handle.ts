@@ -109,6 +109,7 @@ export class ChildHandle {
         env: opts.env,
         cwd: opts.cwd,
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
       });
     } catch (err) {
       throw new Error(`spawn failed for ${opts.command}: ${describeSpawnError(err)}`);

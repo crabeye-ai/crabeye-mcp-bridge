@@ -49,6 +49,13 @@ const tools = {
   },
   cwd: (id) => text(id, process.cwd()),
   process: (id) => text(id, JSON.stringify({ argv: process.argv.slice(2), pid: process.pid, ppid: process.ppid })),
+  "run-child": (id, args) => {
+    try {
+      text(id, require("node:child_process").execFileSync(args.command, args.args, { encoding: "utf8" }).trim());
+    } catch (err) {
+      text(id, "run-child failed: " + (err.stderr || err.message));
+    }
+  },
   "ignore-pings": (id) => {
     answersPings = false;
     text(id, "ignoring pings");

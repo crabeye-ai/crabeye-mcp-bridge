@@ -7,12 +7,13 @@ import { killProcessTree } from "../../src/process/process-utils.js";
 import { until } from "../_helpers/daemon-fixtures.js";
 
 const DRAIN_MS = 50;
-const spawned = vi.hoisted(() => ({ child: undefined as FakeChild | undefined }));
+const spawned = vi.hoisted(() => ({ child: undefined as FakeChild | undefined, options: undefined as unknown }));
 
 vi.mock("../../src/process/process-utils.js", () => ({ killProcessTree: vi.fn(async () => true) }));
 
 vi.mock("../../src/daemon/spawn-server.js", () => ({
-  spawnServer: () => {
+  spawnServer: (_command: string, _args: string[], options: unknown) => {
+    spawned.options = options;
     spawned.child = new FakeChild();
     return spawned.child;
   },
@@ -124,5 +125,13 @@ describe("ChildHandle stopping on Windows", () => {
     } finally {
       Object.defineProperty(process, "platform", platform);
     }
+  });
+});
+
+describe("ChildHandle starting a server", () => {
+  it("starts it without a console window", () => {
+    start();
+
+    expect(spawned.options).toMatchObject({ windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
   });
 });

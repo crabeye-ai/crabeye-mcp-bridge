@@ -234,7 +234,7 @@ async function readPosixProcessInfo(pid: number): Promise<ProcessInfo | null> {
 async function runTaskkill(pid: number, force: boolean): Promise<void> {
   const args = ["/PID", String(pid), "/T"];
   if (force) args.push("/F");
-  await execFileAsync(system32Path("taskkill.exe"), args, { timeout: TASKKILL_TIMEOUT_MS });
+  await execFileAsync(system32Path("taskkill.exe"), args, { timeout: TASKKILL_TIMEOUT_MS, windowsHide: true });
 }
 
 async function readWindowsProcessInfo(pid: number): Promise<ProcessInfo | null> {

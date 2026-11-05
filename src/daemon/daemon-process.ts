@@ -91,7 +91,7 @@ function mayStop(identity: ProcessIdentity, allowUnidentified: boolean): boolean
 
 function taskkill(pid: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn(system32Path("taskkill.exe"), ["/F", "/PID", String(pid)], { stdio: "ignore", timeout: TASKKILL_TIMEOUT_MS });
+    const child = spawn(system32Path("taskkill.exe"), ["/F", "/PID", String(pid)], { stdio: "ignore", timeout: TASKKILL_TIMEOUT_MS, windowsHide: true });
     child.on("exit", (code) => resolve(code === 0));
     child.on("error", () => resolve(false));
   });

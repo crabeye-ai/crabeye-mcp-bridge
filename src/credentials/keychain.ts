@@ -22,7 +22,7 @@ export interface KeychainAdapter {
 
 function runTool(label: string, command: string, args: string[], stdin?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args);
+    const child = spawn(command, args, { windowsHide: true });
     let stdout = "";
     let stderr = "";
     let settled = false;
