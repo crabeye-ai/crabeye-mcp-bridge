@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { APP_NAME, CREDENTIALS_DIR } from "../constants.js";
 import { CredentialError } from "./errors.js";
+import { windowsPowerShellPath } from "../process/process-utils.js";
 
 const SERVICE = APP_NAME;
 const ACCOUNT = "master-key";
@@ -234,7 +235,7 @@ export class WindowsKeychain implements KeychainAdapter {
   }
 
   private powershell(script: string, stdin?: string): Promise<string> {
-    return runTool("powershell", "powershell", this.encodedCommand(script), stdin);
+    return runTool("powershell", windowsPowerShellPath(), this.encodedCommand(script), stdin);
   }
 
   async getKey(): Promise<Buffer | undefined> {

@@ -73,6 +73,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 const { LinuxKeychain, MacKeychain, WindowsKeychain } = await import("../../src/credentials/keychain.js");
+const { windowsPowerShellPath } = await import("../../src/process/process-utils.js");
 
 const KEY = randomBytes(32);
 const HEX = KEY.toString("hex");
@@ -267,6 +268,7 @@ describe("keychain commands", () => {
       expect(tools.calls).toHaveLength(1);
       const call = tools.calls[0]!;
       const script = decodedScript(call);
+      expect(call.command).toBe(windowsPowerShellPath());
       expect(call.stdin).toBe(`${HEX}\n`);
       expect(call.args.join(" ")).not.toContain(HEX);
       expect(script).not.toContain(HEX);

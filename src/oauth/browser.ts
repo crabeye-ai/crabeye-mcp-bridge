@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { platform } from "node:os";
+import { windowsPowerShellPath } from "../process/process-utils.js";
 
 function isSafeLaunchUrl(url: string): boolean {
   try {
@@ -20,7 +21,7 @@ function isSafeLaunchUrl(url: string): boolean {
  *
  * - macOS: `open <url>`
  * - Linux: `xdg-open <url>`
- * - Windows: `powershell -NoProfile -Command Start-Process <url>` — picked
+ * - Windows: System32's `powershell -NoProfile -Command Start-Process <url>` — picked
  *   over `rundll32 url.dll,FileProtocolHandler <url>` (silent failures with
  *   embedded `,` and ANSI-only argv) and `cmd /c start "" <url>` (cmd.exe
  *   re-parses argv so `&`/`|`/`^` in the URL become command separators).
@@ -51,7 +52,7 @@ export async function openBrowser(
       args = [url];
       break;
     case "win32":
-      command = "powershell";
+      command = windowsPowerShellPath();
       args = ["-NoProfile", "-Command", "Start-Process", url];
       break;
     default:

@@ -50,7 +50,12 @@ export function processExists(pid: number): boolean {
 
 /** The full path of `file` in Windows' System32 folder, so that no copy in the working folder or on PATH runs instead. */
 export function system32Path(file: string): string {
-  return `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\${file}`;
+  return `${process.env.SystemRoot || "C:\\Windows"}\\System32\\${file}`;
+}
+
+/** The full path of Windows PowerShell 5.1, which every supported Windows version ships. */
+export function windowsPowerShellPath(): string {
+  return system32Path("WindowsPowerShell\\v1.0\\powershell.exe");
 }
 
 export function parsePid(text: string): number | null {
@@ -121,7 +126,7 @@ export async function readParentPid(pid: number): Promise<number | null> {
     }
     if (process.platform === "win32") {
       const { stdout } = await execFileAsync(
-        system32Path("WindowsPowerShell\\v1.0\\powershell.exe"),
+        windowsPowerShellPath(),
         ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`],
         { timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true },
       );
@@ -246,7 +251,7 @@ async function readWindowsProcessInfo(pid: number): Promise<ProcessInfo | null> 
   let stdout: string;
   try {
     const result = await execFileAsync(
-      system32Path("WindowsPowerShell\\v1.0\\powershell.exe"),
+      windowsPowerShellPath(),
       ["-NoProfile", "-NonInteractive", "-Command", script],
       { timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true },
     );

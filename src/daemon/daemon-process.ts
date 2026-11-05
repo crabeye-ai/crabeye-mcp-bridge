@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { processExists, readProcessInfo, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
+import { processExists, readProcessInfo, system32Path, TASKKILL_TIMEOUT_MS } from "../process/process-utils.js";
 import { isDaemonCommandLine } from "./daemon-identity.js";
 import { readLockHolderPid } from "../process/lockfile.js";
 import type { DaemonFiles } from "./paths.js";
@@ -91,7 +91,7 @@ function mayStop(identity: ProcessIdentity, allowUnidentified: boolean): boolean
 
 function taskkill(pid: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore", timeout: TASKKILL_TIMEOUT_MS });
+    const child = spawn(system32Path("taskkill.exe"), ["/F", "/PID", String(pid)], { stdio: "ignore", timeout: TASKKILL_TIMEOUT_MS });
     child.on("exit", (code) => resolve(code === 0));
     child.on("error", () => resolve(false));
   });

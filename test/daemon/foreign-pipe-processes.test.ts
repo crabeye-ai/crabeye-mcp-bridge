@@ -7,7 +7,7 @@ import { tmpdir, userInfo } from "node:os";
 import { promisify } from "node:util";
 import { getDaemonKeyPath, getDaemonSocketPath } from "../../src/daemon/paths.js";
 import { BRIDGE_CONFIG_FILENAME, CREDENTIALS_DIR } from "../../src/constants.js";
-import { processExists, system32Path } from "../../src/process/process-utils.js";
+import { processExists, system32Path, windowsPowerShellPath } from "../../src/process/process-utils.js";
 import { connectBridgeProcess, occurrences, type BridgeProcess } from "../_helpers/bridge-process.js";
 import { until } from "../_helpers/daemon-fixtures.js";
 import { FAST_RECONNECT } from "../_helpers/stdio-manager.js";
@@ -148,7 +148,7 @@ describe.runIf(process.platform === "win32")("the manager's pipe on Windows", { 
       "$c = New-Object System.Management.Automation.PSCredential($env:CBE_SECOND_USER, (ConvertTo-SecureString $env:CBE_SECOND_PASSWORD -AsPlainText -Force)); " +
       `$p = Start-Process -FilePath '${process.execPath}' -ArgumentList ${argv.map((arg) => `'${arg}'`).join(",")} ` +
       `-Credential $c -WorkingDirectory '${dir}' -RedirectStandardOutput '${join(dir, "out.txt")}' -RedirectStandardError '${join(dir, "err.txt")}' -PassThru; $p.Id`;
-    const { stdout } = await run(system32Path("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoProfile", "-NonInteractive", "-Command", command], {
+    const { stdout } = await run(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", command], {
       env: Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toUpperCase() !== "PSMODULEPATH")),
       timeout: SECOND_USER_TIMEOUT_MS,
     });

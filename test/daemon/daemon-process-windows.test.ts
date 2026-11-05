@@ -9,7 +9,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   return {
     ...actual,
     spawn: (command: string, args: string[], options?: object) => {
-      if (command !== "taskkill") return actual.spawn(command, args, options ?? {});
+      if (!command.endsWith("\\System32\\taskkill.exe")) return actual.spawn(command, args, options ?? {});
       taskkill.calls.push([command, ...args]);
       const child = new EventEmitter();
       setImmediate(() => child.emit("exit", taskkill.exitCode));
@@ -24,6 +24,7 @@ vi.mock("../../src/process/process-utils.js", async (importOriginal) => ({
 }));
 
 const { terminateDaemon } = await import("../../src/daemon/daemon-process.js");
+const { system32Path } = await import("../../src/process/process-utils.js");
 
 describe.skipIf(process.platform === "win32")("terminateDaemon on Windows", () => {
   const platform = process.platform;
@@ -48,7 +49,7 @@ describe.skipIf(process.platform === "win32")("terminateDaemon on Windows", () =
 
     expect(await terminateDaemon(daemon.pid!, { graceMs: 2_000 })).toBe("terminated");
 
-    expect(taskkill.calls).toEqual([["taskkill", "/F", "/PID", String(daemon.pid)]]);
+    expect(taskkill.calls).toEqual([[system32Path("taskkill.exe"), "/F", "/PID", String(daemon.pid)]]);
     expect(kill.mock.calls.filter(([, signal]) => signal !== 0 && signal !== undefined)).toEqual([]);
   });
 
