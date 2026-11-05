@@ -40,7 +40,7 @@ function firstLine(child: ChildProcessWithoutNullStreams): Promise<string> {
       out += chunk.toString();
       if (out.includes("\n")) resolve(out.trim());
     });
-    child.once("exit", () => resolve(out.trim()));
+    child.once("close", () => resolve(out.trim()));
   });
 }
 
@@ -118,8 +118,7 @@ describe.skipIf(isWindows)("daemon singleton across real processes (#205)", () =
       Array.from({ length: CONTENDERS }, () => firstLine(start([acquireScript, lockPath]))),
     );
 
-    expect(verdicts.filter((v) => v === "held")).toHaveLength(1);
-    expect(verdicts.filter((v) => v === "busy")).toHaveLength(CONTENDERS - 1);
+    expect(verdicts.sort()).toEqual([...Array<string>(CONTENDERS - 1).fill("busy"), "held"]);
   });
 
   it("daemon processes racing on one run dir: exactly one serves, the rest defer", async () => {

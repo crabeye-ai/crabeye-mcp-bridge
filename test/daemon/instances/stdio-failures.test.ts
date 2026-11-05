@@ -20,18 +20,20 @@ describe.skipIf(isWindows)("STDIO upstreams in the manager, when things go wrong
   const levelsOf = (bridge: AttachedBridge, message: string) => bridge.logs.filter((log) => log.message === message).map((log) => log.level);
 
   it("reports a crash whose stderr a grandchild keeps open as an exit, and serves the next call from a new process meanwhile", async () => {
-    await h.start(h.stubServer(), { _stderrDrainMs: 3_000, childPingMs: 100, childPingTimeoutMs: 1_000, childPingMaxConsecutiveFailures: 1 });
+    await h.start(h.stubServer(), { _stderrDrainMs: 5_000, childPingMs: 100, childPingTimeoutMs: 3_000, childPingMaxConsecutiveFailures: 1 });
     const bridge = await h.attach();
     await bridge.connected("svc");
     const first = await h.childPid();
+    const exitReported = () => bridge.logs.some((log) => log.message === "STDIO server exited with code 1");
 
     await bridge.callTool("svc", "crash", { lines: ["boom"], code: 1, keepStderrOpen: true }).catch(() => {});
     await until(() => bridge.logs.some((log) => log.message.startsWith("grandchild ")));
     grandchildren.push(Number(bridge.logs.find((log) => log.message.startsWith("grandchild "))!.message.split(" ")[1]));
     await until(async () => (await bridge.calledText("svc", "plain").catch(() => null)) === "called plain");
 
+    expect(exitReported()).toBe(false);
     expect(await h.childPid()).not.toBe(first);
-    await until(() => bridge.logs.some((log) => log.message === "STDIO server exited with code 1"), 10_000);
+    await until(exitReported, 10_000);
     expect(bridge.logs.some((log) => log.message === "STDIO server stopped answering and was stopped")).toBe(false);
   });
 
