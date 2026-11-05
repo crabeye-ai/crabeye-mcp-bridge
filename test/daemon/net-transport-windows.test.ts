@@ -1,4 +1,7 @@
-import { describe, it, expect, afterAll, vi } from "vitest";
+import { describe, it, expect, afterAll, beforeAll, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const realPlatform = process.platform;
 Object.defineProperty(process, "platform", { value: "win32" });
@@ -24,7 +27,16 @@ const { netTransport } = await import("../../src/daemon/net-transport.js");
 const { SocketInUseError } = await import("../../src/daemon/transport.js");
 
 describe("daemon pipe on Windows", () => {
+  let localAppData: string;
+
+  beforeAll(() => {
+    localAppData = mkdtempSync(join(tmpdir(), "cbe-ntw-"));
+    vi.stubEnv("LOCALAPPDATA", localAppData);
+  });
+
   afterAll(() => {
+    vi.unstubAllEnvs();
+    rmSync(localAppData, { recursive: true, force: true });
     Object.defineProperty(process, "platform", { value: realPlatform });
   });
 

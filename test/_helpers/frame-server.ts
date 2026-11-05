@@ -2,6 +2,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { encodeFrame, FrameDecoder } from "../../src/daemon/protocol.js";
 
 export const NO_REPLY = Symbol("no reply");
+export const INVALID_JSON_FRAME = Buffer.concat([Buffer.from([0, 0, 0, 5]), Buffer.from("{nope")]);
 export const DROP_CONNECTION = Symbol("drop connection");
 
 /** Returned by a reply function to answer with this error instead of a result. */

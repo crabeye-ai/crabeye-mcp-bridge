@@ -13,16 +13,19 @@ import {
 } from "./transport.js";
 import { socketAddress } from "./socket-address.js";
 import { ensurePrivateDir } from "../process/private-dir.js";
+import { answerChallenge, loadOrCreateManagerKey, requireProof } from "./pipe-proof.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const SERVING_PROBE_TIMEOUT_MS = 1_000;
 const CLOSING_CONNECTION_GRACE_MS = 1_000;
+const CHALLENGE_TIMEOUT_MS = 5_000;
 const STAGING_SOCKET_NAME = /^\.s[0-9a-f]{4}$/;
 const isWindows = process.platform === "win32";
 
 class NetDaemonServer implements DaemonServer {
   private server: Server | null = null;
   private bound: { dev: number; ino: number } | null = null;
+  private key: Buffer | null = null;
   private readonly sockets = new Set<Socket>();
 
   constructor(private readonly opts: DaemonServerOptions) {}
@@ -33,16 +36,18 @@ class NetDaemonServer implements DaemonServer {
 
   async start(): Promise<void> {
     const address = await socketAddress(this.opts.path);
-    if (!isWindows) {
-      await prepUnixSocketPath(this.opts.path);
-    }
+    if (isWindows) this.key = await loadOrCreateManagerKey();
+    else await prepUnixSocketPath(this.opts.path);
     const bindPath = isWindows ? this.opts.path : stagingSocketPath(this.opts.path);
     const bindAddress = isWindows ? bindPath : join(dirname(address), basename(bindPath));
 
     this.server = createNetServer((socket) => {
       this.sockets.add(socket);
       socket.once("close", () => this.sockets.delete(socket));
-      this.opts.onConnection(wrapSocket(socket, this.opts.path));
+      const channel = wrapSocket(socket, this.opts.path);
+      if (!isWindows) return this.opts.onConnection(channel);
+      const timeoutMs = this.opts._challengeTimeoutMs ?? CHALLENGE_TIMEOUT_MS;
+      answerChallenge(channel, this.key!, timeoutMs, () => this.opts.onConnection(channel), () => socket.destroy());
     });
 
     if (this.opts.onError) {
@@ -201,9 +206,21 @@ export const netTransport: Transport = {
         reject(err);
       };
       const onConnect = (): void => {
-        clearTimeout(timer);
         socket.removeListener("error", onError);
-        resolve(wrapSocket(socket, opts.path));
+        const channel = wrapSocket(socket, opts.path);
+        const connected = (): void => {
+          clearTimeout(timer);
+          resolve(channel);
+        };
+        if (!isWindows) return connected();
+        requireProof(channel, opts.path).then(
+          connected,
+          (err: Error) => {
+            clearTimeout(timer);
+            socket.destroy();
+            reject(err);
+          },
+        );
       };
 
       socket.once("error", onError);

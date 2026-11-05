@@ -4,7 +4,7 @@ import { FrameDecoder, encodeFrame, FrameError } from "./protocol.js";
 
 export interface FrameChannel extends EventEmitter {
   send(payload: unknown): boolean;
-  /** Sends what is queued, then closes; once it has, the connection no longer keeps the process alive. */
+  /** Sends what is queued, then closes; nothing more is received, and once it has closed the connection no longer keeps the process alive. */
   close(): void;
   readonly remote: string;
 }
@@ -29,6 +29,8 @@ export interface DaemonServerOptions {
   path: string;
   onConnection: ConnectionHandler;
   onError?: (err: Error) => void;
+  /** Test override for how long a Windows connection may take to send its challenge. */
+  _challengeTimeoutMs?: number;
 }
 
 export interface DaemonClientOptions {
@@ -50,9 +52,10 @@ export function wrapSocket(socket: Socket, remote: string): FrameChannel {
   let closed = false;
 
   socket.on("data", (chunk: Buffer) => {
+    if (closed) return;
     try {
       decoder.push(chunk);
-      for (;;) {
+      while (!closed) {
         const msg = decoder.next();
         if (msg === null) break;
         emitter.emit("message", msg);

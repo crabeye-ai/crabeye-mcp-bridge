@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DaemonClient } from "./client.js";
 import { daemonFilesFor, getDaemonSocketPath, type DaemonFiles } from "./paths.js";
 import { isServing, netTransport } from "./net-transport.js";
-import { isSocketAddressError } from "./socket-address.js";
+import { isUnusableAddressError } from "./socket-address.js";
 import { SUCCESSOR_REPORT_TIMEOUT_MS, detachedDaemonLauncher, MAX_AWAIT_PREDECESSOR_MS, type DaemonLauncher } from "./daemon-launch.js";
 import {
   describeProcess,
@@ -427,7 +427,7 @@ export async function daemonStatus(socketPath: string): Promise<DaemonStatus | n
     await client.connect();
     return asDaemonStatus(await client.call("STATUS"));
   } catch (err) {
-    if (isSocketAddressError(err)) throw err;
+    if (isUnusableAddressError(err)) throw err;
     return null;
   } finally {
     client.close();

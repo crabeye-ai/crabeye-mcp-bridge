@@ -64,10 +64,21 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx vitest run test/daemon/spawn-server.test.ts test/daemon/child-handle-fake-spawn.test.ts test/daemon/daemon-launch.test.ts test/daemon/daemon-log-processes.test.ts test/logging/log-file.test.ts test/logging/log-file-processes.test.ts test/oauth/rotating-refresh-processes.test.ts test/credentials test/process/
+      - run: npx vitest run test/daemon/pipe-proof.test.ts test/daemon/wrap-socket.test.ts test/daemon/net-transport-windows.test.ts test/daemon/spawn-server.test.ts test/daemon/child-handle-fake-spawn.test.ts test/daemon/daemon-launch.test.ts test/daemon/daemon-log-processes.test.ts test/logging/log-file.test.ts test/logging/log-file-processes.test.ts test/oauth/rotating-refresh-processes.test.ts test/credentials test/process/
       - run: npx vitest run test/daemon/instances/keychain-processes.test.ts
       - run: npx vitest run test/daemon/instances/child-env.test.ts test/daemon/instances/stdio-processes.test.ts
       - run: npx vitest run test/daemon/instances/stdio-windows-shims-processes.test.ts
+      - name: Create a second local user
+        shell: pwsh
+        run: |
+          Start-Service seclogon
+          $password = 'Cb!' + [guid]::NewGuid().ToString('N').Substring(0, 10)
+          "::add-mask::$password"
+          net user cbesecond $password /add /y
+          if ((Get-LocalGroupMember Administrators).Name -match '\\cbesecond$') { throw 'cbesecond must not be an administrator' }
+          "CBE_SECOND_USER=cbesecond" >> $env:GITHUB_ENV
+          "CBE_SECOND_PASSWORD=$password" >> $env:GITHUB_ENV
+      - run: npx vitest run test/daemon/foreign-pipe-processes.test.ts
 
   build:
     runs-on: ubuntu-latest

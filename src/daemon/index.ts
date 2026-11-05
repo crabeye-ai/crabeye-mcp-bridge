@@ -95,4 +95,4 @@ export {
   waitForExit,
   type TerminateResult,
 } from "./daemon-process.js";
-export { SocketAliasRefusedError, SocketPathTooLongError, isSocketAddressError } from "./socket-address.js";
+export { SocketAliasRefusedError, SocketPathTooLongError, isUnusableAddressError } from "./socket-address.js";

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   getDaemonPidPath,
   getDaemonLockPath,
   getDaemonLogPath,
+  getDaemonKeyPath,
 } from "../../src/daemon/paths.js";
 
 describe("daemon paths", () => {
@@ -27,9 +28,36 @@ describe("daemon paths", () => {
     expect(getDaemonSocketPath()).toMatch(/^\\\\\.\\pipe\\crabeye-mcp-bridge-manager-/);
   });
 
-  it("pid and lock filenames are stable", () => {
+  it("pid, lock and key filenames are stable", () => {
     expect(getDaemonPidPath().endsWith("manager.pid")).toBe(true);
     expect(getDaemonLockPath().endsWith("manager.lock")).toBe(true);
+    expect(getDaemonKeyPath()).toBe(join(getDaemonRunDir(), "manager.key"));
+  });
+
+  describe("pipe name on Windows", () => {
+    const platform = process.platform;
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      Object.defineProperty(process, "platform", { value: platform });
+    });
+
+    function pipeFor(localAppData: string): string {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      vi.stubEnv("LOCALAPPDATA", localAppData);
+      return getDaemonSocketPath();
+    }
+
+    it("ends with a hash of the run dir, so each profile gets its own manager", () => {
+      const pipe = pipeFor("C:\\Users\\me\\AppData\\Local");
+
+      expect(pipe).toMatch(/^\\\\\.\\pipe\\crabeye-mcp-bridge-manager-[A-Za-z0-9_-]+-[0-9a-f]{12}$/);
+      expect(pipeFor("C:\\Users\\other\\AppData\\Local")).not.toBe(pipe);
+    });
+
+    it("is the same for a run dir spelled in another case", () => {
+      expect(pipeFor("C:\\Users\\Me\\AppData\\Local")).toBe(pipeFor("c:\\users\\me\\appdata\\local"));
+    });
   });
 
   describe("daemon files for a socket", () => {

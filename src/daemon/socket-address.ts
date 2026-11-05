@@ -4,6 +4,7 @@ import { lstat, readlink, rename, stat, symlink, unlink } from "node:fs/promises
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { DAEMON_BASE } from "../constants.js";
+import { ForeignPipeServerError } from "./pipe-proof.js";
 
 export const SOCKET_PATH_LIMIT = 100;
 const ALIAS_HASH_LENGTH = 12;
@@ -35,8 +36,10 @@ export class SocketAliasRefusedError extends Error {
   }
 }
 
-export function isSocketAddressError(err: unknown): err is SocketPathTooLongError | SocketAliasRefusedError {
-  return err instanceof SocketPathTooLongError || err instanceof SocketAliasRefusedError;
+export function isUnusableAddressError(
+  err: unknown,
+): err is SocketPathTooLongError | SocketAliasRefusedError | ForeignPipeServerError {
+  return err instanceof SocketPathTooLongError || err instanceof SocketAliasRefusedError || err instanceof ForeignPipeServerError;
 }
 
 export interface SocketAddressOptions {

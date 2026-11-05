@@ -20,7 +20,7 @@ import {
   recordedPids,
   terminateDaemon,
   waitForExit,
-  isSocketAddressError,
+  isUnusableAddressError,
   createDaemonLogger,
   getDaemonLogPath,
   daemonStopBudgetMs,
@@ -71,13 +71,13 @@ export async function runDaemonCommand(action: DaemonAction): Promise<number> {
   try {
     return await dispatch(action);
   } catch (err) {
-    reportSocketAddressError(err);
+    reportUnusableAddressError(err);
     return 1;
   }
 }
 
-function reportSocketAddressError(err: unknown): void {
-  if (!isSocketAddressError(err)) throw err;
+function reportUnusableAddressError(err: unknown): void {
+  if (!isUnusableAddressError(err)) throw err;
   process.stderr.write(`${err.message}\n`);
 }
 
@@ -185,7 +185,7 @@ async function runStart(): Promise<number> {
 
 async function runStop(): Promise<number> {
   const reachable = await isDaemonReachable(getDaemonSocketPath()).catch((err: unknown) => {
-    reportSocketAddressError(err);
+    reportUnusableAddressError(err);
     return false;
   });
   const recorded = await recordedDaemonPids();
@@ -262,7 +262,7 @@ async function runStatus(): Promise<number> {
     });
     return 0;
   } catch (err) {
-    if (isSocketAddressError(err)) throw err;
+    if (isUnusableAddressError(err)) throw err;
   } finally {
     client.close();
   }
@@ -407,7 +407,7 @@ export async function runRestartUpstream(opts: RestartUpstreamOpts): Promise<num
     try {
       await client.connect();
     } catch (err) {
-      if (isSocketAddressError(err)) throw err;
+      if (isUnusableAddressError(err)) throw err;
       // Daemon not reachable: nothing to restart. Idempotent no-op, matching
       // `daemon stop`'s behaviour.
       process.stderr.write("daemon not running; nothing to restart\n");

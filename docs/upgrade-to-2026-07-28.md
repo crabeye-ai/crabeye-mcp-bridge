@@ -4,7 +4,7 @@ crabeye-mcp-bridge 2.0 supports the MCP 2026-07-28 protocol. AI clients and upst
 
 ## After upgrading
 
-**Restart every AI client.** Bridges and managers from before 2.0 can't work with each other. A 2.0 bridge replaces an older manager when it starts, and a bridge still running from before the upgrade gets an error telling you to restart its AI client.
+**Restart every AI client.** Bridges and managers from before 2.0 can't work with each other. A 2.0 bridge replaces an older manager when it starts, and a bridge still running from before the upgrade gets an error telling you to restart its AI client; on Windows it reports that it can't reach the manager instead. Also on Windows, the first AI client started after upgrading can take up to a minute to connect while the older manager stops.
 
 Your config files need no changes. Settings that no longer do anything (`--discovery-mode`, `_bridge.sharing`, `_bridge.daemon.autoFork*`) are still accepted, and each logs one warning saying it is ignored.
 

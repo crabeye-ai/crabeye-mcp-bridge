@@ -18,6 +18,7 @@ export const DAEMON_RUN_SUBDIR = "run";
 export const DAEMON_SOCKET_FILENAME = "manager.sock";
 export const DAEMON_PID_FILENAME = "manager.pid";
 export const DAEMON_LOCK_FILENAME = "manager.lock";
+export const DAEMON_KEY_FILENAME = "manager.key";
 export const DAEMON_LOG_SUBDIR = "logs";
 export const DAEMON_LOG_FILENAME = "daemon.log";
 export const DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024;
