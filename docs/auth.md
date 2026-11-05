@@ -67,7 +67,7 @@ The flow:
 
 1. Generates a PKCE verifier + S256 challenge and a random `state`.
 2. Starts a one-shot HTTP listener on `127.0.0.1` at either a random free port or `_bridge.auth.redirectPort` if you've pinned one.
-3. Prints the authorization URL to stderr and tries to open it in your default browser. If the launcher fails (headless terminal, missing `xdg-open`, etc.), copy the printed URL into any browser on a machine that can reach the upstream — the redirect must come back to your loopback, so this usually means the same machine.
+3. Prints the authorization URL to stderr and tries to open it in your default browser. If it can't start a browser (for example, `xdg-open` is missing), it says so. If no browser opens, copy the printed URL into any browser on a machine that can reach the upstream — the redirect must come back to your loopback, so this usually means the same machine.
 4. Verifies the returned `state`, exchanges the code at the token endpoint, and writes `oauth:<server>` to the credential store.
 5. Five-minute timeout. Ctrl-C aborts cleanly.
 

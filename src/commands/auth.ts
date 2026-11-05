@@ -467,9 +467,12 @@ async function authorize(
         errPrint(`Opening authorization URL for "${serverName}":`);
         errPrint(`  ${url}`);
         errPrint(`Listening on ${handle!.redirectUri} (Ctrl-C to cancel)`);
-        // Surface launcher rejections (unhandled-rejection avoidance) — the
-        // user may still complete auth by pasting the URL manually.
-        void openFn(String(url)).catch(() => undefined);
+        void openFn(String(url))
+          .catch(() => false)
+          .then((opened) => {
+            if (!opened) errPrint("Could not open a browser; open the URL above to authorize");
+          })
+          .catch(() => undefined);
       },
     });
 

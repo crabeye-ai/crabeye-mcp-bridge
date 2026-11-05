@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { platform } from "node:os";
 import { windowsPowerShellPath } from "../process/process-utils.js";
 
+const BROWSER_URL_ENV = "CRABEYE_MCP_BRIDGE_BROWSER_URL";
+
 function isSafeLaunchUrl(url: string): boolean {
   try {
     const u = new URL(url);
@@ -21,20 +23,20 @@ function isSafeLaunchUrl(url: string): boolean {
  *
  * - macOS: `open <url>`
  * - Linux: `xdg-open <url>`
- * - Windows: System32's `powershell -NoProfile -Command Start-Process <url>` — picked
- *   over `rundll32 url.dll,FileProtocolHandler <url>` (silent failures with
- *   embedded `,` and ANSI-only argv) and `cmd /c start "" <url>` (cmd.exe
- *   re-parses argv so `&`/`|`/`^` in the URL become command separators).
- *   `Start-Process` passes the URL via .NET — no shell re-parsing.
+ * - Windows: System32's `powershell -NoProfile -NonInteractive -Command Start-Process`
+ *   reading the URL from an environment variable, so PowerShell never parses it
+ *   as code — picked over `rundll32 url.dll,FileProtocolHandler <url>` (silent
+ *   failures with embedded `,` and ANSI-only argv) and `cmd /c start "" <url>`
+ *   (cmd.exe re-parses argv so `&`/`|`/`^` in the URL become command separators).
+ *   PowerShell isn't detached: started detached, it has no console and runs nothing.
  *
  * Rejects non-http(s) URLs and URLs with embedded userinfo without spawning.
  *
- * Fire-and-forget — never throws and never rejects.
+ * Doesn't wait for the browser — never throws and never rejects.
  *
- * @returns `true` if the launcher spawned (i.e. the child process started
- *   successfully); `false` if spawn failed synchronously or the binary was
- *   not found. The return value waits on Node's `spawn`/`error` events so
- *   callers get an accurate signal instead of an `setImmediate`-rate guess.
+ * @returns `true` once the launcher has started (on Windows, once PowerShell has
+ *   exited with code 0); `false` if spawn failed synchronously, the binary was
+ *   not found, or PowerShell exited with another code or a signal.
  */
 export async function openBrowser(
   url: string,
@@ -45,6 +47,8 @@ export async function openBrowser(
   const os = options._platform ?? platform();
   let command: string;
   let args: string[];
+  let env = process.env;
+  let waitsForExit = false;
 
   switch (os) {
     case "darwin":
@@ -53,7 +57,9 @@ export async function openBrowser(
       break;
     case "win32":
       command = windowsPowerShellPath();
-      args = ["-NoProfile", "-Command", "Start-Process", url];
+      args = ["-NoProfile", "-NonInteractive", "-Command", `Start-Process $env:${BROWSER_URL_ENV}`];
+      env = { ...process.env, [BROWSER_URL_ENV]: url };
+      waitsForExit = true;
       break;
     default:
       command = "xdg-open";
@@ -71,15 +77,15 @@ export async function openBrowser(
     try {
       const child = spawn(command, args, {
         stdio: "ignore",
-        detached: true,
+        detached: !waitsForExit,
+        windowsHide: true,
+        env,
       });
       child.once("error", () => finish(false));
-      // `spawn` fires when the child process is actually running. Listening
-      // here (instead of `setImmediate`) means we don't return `true` for a
-      // missing binary that emits `error` slightly later.
+      if (waitsForExit) child.once("exit", (code) => finish(code === 0));
       child.once("spawn", () => {
         child.unref?.();
-        finish(true);
+        if (!waitsForExit) finish(true);
       });
     } catch {
       finish(false);

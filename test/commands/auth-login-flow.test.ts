@@ -31,6 +31,7 @@ interface LoginOptions {
   iss?: IssFor;
   metadataIssuer?: string;
   omitMetadata?: boolean;
+  opened?: boolean | "rejects";
 }
 
 interface LoginResult {
@@ -75,7 +76,7 @@ describe("crabeye auth against a real authorization server", () => {
     cleanup();
   });
 
-  async function login({ advertised = false, iss = matching, metadataIssuer, omitMetadata }: LoginOptions = {}): Promise<LoginResult> {
+  async function login({ advertised = false, iss = matching, metadataIssuer, omitMetadata, opened = true }: LoginOptions = {}): Promise<LoginResult> {
     const upstream = await startProtectedUpstream("ok", { issParameterSupported: advertised, metadataIssuer, omitMetadata });
     started = upstream;
     const stderr: string[] = [];
@@ -87,8 +88,9 @@ describe("crabeye auth against a real authorization server", () => {
         errPrint: (line) => stderr.push(line),
         loadConfig: async () => makeConfig(upstream.url),
         openBrowser: async (authorizationUrl) => {
-          await fetch(callbackFor(authorizationUrl, iss(upstream.issuer)));
-          return true;
+          void fetch(callbackFor(authorizationUrl, iss(upstream.issuer))).catch(() => {});
+          if (opened === "rejects") throw new Error("spawn failed");
+          return opened;
         },
       },
     );
@@ -113,6 +115,17 @@ describe("crabeye auth against a real authorization server", () => {
       issuer: upstream.issuer,
     });
   }
+
+  it.each([
+    { opened: false, says: true },
+    { opened: "rejects" as const, says: true },
+    { opened: true, says: false },
+  ])("says it could not open a browser only when it didn't (opened: $opened), and authorizes either way", async ({ opened, says }) => {
+    const result = await login({ opened });
+
+    await expectAuthorized(result);
+    expect(result.stderr.includes("Could not open a browser; open the URL above to authorize")).toBe(says);
+  });
 
   it("authorizes again over a stored access token that can't be sent in a header", async () => {
     await store.set(oauthCredentialKey(SERVER), { type: "oauth2", access_token: "stale\nX-Injected: 1", refresh_token: "rt-stale" });
