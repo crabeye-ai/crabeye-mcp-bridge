@@ -54,16 +54,11 @@ The bridge tracks how many tokens it saves compared to exposing all upstream too
 
 Token counts are estimated using a chars/4 heuristic.
 
-## Bridge instructions assembly
+## Bridge instructions
 
-The bridge advertises its own `instructions` string to clients during the MCP `initialize` handshake. It is built in two parts:
+The bridge gives every client the same fixed instructions when it connects: when and how to call `search_tools` and `run_tool`. They don't depend on which servers are configured or connected.
 
-1. **Base instructions** — a static block telling the assistant how and when to call `search_tools` and `run_tool`.
-2. **Per-server passthrough blocks** — appended for every upstream that opted in via `_bridge.passthrough` (see [configuration.md](configuration.md#context-passthrough)). One H2-headed block per upstream, in the order upstreams are resolved from the config.
-
-Upstream `instructions` are read from each upstream's `initialize` response (or its answer about the protocol versions it speaks). The manager connects every upstream once, so every bridge gets the same instructions from the manager's one connection.
-
-The manager renders the passthrough blocks from the servers it has connected and the tool policy. A change applies to the **next** client `initialize` only — MCP has no mechanism to push an updated instructions string to a connected session.
+A server's own instructions come with search results instead, for servers that opt in with `_bridge.passthrough` (see [configuration.md](configuration.md#context-passthrough)). The assistant asks for them only when it needs them, so it spends no tokens on the instructions of servers it never uses.
 
 ## Examples
 
@@ -113,6 +108,19 @@ To get full tool definitions, add `expand_tools: true` or use a `tool` filter to
   }
 }
 ```
+
+When a server has [`_bridge.passthrough`](configuration.md#context-passthrough) on and has sent instructions, its entry in the results is marked `"has_instructions": true`. To get them, add `include_instructions: true` to the query:
+
+```json
+{
+  "name": "search_tools",
+  "arguments": {
+    "queries": [{ "provider": "linear", "include_instructions": true }]
+  }
+}
+```
+
+The server's result then carries its instructions in an `instructions` field. A server matched by several queries in one search gets them once, under the first query that asks for them.
 
 ### Searching for tools
 

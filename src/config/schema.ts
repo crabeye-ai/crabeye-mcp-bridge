@@ -114,16 +114,16 @@ export const ReconnectConfigSchema = z.object({
   maxReconnectAttempts: z.unknown().optional(),
 });
 
-/**
- * Per-server context-passthrough level. Controls how much of an upstream's
- * `initialize.instructions` and tool list gets injected into the bridge's
- * downstream instructions string at handshake. The literal `true` is not
- * accepted — callers must pick a level explicitly.
- */
-export const PassthroughLevelSchema = z.union([
-  z.literal(false),
-  z.enum(["instructions", "tools", "full"]),
-]);
+/** The levels `_bridge.passthrough` took before it became a boolean; each now means `true`. */
+const LEGACY_PASSTHROUGH_LEVELS = ["instructions", "tools", "full"] as const;
+
+/** Whether a search may return a server's own instructions when a query asks for them. */
+export const PassthroughSchema = z.union([z.boolean(), z.enum(LEGACY_PASSTHROUGH_LEVELS).meta({ deprecated: true })]);
+
+export function isPassthroughOn(config: ServerConfig): boolean {
+  const passthrough = config._bridge?.passthrough;
+  return passthrough !== undefined && passthrough !== false;
+}
 
 export const ServerBridgeConfigSchema = z
   .object({
@@ -134,11 +134,11 @@ export const ServerBridgeConfigSchema = z
     rateLimit: RateLimitConfigOrDisabledSchema.optional(),
     reconnect: ReconnectConfigSchema.optional(),
     sharing: z.unknown().optional(),
-    passthrough: PassthroughLevelSchema.optional(),
+    passthrough: PassthroughSchema.optional(),
     /**
-     * Per-server byte cap on the rendered passthrough block. Bounded at 1
-     * MiB at the schema layer; the renderer enforces an additional 256 KiB
-     * default ceiling when this is unset.
+     * Per-server byte cap on the instructions a search returns. The
+     * instructions never exceed 256 KiB, which is also the cap when this is
+     * unset.
      */
     passthroughMaxBytes: z.number().int().positive().max(1_048_576).optional(),
   })
@@ -272,7 +272,6 @@ export const BridgeConfigSchema = z.object({
 // --- Inferred types ---
 
 export type ToolPolicy = z.infer<typeof ToolPolicySchema>;
-export type PassthroughLevel = z.infer<typeof PassthroughLevelSchema>;
 export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
 export type RateLimitConfigOrDisabled = z.infer<typeof RateLimitConfigOrDisabledSchema>;
 export type ReconnectConfig = z.infer<typeof ReconnectConfigSchema>;

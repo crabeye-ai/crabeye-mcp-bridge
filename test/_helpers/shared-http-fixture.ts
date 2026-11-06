@@ -8,6 +8,7 @@ import { resolveUpstreams, type BridgeConfig } from "../../src/config/schema.js"
 import { CredentialStore } from "../../src/credentials/credential-store.js";
 import { createKeychainAdapter, type KeychainAdapter } from "../../src/credentials/keychain.js";
 import type { StatusResult } from "../../src/daemon/protocol.js";
+import type { SearchToolsParams, SearchToolsResponse } from "../../src/search/index.js";
 import { clientInfoKey, oauthCredentialKey } from "../../src/oauth/client-secret.js";
 import { awaitConnectedClient } from "../../src/server/upstream-wait.js";
 import { ToolRegistry } from "../../src/server/tool-registry.js";
@@ -31,6 +32,7 @@ export interface TestBridge {
   client: (name: string) => InstanceUpstreamClient;
   tools: () => string[];
   call: (server: string, tool?: string, args?: Record<string, unknown>) => Promise<unknown>;
+  search: (params: SearchToolsParams) => Promise<SearchToolsResponse>;
 }
 
 /** A config with one upstream `svc` on `server`, retried quickly, with `auth` as its `_bridge.auth`, or none when it is null. */
@@ -183,22 +185,18 @@ export function useSharedHttpFixture(): SharedHttpFixture {
       const logger = recordingLogger(lines);
       const config = kind === "file" ? await loadConfig({ configPath: path }) : (await loadMergedConfig({ bridgeConfigPath: path })).config;
       const registry = new ToolRegistry();
-      const manager = new UpstreamManager({
-        names: Object.keys(resolveUpstreams(config)),
-        toolRegistry: registry,
+      const instanceLink = new InstanceLink({
+        source: { kind, path },
+        env,
+        childEnv: {},
         logger,
-        instanceLink: new InstanceLink({
-          source: { kind, path },
-          env,
-          childEnv: {},
-          logger,
-          rpcTimeoutMs: 30_000,
-          heartbeatMs: 60_000,
-          respawnLockWaitMs: 60_000,
-          _socketPath: fx!.socketPath,
-          _ensureDaemon: async () => {},
-        }),
+        rpcTimeoutMs: 30_000,
+        heartbeatMs: 60_000,
+        respawnLockWaitMs: 60_000,
+        _socketPath: fx!.socketPath,
+        _ensureDaemon: async () => {},
       });
+      const manager = new UpstreamManager({ names: Object.keys(resolveUpstreams(config)), toolRegistry: registry, logger, instanceLink });
       await manager.connectAll();
       const created: TestBridge = {
         manager,
@@ -207,6 +205,7 @@ export function useSharedHttpFixture(): SharedHttpFixture {
         client: (name) => manager.getClient(name) as InstanceUpstreamClient,
         tools: () => registry.listRegisteredTools().map((registered) => registered.tool.name).sort(),
         call: async (server, tool = "echo", args = {}) => (await manager.getClient(server)!.callTool({ name: tool, arguments: args })).content,
+        search: (params) => instanceLink.search(params),
       };
       bridges.push(created);
       return created;

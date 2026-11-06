@@ -90,7 +90,7 @@ describe.skipIf(isWindows)("bridge process: upstream connections wait for the cl
 
   it.each([
     ["", {}],
-    [", with passthrough configured", { passthrough: "tools" }],
+    [", with passthrough configured", { passthrough: true }],
   ])("sends nothing upstream when the client only probes the version and leaves%s", async (_case, bridgeSettings) => {
     await startBridge("http", bridgeSettings);
 

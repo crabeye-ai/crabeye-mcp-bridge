@@ -9,7 +9,6 @@ const connected = (overrides: Partial<UpstreamSnapshot> = {}): UpstreamSnapshot 
   name: "svc",
   status: "connected",
   tools: [tool("search")],
-  instructions: "use search",
   ...overrides,
 });
 
@@ -37,7 +36,6 @@ describe("InstanceUpstreamClient", () => {
 
       expect(client.status).toBe("connected");
       expect(client.tools).toEqual([tool("search")]);
-      expect(client.instructions).toBe("use search");
       expect(toolEvents).toEqual([1]);
       expect(link.retry).not.toHaveBeenCalled();
     });

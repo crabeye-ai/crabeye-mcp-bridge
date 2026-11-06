@@ -18,9 +18,9 @@ import type { LogLevel } from "../logging/index.js";
 import type { SearchToolsParams, SearchToolsResponse } from "../search/index.js";
 import type { ConnectionStatus } from "../upstream/types.js";
 
-export const PROTOCOL_VERSION = 7;
-export const MIN_BRIDGE_PROTOCOL_VERSION = 7;
-export const MIN_DAEMON_PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
+export const MIN_BRIDGE_PROTOCOL_VERSION = 8;
+export const MIN_DAEMON_PROTOCOL_VERSION = 8;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
@@ -154,7 +154,6 @@ export interface UpstreamSnapshot {
   /** Why the last connection attempt failed, while not connected. */
   error?: string;
   tools: Tool[];
-  instructions?: string;
 }
 
 export interface CallToolParams {

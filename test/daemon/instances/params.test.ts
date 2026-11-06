@@ -89,7 +89,7 @@ describe("parseCallToolParams", () => {
 });
 
 describe("parseSearchToolsParams", () => {
-  const query = { tool: "create", provider: "linear", category: "", expand_tools: true, limit: 5, offset: 2.5 };
+  const query = { tool: "create", provider: "linear", category: "", expand_tools: true, include_instructions: false, limit: 5, offset: 2.5 };
 
   it("accepts queries with the fields search_tools takes, and leaves out any other field", () => {
     expect(parseSearchToolsParams({ queries: [query, {}] })).toEqual({ queries: [query, {}] });
@@ -104,6 +104,7 @@ describe("parseSearchToolsParams", () => {
     ["a limit that isn't a finite number", { queries: [{ tool: "x", limit: Number.POSITIVE_INFINITY }] }],
     ["an offset that is a string", { queries: [{ tool: "x", offset: "1" }] }],
     ["expand_tools that isn't a boolean", { queries: [{ tool: "x", expand_tools: "yes" }] }],
+    ["include_instructions that isn't a boolean", { queries: [{ tool: "x", include_instructions: 1 }] }],
   ])("refuses %s", (_label, params) => {
     expect(parseSearchToolsParams(params)).toBeNull();
   });

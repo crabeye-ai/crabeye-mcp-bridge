@@ -101,7 +101,7 @@ The assistant can then search by category: `{ "queries": [{ "category": "design"
 
 ## Context passthrough
 
-Some upstream servers carry instructions or tool documentation the model needs from the very first turn — opt them in with `_bridge.passthrough`:
+Some upstream servers carry instructions the assistant should read before it uses their tools. Opt them in with `_bridge.passthrough`:
 
 ```json
 {
@@ -110,14 +110,7 @@ Some upstream servers carry instructions or tool documentation the model needs f
       "command": "npx",
       "args": ["-y", "@anthropic/linear-mcp-server"],
       "_bridge": {
-        "passthrough": "instructions"
-      }
-    },
-    "filesystem": {
-      "command": "node",
-      "args": ["./fs-server.js"],
-      "_bridge": {
-        "passthrough": "tools",
+        "passthrough": true,
         "passthroughMaxBytes": 16384
       }
     }
@@ -125,22 +118,15 @@ Some upstream servers carry instructions or tool documentation the model needs f
 }
 ```
 
-Levels:
+With `passthrough: true`, a search that returns the server marks it with `"has_instructions": true` once it has connected and sent instructions. A query with `include_instructions: true` gets the instructions themselves (see [how-it-works.md](how-it-works.md#discovering-providers)). The bridge's own instructions tell the assistant to ask for them before using such a server's tools. A server that isn't connected, or hasn't opted in, gets neither field. Edits to `passthrough` apply to the next search.
 
-| Value | What's appended to bridge instructions |
-|-------|----------------------------------------|
-| `false` / unset (default) | Nothing. Tools stay hidden behind `search_tools`. |
-| `"instructions"` | The upstream's `initialize.instructions` text under `## <configKey>`. |
-| `"tools"` | Instructions plus a `### Tools` list with each namespaced tool name and description. |
-| `"full"` | Same as `"tools"` plus each tool's `inputSchema` as compact JSON. |
+The old values `"instructions"`, `"tools"` and `"full"` still load and mean `true`. `"tools"` and `"full"` also log a warning: a search already returns a server's tools with their descriptions and input schemas.
 
-The literal `true` is not accepted — pick a level explicitly. Headings use the config key (e.g. `linear`), which is also the namespace prefix of the tool names the model passes to `run_tool` (`linear__create_issue`). Tools filtered out by `_bridge.tools` allow/deny do not appear in the rendered list.
+`_bridge.passthroughMaxBytes` (optional, positive integer) caps a server's instructions in UTF-8 bytes. They are never longer than 256 KiB, which is also the cap when it is unset. Excess text is cut at a character boundary and `…(truncated)` is appended. The marker itself is not counted toward the cap.
 
-`_bridge.passthroughMaxBytes` (optional, positive integer) caps the per-server rendered block in UTF-8 bytes. Excess content is truncated at a codepoint boundary and `…(truncated)` is appended. The marker itself is not counted toward the cap.
+Passthrough does not change which tools exist or how they run.
 
-Passthrough does not change tool exposure or routing — `tools/list` and `search_tools` behave exactly as before. Toggling `passthrough` at runtime makes the manager render the blocks again for the next client `initialize`; existing sessions are unaffected because MCP has no mid-session push for instructions.
-
-> **Trust note.** Enabling `passthrough` for a server lets that server's author influence your LLM's system prompt — its `instructions` text and tool descriptions are interpolated verbatim. The bridge sanitises control / bidi / zero-width characters and applies a per-server byte cap, but it does not validate the *content* against prompt-injection. Only enable passthrough for servers you trust as much as the LLM client itself.
+> **Trust note.** Enabling `passthrough` for a server lets that server's author write text the assistant reads as guidance. The bridge removes control, bidi, zero-width and other invisible characters and applies the byte cap, but it does not check the *content* for prompt injection. Only enable passthrough for servers you trust as much as the AI client itself.
 
 ## Config sources
 

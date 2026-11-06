@@ -25,6 +25,8 @@ The bridge always lists exactly two tools, `search_tools` and `run_tool`. Search
 * Upstream tools run only through `run_tool`. Calling one by its own name, such as `linear__create_issue`, fails as an unknown tool, and nothing is sent to the server.
 * Your AI client sees only the two bridge tools, so permission rules it keeps per tool can't tell upstream tools apart. Use [tool policies](policies.md) (`"prompt"`, `"never"`) to control individual tools.
 * `--discovery-mode` has no effect.
+* Servers with `_bridge.passthrough` on no longer have their instructions added to the bridge's instructions; a search returns them when the assistant asks (see [Context passthrough](configuration.md#context-passthrough)).
+* `_bridge.passthrough` is now `true` or `false`. The old `"instructions"`, `"tools"` and `"full"` values still load and mean `true`; `"tools"` and `"full"` also log a warning, because a search already returns a server's tools.
 
 ### Servers can't ask your AI client for input
 

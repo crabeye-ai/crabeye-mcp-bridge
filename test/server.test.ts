@@ -139,61 +139,17 @@ describe("BridgeServer initialize", () => {
     await cleanup();
   });
 
-  it("buildPassthrough output is appended to bridge instructions on initialize (AIT-183)", async () => {
-    const toolRegistry = new ToolRegistry();
-    const server = new BridgeServer({
-      toolRegistry,
-      search: localSearch(toolRegistry),
-      buildPassthrough: () => "## linear\n\nUse Linear for tickets.",
-    });
-    const client = new Client({ name: "t", version: "0" });
-    const [c, s] = InMemoryTransport.createLinkedPair();
-    await server.connect(s);
-    await client.connect(c);
-    const instructions = client.getInstructions();
-    expect(instructions).toBeDefined();
-    expect(instructions).toContain("This MCP bridge connects you");
-    expect(instructions).toContain("## linear\n\nUse Linear for tickets.");
-    await client.close();
-    await server.close();
-  });
+  it.each([false, true])("gives the fixed instructions, which say how to ask for a server's own instructions (modern: %s)", async (modern) => {
+    const first = await createTestPair({ modern });
+    const second = await createTestPair({ modern });
+    const instructions = first.client.getInstructions();
 
-  it("each new connection re-reads instructions, so late passthrough blocks appear (AIT-183)", async () => {
-    const toolRegistry = new ToolRegistry();
-    let block = "";
-    const server = new BridgeServer({
-      toolRegistry,
-      search: localSearch(toolRegistry),
-      buildPassthrough: () => block,
-    });
+    expect(second.client.getInstructions()).toBe(instructions);
+    expect(instructions).toContain('has_instructions: true, search it again for its instructions before using its tools: { "queries": [{ "provider": "linear", "include_instructions": true }] }');
+    expect(instructions).not.toMatch(/^## |in a server below/m);
 
-    // First handshake: empty passthrough.
-    {
-      const client = new Client({ name: "t", version: "0" });
-      const [c, s] = InMemoryTransport.createLinkedPair();
-      await server.connect(s);
-      await client.connect(c);
-      const instr = client.getInstructions();
-      expect(instr).toBeDefined();
-      expect(instr).not.toContain("## fs");
-      await client.close();
-      await server.close();
-    }
-
-    block = "## fs\n\nFile-system server.";
-
-    {
-      const client = new Client({ name: "t", version: "0" });
-      const [c, s] = InMemoryTransport.createLinkedPair();
-      await server.connect(s);
-      await client.connect(c);
-      const instr = client.getInstructions();
-      expect(instr).toContain("## fs");
-      expect(instr).toContain("File-system server.");
-      await client.close();
-    }
-
-    await server.close();
+    await first.cleanup();
+    await second.cleanup();
   });
 });
 

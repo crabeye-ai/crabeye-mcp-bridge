@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { BridgeConfigSchema } from "../../src/config/schema.js";
-import { findRemovedSettings, warnAboutConfig } from "../../src/config/removed-settings.js";
+import { findRemovedSettings, findToolPassthroughLevels, warnAboutConfig } from "../../src/config/removed-settings.js";
 import { spyLogger } from "../_helpers/spy-logger.js";
 
 const RETRIES_FOREVER = "upstreams now retry indefinitely with capped backoff";
@@ -34,7 +34,37 @@ describe("findRemovedSettings", () => {
   });
 });
 
+describe("findToolPassthroughLevels", () => {
+  it('names the servers whose passthrough is "tools" or "full"', () => {
+    const config = BridgeConfigSchema.parse({
+      mcpServers: {
+        a: { command: "node", _bridge: { passthrough: "tools" } },
+        b: { command: "node", _bridge: { passthrough: "instructions" } },
+        c: { command: "node", _bridge: { passthrough: "full" } },
+        d: { command: "node", _bridge: { passthrough: true } },
+        e: { command: "node" },
+      },
+    });
+
+    expect(findToolPassthroughLevels(config)).toEqual(['server "a"', 'server "c"']);
+  });
+});
+
 describe("warnAboutConfig", () => {
+  it("warns once that the tools and full passthrough levels now mean true, naming each server", () => {
+    const logger = spyLogger();
+
+    warnAboutConfig(
+      BridgeConfigSchema.parse({ mcpServers: { a: { command: "node", _bridge: { passthrough: "tools" } }, b: { command: "node", _bridge: { passthrough: "full" } } } }),
+      logger,
+    );
+    warnAboutConfig(BridgeConfigSchema.parse({ mcpServers: { c: { command: "node", _bridge: { passthrough: "instructions" } } } }), logger);
+
+    expect(logger.warn.mock.calls).toEqual([
+      ['passthrough "tools" and "full" now mean true (server "a", server "b"); a search already returns a server\'s tools', { component: "config" }],
+    ]);
+  });
+
   it("logs one warning per removed setting, naming every place it is set", () => {
     const logger = spyLogger();
     const config = BridgeConfigSchema.parse({

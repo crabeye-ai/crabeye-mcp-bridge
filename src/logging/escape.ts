@@ -1,4 +1,6 @@
 const CONTROL_CHARACTERS = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+/** Invisible characters: bidi, zero-width and other format characters, variation selectors, fillers and tags. */
+export const INVISIBLE_CHARACTERS = /[\p{Cf}\p{Default_Ignorable_Code_Point}\u2800]/gu;
 const NAMED_ESCAPES: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
 
 function hexEscape(code: number): string {

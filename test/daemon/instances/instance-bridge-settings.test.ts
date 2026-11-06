@@ -9,6 +9,8 @@ import { InstanceHost } from "../../../src/daemon/instances/instance-host.js";
 import { UpstreamPool } from "../../../src/daemon/instances/upstream-pool.js";
 import { MIN_BRIDGE_PROTOCOL_VERSION, type AttachResult } from "../../../src/daemon/protocol.js";
 import type { FrameChannel } from "../../../src/daemon/transport.js";
+import type { SearchQuery } from "../../../src/search/types.js";
+import { TRUNCATION_MARKER } from "../../../src/server/passthrough.js";
 import { ScriptedUpstreamClient, stdioPoolOptions, tool } from "../../_helpers/scripted-upstream-client.js";
 import { spyLogger, type SpyLogger } from "../../_helpers/spy-logger.js";
 
@@ -110,6 +112,7 @@ describe("What an instance tells its bridges about its config", () => {
   it.each([
     ["a removed setting", { mcpServers: { linear: linear({ sharing: "auto" }) } }, /^sharing no longer has any effect/],
     ["a changed log format", { mcpServers: { linear: linear() }, _bridge: { logFormat: "json" } }, /^_bridge\.logFormat changed; restart the AI clients/],
+    ["a passthrough level that now means true", { mcpServers: { linear: linear({ passthrough: "tools" }) } }, /^passthrough "tools" and "full" now mean true/],
   ])("tells every attached bridge about %s when it reloads", async (_case, next, message) => {
     const { bridge: first } = await attach();
     config = next;
@@ -264,15 +267,27 @@ describe("What an instance tells its bridges about its config", () => {
   });
 });
 
-describe("An instance's passthrough blocks", () => {
+describe("A server's instructions in an instance's search answers", () => {
+  const INSTRUCTIONS = "Use create_issue for bugs.";
+  const withPassthrough = (url: string) => ({ url, _bridge: { passthrough: true } });
+  let servers: Record<string, unknown>;
+  let clients: Map<string, ScriptedUpstreamClient>;
   let pool: UpstreamPool;
   let instance: Instance | undefined;
 
   beforeEach(() => {
+    servers = { linear: withPassthrough("https://linear.example.com/mcp"), docs: { url: "https://docs.example.com/mcp" } };
+    clients = new Map();
     pool = new UpstreamPool({
       logger: spyLogger(),
       stdio: stdioPoolOptions(),
-      createHttpClient: scriptedLinear,
+      createHttpClient: (name) => {
+        const client = scriptedLinear(name);
+        if (name === "starting") client.attempt = () => new Promise(() => {});
+        if (name === "broken") client.attempt = async () => Promise.reject(new Error("boom"));
+        clients.set(name, client);
+        return client;
+      },
     });
   });
 
@@ -281,25 +296,70 @@ describe("An instance's passthrough blocks", () => {
     await pool.close(0);
   });
 
-  async function open(servers: Record<string, unknown>): Promise<Instance> {
+  async function open(): Promise<Instance> {
     instance = await Instance.open(SOURCE, { env: {}, childEnv: {} }, {
       pool,
       logger: spyLogger(),
       loadConfig: async () => ({ config: BridgeConfigSchema.parse({ mcpServers: servers }), watchPaths: [] }),
       createCredentialStore: () => ({}) as CredentialStore,
     });
-    await vi.waitFor(() => expect(instance!.search({ queries: [{ provider: "linear" }] }).results[0]!.total).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(["linear", "docs"].map((name) => clients.get(name)?.status)).toEqual(["connected", "connected"]));
     return instance;
   }
 
-  it("renders a server's instructions and tools, leaving out tools the policy disables", async () => {
-    const opened = await open({ linear: { url: "https://linear.example.com/mcp", _bridge: { passthrough: "tools", tools: { delete_issue: "never" } } } });
+  const shown = (opened: Instance, ...queries: SearchQuery[]) =>
+    opened.search({ queries }).results.map((result) => result.providers.map(({ name, instructions, has_instructions }) => ({ name, instructions, has_instructions })));
 
-    expect(opened.passthrough()).toBe("## linear\n\nUse create_issue for bugs.\n\n### Tools\n\n- linear__create_issue");
+  const query = (provider: string, include_instructions?: boolean): SearchQuery => ({ provider, ...(include_instructions !== undefined && { include_instructions }) });
+
+  it("returns the instructions of a server that shares them only to a query that asks, and marks them otherwise", async () => {
+    const opened = await open();
+
+    expect(shown(opened, query("linear"), query("docs", true))).toEqual([[{ name: "linear", has_instructions: true }], [{ name: "docs" }]]);
+    expect(shown(opened, query("linear", false), query("docs", true))).toEqual([[{ name: "linear", has_instructions: true }], [{ name: "docs" }]]);
+    expect(shown(opened, query("linear", true), query("docs", true))).toEqual([[{ name: "linear", instructions: INSTRUCTIONS }], [{ name: "docs" }]]);
   });
 
-  it("renders nothing when no server asks for it", async () => {
-    expect((await open({ linear: { url: "https://linear.example.com/mcp" } })).passthrough()).toBe("");
+  it("returns them once when several queries match the server, marking it only before then", async () => {
+    const opened = await open();
+
+    const linearOnly = shown(opened, query("lin"), query("linear", true), { tool: "create", include_instructions: true }).map((providers) =>
+      providers.filter(({ name }) => name === "linear"),
+    );
+    expect(linearOnly).toEqual([[{ name: "linear", has_instructions: true }], [{ name: "linear", instructions: INSTRUCTIONS }], [{ name: "linear" }]]);
+  });
+
+  it("adds neither field for a server that is still starting or failed to start", async () => {
+    servers = { ...servers, starting: withPassthrough("https://starting.example.com/mcp"), broken: withPassthrough("https://broken.example.com/mcp") };
+    const opened = await open();
+    await vi.waitFor(() => expect(["starting", "broken"].map((name) => clients.get(name)?.status)).toEqual(["connecting", "disconnected"]));
+
+    expect(shown(opened, query("starting", true), query("broken", true), query("broken"))).toEqual([[{ name: "starting" }], [{ name: "broken" }], [{ name: "broken" }]]);
+  });
+
+  it("adds neither field while a server is disconnected, and its new instructions once it reconnects", async () => {
+    const opened = await open();
+    expect(shown(opened, query("linear", true))).toEqual([[{ name: "linear", instructions: INSTRUCTIONS }]]);
+
+    clients.get("linear")!.setStatus("disconnected", new Error("reset"));
+    expect(shown(opened, query("linear", true))).toEqual([[{ name: "linear" }]]);
+
+    clients.get("linear")!.instructions = "Use create_issue for features too.";
+    clients.get("linear")!.setStatus("connected");
+    expect(shown(opened, query("linear", true))).toEqual([[{ name: "linear", instructions: "Use create_issue for features too." }]]);
+  });
+
+  it("follows a reload that caps the instructions or stops sharing them", async () => {
+    const opened = await open();
+    expect(shown(opened, query("linear", true))).toEqual([[{ name: "linear", instructions: INSTRUCTIONS }]]);
+
+    servers = { ...servers, linear: { url: "https://linear.example.com/mcp", _bridge: { passthrough: "instructions", passthroughMaxBytes: 3 } } };
+    await opened.reload();
+    expect(shown(opened, query("linear", true))).toEqual([[{ name: "linear", instructions: `Use${TRUNCATION_MARKER}` }]]);
+
+    servers = { ...servers, linear: { url: "https://linear.example.com/mcp", _bridge: { passthrough: false } } };
+    await opened.reload();
+    expect(shown(opened, query("linear", true))).toEqual([[{ name: "linear" }]]);
   });
 });
 

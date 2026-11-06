@@ -1,7 +1,6 @@
-import { escapeControlCharacters, escapeMatching } from "./escape.js";
+import { escapeControlCharacters, escapeMatching, INVISIBLE_CHARACTERS } from "./escape.js";
 
 const MAX_METHOD_LABEL_LENGTH = 64;
-const INVISIBLE_CHARACTERS = /[\p{Cf}\p{Default_Ignorable_Code_Point}\u2800]/gu;
 const LONE_HIGH_SURROGATE_AT_END = /[\ud800-\udbff]$/;
 
 /** Escapes control and invisible characters (bidi, zero-width, variation selectors, fillers, tags) so the text prints as it reads. */

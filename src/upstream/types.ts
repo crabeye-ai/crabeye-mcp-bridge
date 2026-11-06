@@ -47,7 +47,8 @@ export interface UpstreamClient {
   /**
    * Upstream's `initialize.instructions` text, captured by the SDK Client when
    * the upstream completes its initialize handshake. `undefined` until
-   * connected, or when the upstream did not advertise instructions.
+   * connected, or when the upstream did not advertise instructions. Only
+   * clients that connect to the upstream themselves report it.
    */
   readonly instructions?: string;
 

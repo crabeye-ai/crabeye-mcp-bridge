@@ -149,15 +149,19 @@ export class PooledUpstream {
   }
 
   snapshot(): UpstreamSnapshot {
-    const { status, tools, instructions } = this._client;
+    const { status, tools } = this._client;
     const connected = status === "connected";
     return {
       name: this.name,
       status,
       ...(!connected && this._lastError !== undefined && { error: this._lastError }),
       tools: connected ? [...tools] : [],
-      ...(connected && instructions !== undefined && { instructions }),
     };
+  }
+
+  /** The server's own instructions, while it is connected. */
+  get instructions(): string | undefined {
+    return this._client.status === "connected" ? this._client.instructions : undefined;
   }
 
   callTool(params: { name: string; arguments?: Record<string, unknown> }, options: { signal: AbortSignal }): Promise<CallToolResult> {
@@ -252,7 +256,6 @@ export class PooledUpstream {
       previous === undefined ||
       previous.snapshot.status !== snapshot.status ||
       previous.snapshot.error !== snapshot.error ||
-      previous.snapshot.instructions !== snapshot.instructions ||
       previous.toolsText !== toolsText
     );
   }

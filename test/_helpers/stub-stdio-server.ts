@@ -12,6 +12,8 @@ export const MODERN_STUB_START_DELAY_ENV = "MODERN_STUB_START_DELAY_MS";
 export const STUB_METHOD_LOG_ENV = "STUB_METHOD_LOG";
 /** Makes the stub refuse every request but `initialize` until `notifications/initialized` arrives, as strict legacy servers do. */
 export const STUB_STRICT_ENV = "STUB_STRICT";
+/** The instructions the stub's `initialize` answer carries. */
+export const STUB_INSTRUCTIONS_ENV = "STUB_INSTRUCTIONS";
 
 export const STUB_STDIO_SERVER = `
 const reply = (id, body) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, ...body }) + "\\n");
@@ -88,7 +90,7 @@ const serve = () => onNewlineOnlyLines((line) => {
   if (process.env.${STUB_STRICT_ENV} && !initialized && msg.method !== "initialize" && msg.method !== "ping") {
     reply(msg.id, { error: { code: -32002, message: "Server not initialized" } });
   } else if (msg.method === "initialize") {
-    reply(msg.id, { result: { protocolVersion: msg.params.protocolVersion, serverInfo: { name: "stub", version: "0" }, capabilities: { tools: { listChanged: true } } } });
+    reply(msg.id, { result: { protocolVersion: msg.params.protocolVersion, serverInfo: { name: "stub", version: "0" }, capabilities: { tools: { listChanged: true } }, instructions: process.env.${STUB_INSTRUCTIONS_ENV} } });
   } else if (msg.method === "server/discover" && process.env.${STUB_IGNORE_DISCOVER_ENV}) {
     return;
   } else if (msg.method === "server/discover" && process.env.${STUB_EXIT_ON_DISCOVER_ENV}) {

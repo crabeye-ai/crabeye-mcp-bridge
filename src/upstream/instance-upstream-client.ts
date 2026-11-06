@@ -17,9 +17,9 @@ export interface InstanceUpstreamClientOptions {
 }
 
 /**
- * Stands in for an upstream the daemon connects: mirrors the state, tools
- * and instructions the daemon reports and sends calls through the bridge's
- * instance link. The daemon reconnects and health-checks the upstream.
+ * Stands in for an upstream the daemon connects: mirrors the state and
+ * tools the daemon reports and sends calls through the bridge's instance
+ * link. The daemon reconnects and health-checks the upstream.
  */
 export class InstanceUpstreamClient implements UpstreamClient {
   readonly name: string;
@@ -30,7 +30,6 @@ export class InstanceUpstreamClient implements UpstreamClient {
   private _status: ConnectionStatus = "disconnected";
   private _tools: Tool[] = [];
   private _toolsText = canonicalize([]);
-  private _instructions: string | undefined;
   private _lastError: Error | undefined;
   private _closed = false;
 
@@ -51,10 +50,6 @@ export class InstanceUpstreamClient implements UpstreamClient {
 
   get tools(): ReadonlyArray<Tool> {
     return this._tools;
-  }
-
-  get instructions(): string | undefined {
-    return this._instructions;
   }
 
   /** Settles once the daemon has tried the upstream: resolves when connected, rejects with the reason otherwise. */
@@ -150,7 +145,6 @@ export class InstanceUpstreamClient implements UpstreamClient {
     const becameConnected = connected && this._status !== "connected";
     const toolsText = connected ? canonicalize(snapshot.tools) : this._toolsText;
     const toolsChanged = toolsText !== this._toolsText;
-    this._instructions = snapshot.instructions;
     if (toolsChanged) {
       this._tools = snapshot.tools;
       this._toolsText = toolsText;

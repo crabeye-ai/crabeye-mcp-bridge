@@ -12,6 +12,7 @@ const MAX_CALL_ID_BYTES = 64;
 const MAX_UPSTREAM_NAME_BYTES = 256;
 const MAX_TOOL_NAME_BYTES = 1024;
 const SEARCH_NUMBERS = ["limit", "offset"] as const;
+const SEARCH_FLAGS = ["expand_tools", "include_instructions"] as const;
 
 /** The protocol version an ATTACH says its bridge speaks, read before the rest, whose shape depends on it. */
 export function bridgeProtocolVersionOf(raw: unknown): number | null {
@@ -66,9 +67,11 @@ function parseSearchQuery(raw: unknown): SearchQuery | null {
     if (typeof value !== "number" || !Number.isFinite(value)) return null;
     query[field] = value;
   }
-  if (raw.expand_tools !== undefined) {
-    if (typeof raw.expand_tools !== "boolean") return null;
-    query.expand_tools = raw.expand_tools;
+  for (const field of SEARCH_FLAGS) {
+    const value = raw[field];
+    if (value === undefined) continue;
+    if (typeof value !== "boolean") return null;
+    query[field] = value;
   }
   return query;
 }

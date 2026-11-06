@@ -68,11 +68,6 @@ export class ToolIndex {
     this._search.refresh();
   }
 
-  /** The tools of server `name`, under their namespaced names. */
-  tools(name: string): Tool[] {
-    return this._registry.listRegisteredTools().filter(({ source }) => source === name).map(({ tool }) => tool);
-  }
-
   /** Searches the tools; a query whose provider filter matches a server that isn't connected also gets that server's status and why. */
   search(params: SearchToolsParams): SearchToolsResponse {
     const { results } = this._search.search(params);
@@ -101,9 +96,14 @@ export class ToolIndex {
         providers[at] = { ...providers[at]!, ...note };
         continue;
       }
-      providers.push({ name, ...(category !== undefined && { category }), tool_count: hasTools ? this.tools(name).length : 0, tools: [], ...note });
+      providers.push({ name, ...(category !== undefined && { category }), tool_count: hasTools ? this._tools(name).length : 0, tools: [], ...note });
     }
     return { ...result, providers };
+  }
+
+  /** The tools of server `name`, under their namespaced names. */
+  private _tools(name: string): Tool[] {
+    return this._registry.listRegisteredTools().filter(({ source }) => source === name).map(({ tool }) => tool);
   }
 
   private _setTools(name: string, tools: ReadonlyArray<Tool>): void {

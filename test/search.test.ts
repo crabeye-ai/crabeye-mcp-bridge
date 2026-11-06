@@ -619,6 +619,15 @@ describe("ToolSearchService", () => {
   });
 });
 
+describe("searchToolDefinition", () => {
+  it("lets a query ask for a server's instructions, and says when to", () => {
+    const query = (searchToolDefinition.inputSchema.properties!.queries as { items: { properties: Record<string, unknown> } }).items.properties;
+
+    expect(query.include_instructions).toEqual({ type: "boolean", description: expect.stringContaining("has_instructions: true") });
+    expect(searchToolDefinition.description).toContain("When a provider has has_instructions: true, search it again with include_instructions: true");
+  });
+});
+
 // --- BridgeServer integration tests ---
 
 describe("BridgeServer search_tools and run_tool", () => {
@@ -852,6 +861,7 @@ describe("BridgeServer search_tools and run_tool", () => {
       ["search_tools without queries", SEARCH_TOOL_NAME, {}, "data must have required property 'queries'"],
       ["search_tools with queries that are not an array", SEARCH_TOOL_NAME, { queries: "linear" }, "data/queries must be array"],
       ["search_tools with a limit that is not a number", SEARCH_TOOL_NAME, { queries: [{ tool: "create", limit: "10" }] }, "data/queries/0/limit must be number"],
+      ["search_tools with include_instructions that is not a boolean", SEARCH_TOOL_NAME, { queries: [{ provider: "linear", include_instructions: "yes" }] }, "data/queries/0/include_instructions must be boolean"],
       ["run_tool without a name", RUN_TOOL_NAME, {}, "data must have required property 'name'"],
       ["run_tool with a name that is not a string", RUN_TOOL_NAME, { name: 5 }, "data/name must be string"],
       ["run_tool with arguments that are not an object", RUN_TOOL_NAME, { name: "linear__tool", arguments: '{"title":"Bug"}' }, "data/arguments must be object"],

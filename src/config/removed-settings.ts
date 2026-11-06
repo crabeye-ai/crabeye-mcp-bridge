@@ -55,16 +55,27 @@ function inServers(config: BridgeConfig, valueOf: (server: ServerConfig) => unkn
     .map(([name]) => `server "${name}"`);
 }
 
+/** The servers whose `passthrough` is `"tools"` or `"full"`, which now mean `true`. */
+export function findToolPassthroughLevels(config: BridgeConfig): string[] {
+  return inServers(config, (server) => (server._bridge?.passthrough === "tools" || server._bridge?.passthrough === "full" ? true : undefined));
+}
+
 export function findRemovedSettings(config: BridgeConfig): RemovedSettingInUse[] {
   return REMOVED_SETTINGS.map(({ setting, locate, reason }) => ({ setting, locations: locate(config), reason })).filter(
     ({ locations }) => locations.length > 0,
   );
 }
 
-/** Logs the settings in `config` that have no effect: removed settings, and servers that would launch the bridge itself. */
+/** Logs the settings in `config` that have no effect or changed meaning, and servers that would launch the bridge itself. */
 export function warnAboutConfig(config: BridgeConfig, logger: Logger): void {
   for (const { setting, locations, reason } of findRemovedSettings(config)) {
     logger.warn(`${setting} no longer has any effect and is ignored (${locations.join(", ")}); ${reason}`, {
+      component: "config",
+    });
+  }
+  const toolLevels = findToolPassthroughLevels(config);
+  if (toolLevels.length > 0) {
+    logger.warn(`passthrough "tools" and "full" now mean true (${toolLevels.join(", ")}); a search already returns a server's tools`, {
       component: "config",
     });
   }

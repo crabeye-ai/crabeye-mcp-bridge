@@ -53,7 +53,7 @@ describe("httpUpstreamIdentity", () => {
   it("ignores settings that only tune timing or the bridge's view", () => {
     const tuned = http({
       ...base,
-      _bridge: { reconnect: { reconnectBaseDelay: 500 }, category: "work", toolPolicy: "never", passthrough: "full" },
+      _bridge: { reconnect: { reconnectBaseDelay: 500 }, category: "work", toolPolicy: "never", passthrough: true },
     });
     expect(httpUpstreamKey("svc", tuned, masterKeyEnv("k"))).toBe(httpUpstreamKey("svc", base, masterKeyEnv("k")));
   });

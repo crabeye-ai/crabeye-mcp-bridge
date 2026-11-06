@@ -128,9 +128,9 @@ describe("daemon protocol", () => {
   });
 
   describe("versions", () => {
-    it("speaks protocol 7, and needs daemons and bridges that do", () => {
-      expect(PROTOCOL_VERSION).toBe(7);
-      expect([MIN_DAEMON_PROTOCOL_VERSION, MIN_BRIDGE_PROTOCOL_VERSION]).toEqual([7, 7]);
+    it("speaks protocol 8, and needs daemons and bridges that do", () => {
+      expect(PROTOCOL_VERSION).toBe(8);
+      expect([MIN_DAEMON_PROTOCOL_VERSION, MIN_BRIDGE_PROTOCOL_VERSION]).toEqual([8, 8]);
     });
   });
 
@@ -149,7 +149,7 @@ describe("daemon protocol", () => {
   });
 
   it("reports only the upstream states bridges of this protocol version know; another one needs a protocol version bump", () => {
-    expect(PROTOCOL_VERSION).toBe(7);
+    expect(PROTOCOL_VERSION).toBe(8);
     expect(CONNECTION_STATUSES).toEqual(["disconnected", "connecting", "connected", "auth_required"]);
   });
 });

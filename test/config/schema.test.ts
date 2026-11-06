@@ -4,8 +4,10 @@ import {
   ServerOAuthConfigSchema,
   DaemonConfigSchema,
   GlobalBridgeConfigSchema,
-  PassthroughLevelSchema,
+  PassthroughSchema,
   RateLimitConfigOrDisabledSchema,
+  isPassthroughOn,
+  type ServerConfig,
 } from "../../src/config/schema.js";
 
 describe("config — removed sharing settings", () => {
@@ -107,31 +109,34 @@ describe("rate limit — disabled opt-out (#183)", () => {
   });
 });
 
-describe("ServerBridgeConfigSchema — passthrough (AIT-183)", () => {
-  it("accepts every documented passthrough level", () => {
-    expect(PassthroughLevelSchema.parse(false)).toBe(false);
-    expect(PassthroughLevelSchema.parse("instructions")).toBe("instructions");
-    expect(PassthroughLevelSchema.parse("tools")).toBe("tools");
-    expect(PassthroughLevelSchema.parse("full")).toBe("full");
+describe("ServerBridgeConfigSchema — passthrough", () => {
+  it("accepts true and false, and the levels it used to take", () => {
+    for (const value of [true, false, "instructions", "tools", "full"]) {
+      expect(ServerBridgeConfigSchema.parse({ passthrough: value }).passthrough).toBe(value);
+    }
   });
 
-  it("rejects literal true so callers must pick a level explicitly", () => {
-    expect(() => PassthroughLevelSchema.parse(true)).toThrow();
-    expect(() =>
-      ServerBridgeConfigSchema.parse({ passthrough: true }),
-    ).toThrow();
+  it("rejects any other value", () => {
+    for (const value of ["partial", "true", 1, null]) {
+      expect(() => PassthroughSchema.parse(value)).toThrow();
+      expect(() => ServerBridgeConfigSchema.parse({ passthrough: value })).toThrow();
+    }
   });
 
-  it("rejects unknown string levels", () => {
-    expect(() => PassthroughLevelSchema.parse("partial")).toThrow();
-    expect(() =>
-      ServerBridgeConfigSchema.parse({ passthrough: "everything" }),
-    ).toThrow();
+  it.each([
+    [undefined, false],
+    [false, false],
+    [true, true],
+    ["instructions", true],
+    ["tools", true],
+    ["full", true],
+  ])("treats passthrough %j as on: %j", (passthrough, on) => {
+    expect(isPassthroughOn({ command: "node", ...(passthrough !== undefined && { _bridge: { passthrough } }) } as ServerConfig)).toBe(on);
   });
 
   it("passthroughMaxBytes accepts positive integers", () => {
     const cfg = ServerBridgeConfigSchema.parse({
-      passthrough: "tools",
+      passthrough: true,
       passthroughMaxBytes: 1024,
     });
     expect(cfg.passthroughMaxBytes).toBe(1024);

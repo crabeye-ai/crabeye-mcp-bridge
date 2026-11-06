@@ -92,14 +92,16 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     await vi.waitFor(() => expect(server.cancellations()).toBe(1));
   });
 
-  it.each(["modern", "legacy"] as const)("passes the %s server's instructions to every client", async (era) => {
+  it.each(["modern", "legacy"] as const)("gives every client's search the %s server's instructions", async (era) => {
     await daemon();
     const server = await upstream({ era, instructions: "Use echo to repeat things." });
-    const config = await writeJson("bridge.json", { mcpServers: { svc: { url: server.url } } });
+    const config = await writeJson("bridge.json", { mcpServers: { svc: { url: server.url, _bridge: { passthrough: true } } } });
     const [a, b] = [await bridge(config), await bridge(config)];
 
-    expect(a.client("svc").instructions).toBe("Use echo to repeat things.");
-    expect(b.client("svc").instructions).toBe("Use echo to repeat things.");
+    for (const client of [a, b]) {
+      const { results } = await client.search({ queries: [{ provider: "svc", include_instructions: true }] });
+      expect(results[0]!.providers[0]!.instructions).toBe("Use echo to repeat things.");
+    }
   });
 
   it("serves a server added to a client config file in merged mode to every attached client", async () => {

@@ -27,7 +27,7 @@ export type PoolSpec = {
 } & ({ kind: "stdio"; stdio: StdioConnectionSpec } | { kind: "http"; http: HttpConnectionSpec });
 
 /** What an owner may do with a connection it holds a lease on. */
-export type SharedUpstream = Pick<PooledUpstream, "status" | "snapshot" | "callTool" | "retry" | "retryIfPaused" | "subscribe">;
+export type SharedUpstream = Pick<PooledUpstream, "status" | "snapshot" | "instructions" | "callTool" | "retry" | "retryIfPaused" | "subscribe">;
 
 export interface Lease {
   readonly upstream: SharedUpstream;

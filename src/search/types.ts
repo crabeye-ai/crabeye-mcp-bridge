@@ -3,6 +3,7 @@ export interface SearchQuery {
   provider?: string;
   category?: string;
   expand_tools?: boolean;
+  include_instructions?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -36,6 +37,10 @@ export interface ProviderResult {
   status?: ProviderStatus;
   /** What the status means for the model, set with `status`. */
   message?: string;
+  /** The server's own instructions, on its first entry under a query that asked for them, when the server has passthrough on. */
+  instructions?: string;
+  /** Set when the server shares instructions this search hasn't returned yet and the query didn't ask for them. */
+  has_instructions?: true;
 }
 
 export interface QueryResult {

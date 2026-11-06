@@ -124,11 +124,12 @@ describe("UpstreamPool with HTTP connections", () => {
     client.tools = [tool("search")];
     finish();
 
-    expect(await retried).toEqual({ name: "svc", status: "connected", tools: [tool("search")], instructions: "use it well" });
+    expect(await retried).toEqual({ name: "svc", status: "connected", tools: [tool("search")] });
+    expect(lease.upstream.instructions).toBe("use it well");
     expect(watcher.snapshots).toEqual([
       { name: "svc", status: "disconnected", error: "boom", tools: [] },
       { name: "svc", status: "connecting", error: "boom", tools: [] },
-      { name: "svc", status: "connected", tools: [tool("search")], instructions: "use it well" },
+      { name: "svc", status: "connected", tools: [tool("search")] },
     ]);
   });
 
@@ -153,11 +154,14 @@ describe("UpstreamPool with HTTP connections", () => {
     expect(lease.upstream.snapshot().tools).toEqual([]);
   });
 
-  it("doesn't report instructions while not connected", () => {
+  it("gives the server's instructions only while it is connected, and never in a snapshot", () => {
     const lease = pool.acquire(spec());
-    created[0]!.instructions = "stale";
+    created[0]!.instructions = "use it well";
+    expect(lease.upstream.instructions).toBe("use it well");
+    expect(lease.upstream.snapshot()).toEqual({ name: "svc", status: "connected", tools: [] });
+
     created[0]!.setStatus("disconnected");
-    expect(lease.upstream.snapshot()).not.toHaveProperty("instructions");
+    expect(lease.upstream.instructions).toBeUndefined();
   });
 
   it("passes the connection's warnings and errors to listeners, without the server name, and logs everything in the daemon log", () => {

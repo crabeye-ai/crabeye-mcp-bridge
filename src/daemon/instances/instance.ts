@@ -2,13 +2,13 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 import { ConfigWatcher } from "../../config/config-watcher.js";
 import { ConfigError, describeConfigError } from "../../config/loader.js";
 import { leftOutWarning, type SkippedFile } from "../../config/merged-loader.js";
-import { findRemovedSettings, warnAboutConfig } from "../../config/removed-settings.js";
-import { findSelfReferences, isHttpServer, resolveUpstreams, serverBridgeConfigs, type BridgeConfig, type RateLimitConfig, type ServerConfig } from "../../config/schema.js";
+import { findRemovedSettings, findToolPassthroughLevels, warnAboutConfig } from "../../config/removed-settings.js";
+import { findSelfReferences, isHttpServer, isPassthroughOn, resolveUpstreams, serverBridgeConfigs, type BridgeConfig, type RateLimitConfig, type ServerConfig } from "../../config/schema.js";
 import type { CredentialStore } from "../../credentials/credential-store.js";
 import type { Logger } from "../../logging/index.js";
 import { PolicyEngine } from "../../policy/index.js";
 import type { SearchToolsParams, SearchToolsResponse } from "../../search/index.js";
-import { renderPassthrough } from "../../server/passthrough.js";
+import { passthroughInstructions, withInstructions } from "../../server/passthrough.js";
 import { listedStatus, renderServerList } from "../../server/server-list.js";
 import { defaultLimitReachedMessage, resolveRateLimitConfig } from "../../server/rate-limit-resolution.js";
 import { awaitConnectedClient } from "../../server/upstream-wait.js";
@@ -84,6 +84,8 @@ interface Hosted {
   lease: Lease;
   view: HostedView;
   unsubscribe: () => void;
+  /** The server's instructions as searches return them, with the raw text and cap they were made from. */
+  instructions?: { raw: string; maxBytes: number | undefined; text: string | undefined };
 }
 
 /**
@@ -197,7 +199,8 @@ export class Instance {
   }
 
   search(params: SearchToolsParams): SearchToolsResponse {
-    return this._index.search(params);
+    const servers = resolveUpstreams(this._config);
+    return withInstructions(this._index.search(params), params.queries, (name) => this._instructionsOf(name, servers));
   }
 
   /** The settings the config gives the instance's bridges. */
@@ -208,16 +211,6 @@ export class Instance {
   /** What bridges add to the end of the `search_tools` description: each of its servers, in config order, with its category and the status of each that isn't connected. */
   description(): string {
     return this._description;
-  }
-
-  /** The `_bridge.passthrough` blocks for a bridge's instructions, from what the servers have reported so far. */
-  passthrough(): string {
-    return renderPassthrough({
-      upstreams: resolveUpstreams(this._config),
-      getInstructions: (name) => this._hosted.get(name)?.lease.upstream.snapshot().instructions,
-      getTools: (name) => this._index.tools(name),
-      resolvePolicy: (name, toolName) => this._policy.resolvePolicy(name, toolName),
-    });
   }
 
   /**
@@ -453,6 +446,19 @@ export class Instance {
     this._broadcast({ method: "DESCRIPTION", params: { text } });
   }
 
+  private _instructionsOf(name: string, servers: Record<string, ServerConfig>): string | undefined {
+    const config = Object.hasOwn(servers, name) ? servers[name]! : undefined;
+    if (config === undefined || !isPassthroughOn(config)) return undefined;
+    const hosted = this._hosted.get(name);
+    const raw = hosted?.lease.upstream.instructions;
+    if (hosted === undefined || raw === undefined) return undefined;
+    const maxBytes = config._bridge?.passthroughMaxBytes;
+    if (hosted.instructions?.raw !== raw || hosted.instructions.maxBytes !== maxBytes) {
+      hosted.instructions = { raw, maxBytes, text: passthroughInstructions(raw, maxBytes) };
+    }
+    return hosted.instructions.text;
+  }
+
   private _defaultLimitReached(name: string, config: RateLimitConfig): void {
     const message = defaultLimitReachedMessage(name, config);
     this._log.info(message, { server: name });
@@ -475,5 +481,5 @@ function release(hosted: Hosted): void {
 
 /** What `warnAboutConfig` would say about `config`, to warn again only when it changes. */
 function configWarnings(config: BridgeConfig): string {
-  return JSON.stringify([findRemovedSettings(config), findSelfReferences(config)]);
+  return JSON.stringify([findRemovedSettings(config), findToolPassthroughLevels(config), findSelfReferences(config)]);
 }
