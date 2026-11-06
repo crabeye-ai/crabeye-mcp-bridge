@@ -2,12 +2,38 @@
 
 When the AI assistant starts its session, every configured upstream server is started or connected and the bridge discovers its tools. An assistant that only checks which protocol version the bridge speaks, then disconnects, starts none of them. A per-user [manager](stdio-manager.md) process shared by every bridge starts every STDIO server and connects every upstream, once for all bridges. A bridge starts the manager as soon as its config has an upstream, or else when its client starts a session. Each bridge does little itself: it checks its config when it starts and reports a config that doesn't load, then leaves the servers, search, rate limits, tool policy and config edits to the manager. What it keeps is what concerns its own client: answering it, asking it to approve calls the tool policy marks `prompt`, cancelling calls it cancels, and `--stats`. Each tool is namespaced by server name (e.g. `linear__create_issue`, `github__list_repos`) so tools from different servers never collide.
 
-The bridge exposes exactly two tools to the AI assistant, and that list never changes during a session:
+The bridge exposes exactly two tools to the AI assistant, and they stay the same two for the whole session:
 
 - **`search_tools`** — Fuzzy-search across all discovered tools by name, description, provider, or category.
 - **`run_tool`** — Run any discovered tool by its namespaced name (e.g. `linear__create_issue`).
 
 The AI assistant calls `search_tools` when it detects a relevant intent, then runs the tool it found with `run_tool`. When a search returns tools, each comes with its full input schema. Upstream tools can only be run through `run_tool`: calling one by its own name fails as an unknown tool.
+
+### Servers and their status
+
+The end of the `search_tools` description lists every server in the config, with its category, so the assistant knows what it can search for. A server that isn't connected is listed with its status:
+
+```
+Servers (search by provider name):
+- linear [issues]
+- github: starting
+- notion: needs authorization; the user runs: crabeye-mcp-bridge auth notion, or updates its credentials if it doesn't use OAuth
+- jira: not connected
+```
+
+A server whose connection dropped is listed as starting while it reconnects. One that failed to connect stays listed as not connected while it tries again, so a server that keeps failing doesn't change the list each time.
+
+Before the bridge has heard from the [manager](stdio-manager.md), it lists the servers in its own config; afterwards, when it can't reach the manager, the servers the manager last reported. Either way it leaves out their categories, and lists them as not connected while the manager can't be reached, or as starting while the manager starts or is being replaced.
+
+The server names and categories are part of what the assistant sees on every request, as tool descriptions are.
+
+Whenever the list changes (a server starts, connects, stops, needs authorization or gets it, or a config edit adds or removes a server or changes a category), the bridge tells the assistant its tool list changed, and the assistant reads the description again. Changes that come close together are announced once, at most once a second. A change that is undone within that second isn't announced.
+
+A server's tools are searched while it is connected, and while it reconnects after its connection dropped. Once an attempt to connect fails, or it needs authorization, its tools leave the search until it connects again. A search whose `provider` matches a server that isn't connected returns that server with a `status` (`starting`, `not_connected` or `needs_authorization`) and a `message` saying why: try again shortly (or, for a server reconnecting with its tools, that a call waits for it), the reason it couldn't connect, or the `crabeye-mcp-bridge auth <server>` command to run. Anything in the reason that looks like a credential, such as a bearer token or a `password=` value, is replaced with `[redacted]`. A query with a `category` gets only the servers in that category, and a query for a later page (an `offset` above 0) gets none.
+
+```json
+{ "name": "jira", "tool_count": 0, "tools": [], "status": "not_connected", "message": "\"jira\" is not connected: connect ECONNREFUSED 127.0.0.1:8080" }
+```
 
 The bridge tracks how many tokens it saves compared to exposing all upstream tool definitions directly. Token savings are always logged to stderr after each search. To also include them in `search_tools` responses, pass `--stats`:
 

@@ -20,7 +20,7 @@ Until 3.0, the bridge speaks both the 2026-07-28 protocol and the earlier ones, 
 
 ### Only `search_tools` and `run_tool`
 
-The bridge always lists exactly two tools, `search_tools` and `run_tool`, and its tool list never changes during a session. Searching no longer adds the tools it finds to the assistant's tool list. Each result includes the tool's full input schema, and tools from servers that connect later are still found by search.
+The bridge always lists exactly two tools, `search_tools` and `run_tool`. Searching no longer adds the tools it finds to the assistant's tool list. The end of the `search_tools` description lists the servers and their status, and the bridge tells the assistant when that list changes (see [Servers and their status](how-it-works.md#servers-and-their-status)). Each result includes the tool's full input schema, and tools from servers that connect later are still found by search.
 
 * Upstream tools run only through `run_tool`. Calling one by its own name, such as `linear__create_issue`, fails as an unknown tool, and nothing is sent to the server.
 * Your AI client sees only the two bridge tools, so permission rules it keeps per tool can't tell upstream tools apart. Use [tool policies](policies.md) (`"prompt"`, `"never"`) to control individual tools.

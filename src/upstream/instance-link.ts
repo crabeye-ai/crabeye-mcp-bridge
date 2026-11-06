@@ -22,15 +22,14 @@ import {
   type InstanceSource,
   type SearchToolsRequest,
   type SearchToolsResult,
-  type SettingsParams,
   type UpstreamLogParams,
-  type UpstreamRemovedParams,
   type UpstreamSnapshot,
 } from "../daemon/protocol.js";
 import { createNoopLogger, type Logger, type LogLevel } from "../logging/index.js";
 import { DEFAULT_RECONNECT_BASE_DELAY_MS, DEFAULT_RECONNECT_MAX_DELAY_MS } from "./base-client.js";
 import { ApprovalRequiredError, CallRefusedError } from "./call-errors.js";
-import { isConnectionStatus, type CallToolOptions } from "./types.js";
+import { isDescription, isLogLevel, isRemoval, isSearchResult, isSettings, logOf, snapshotOf } from "./instance-frames.js";
+import type { CallToolOptions } from "./types.js";
 import type { UpstreamReconnectInputs } from "./upstream-hash.js";
 
 const NO_TIMEOUT = { timeoutMs: 0 };
@@ -87,14 +86,16 @@ export class InstanceLink {
   private readonly _ensureDaemon: (opts?: EnsureAttemptOptions) => Promise<void>;
   private readonly _snapshots = new Map<string, UpstreamSnapshot>();
   private readonly _namesListeners = new Set<() => void>();
+  private readonly _stateListeners = new Set<() => void>();
   private readonly _views = new Map<string, Set<UpstreamView>>();
   private readonly _pendingCalls = new Set<(err: Error) => void>();
   private _supervisor: DaemonLivenessSupervisor | null = null;
   private _attaching: Promise<void> | null = null;
   private _respawning: Deferred | null = null;
   private _attached = false;
+  private _description: string | undefined;
   /** What the instance sent while an attach was in flight, which wins over the attach reply. */
-  private _heardWhileAttaching: { snapshots: Set<string>; settings: boolean } | null = null;
+  private _heardWhileAttaching: { snapshots: Set<string>; settings: boolean; description: boolean } | null = null;
   private _closed = false;
   private _failures = 0;
   private _lastFailure: { at: number; error: Error } | null = null;
@@ -110,6 +111,22 @@ export class InstanceLink {
 
   get isAttached(): boolean {
     return this._attached;
+  }
+
+  /** The last attempt to attach failed, and the link hasn't attached since. */
+  get isDown(): boolean {
+    return !this._attached && this._respawning === null && this._lastFailure !== null;
+  }
+
+  /** What the instance last said to add to the `search_tools` description; undefined until the link first attaches. */
+  description(): string | undefined {
+    return this._description;
+  }
+
+  /** Fires when the description changes, and when the link attaches, is interrupted or goes down; returns an unsubscribe. */
+  onStateChanged(listener: () => void): () => void {
+    this._stateListeners.add(listener);
+    return () => this._stateListeners.delete(listener);
   }
 
   snapshot(name: string): UpstreamSnapshot | undefined {
@@ -287,7 +304,7 @@ export class InstanceLink {
       env: this._opts.env,
       childEnv: this._opts.childEnv,
     };
-    const heard = { snapshots: new Set<string>(), settings: false };
+    const heard = { snapshots: new Set<string>(), settings: false, description: false };
     this._heardWhileAttaching = heard;
     let result: AttachResult;
     try {
@@ -301,11 +318,13 @@ export class InstanceLink {
     this._failures = 0;
     this._lastFailure = null;
     if (!heard.settings && isLogLevel(result.logLevel)) this._opts.onLogLevel?.(result.logLevel);
+    if (!heard.description && isDescription(result.description)) this._description = result.description.text;
     for (const name of new Set([...this._snapshots.keys(), ...this._views.keys()])) {
       if (!hosted.has(name)) this._onRemoved(name);
     }
     for (const snapshot of this._snapshots.values()) this._notifySnapshot(snapshot);
     this._notifyNamesChanged();
+    this._notifyStateChanged();
   }
 
   private async _attachAgain(supervisor: DaemonLivenessSupervisor): Promise<void> {
@@ -336,6 +355,10 @@ export class InstanceLink {
     } else if (method === "SETTINGS" && isSettings(params)) {
       if (this._heardWhileAttaching !== null) this._heardWhileAttaching.settings = true;
       this._opts.onLogLevel?.(params.logLevel);
+    } else if (method === "DESCRIPTION" && isDescription(params)) {
+      if (this._heardWhileAttaching !== null) this._heardWhileAttaching.description = true;
+      this._description = params.text;
+      this._notifyStateChanged();
     }
   }
 
@@ -355,6 +378,10 @@ export class InstanceLink {
     for (const listener of [...this._namesListeners]) listener();
   }
 
+  private _notifyStateChanged(): void {
+    for (const listener of [...this._stateListeners]) listener();
+  }
+
   private _onRemoved(name: string): void {
     if (this._snapshots.delete(name)) this._notifyNamesChanged();
     for (const view of [...(this._views.get(name) ?? [])]) view.onRemoved();
@@ -365,6 +392,7 @@ export class InstanceLink {
     this._respawning ??= deferred();
     this._failPendingCalls();
     this._eachView((view) => view.onInterrupted());
+    this._notifyStateChanged();
   }
 
   private _onDown(error: Error): void {
@@ -373,6 +401,7 @@ export class InstanceLink {
     this._failPendingCalls();
     this._lastFailure = { at: Date.now(), error };
     this._eachView((view) => view.onDown(error));
+    this._notifyStateChanged();
     this._scheduleAttach();
   }
 
@@ -429,46 +458,12 @@ function deferred(): Deferred {
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
-/** The snapshot in `value`, or null when it isn't one; a status this bridge doesn't know reads as disconnected. */
-function snapshotOf(value: unknown): UpstreamSnapshot | null {
-  if (typeof value !== "object" || value === null) return null;
-  const { name, status, tools } = value as { name?: unknown; status?: unknown; tools?: unknown };
-  if (typeof name !== "string" || typeof status !== "string" || !Array.isArray(tools)) return null;
-  if (isConnectionStatus(status)) return value as UpstreamSnapshot;
-  return { name, status: "disconnected", error: `the manager reported a status this bridge doesn't know: ${status}`, tools: [] };
-}
-
-function isRemoval(value: unknown): value is UpstreamRemovedParams {
-  return typeof value === "object" && value !== null && typeof (value as Partial<UpstreamRemovedParams>).upstream === "string";
-}
-
-/** The log line in `value`, or null when it isn't one; a level this bridge doesn't know logs at debug. */
-function logOf(value: unknown): UpstreamLogParams | null {
-  if (typeof value !== "object" || value === null) return null;
-  const { upstream, level, message, stderr } = value as Partial<Record<keyof UpstreamLogParams, unknown>>;
-  if (stderr !== undefined && !(Array.isArray(stderr) && stderr.every((line) => typeof line === "string"))) return null;
-  if ((upstream !== undefined && typeof upstream !== "string") || typeof message !== "string") return null;
-  return { ...(value as UpstreamLogParams), level: isLogLevel(level) ? level : "debug" };
-}
-
 /** A call the manager refused comes back as the refusal, for the bridge to pass on as is, and one that needs approval as the question to ask. */
 function callError(err: unknown): Error {
   if (!(err instanceof DaemonRpcError)) return toError(err);
   if (err.code === ERROR_CODE_CALL_REFUSED) return new CallRefusedError(err.message);
   if (err.code === ERROR_CODE_APPROVAL_REQUIRED) return new ApprovalRequiredError(err.message);
   return err;
-}
-
-function isSettings(value: unknown): value is SettingsParams {
-  return typeof value === "object" && value !== null && isLogLevel((value as { logLevel?: unknown }).logLevel);
-}
-
-function isLogLevel(value: unknown): value is LogLevel {
-  return value === "debug" || value === "info" || value === "warn" || value === "error";
-}
-
-function isSearchResult(value: unknown): value is SearchToolsResult {
-  return typeof value === "object" && value !== null && Array.isArray((value as { results?: unknown }).results);
 }
 
 function toError(err: unknown): Error {

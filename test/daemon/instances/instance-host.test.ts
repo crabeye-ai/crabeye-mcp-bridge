@@ -102,7 +102,7 @@ describe("InstanceHost", () => {
     it("sends a snapshot of each server, then answers with their names", async () => {
       const channel = fakeChannel();
 
-      expect(await attach(channel)).toEqual({ id: "a1", result: { upstreams: ["svc"], logLevel: "info" } });
+      expect(await attach(channel)).toEqual({ id: "a1", result: { upstreams: ["svc"], logLevel: "info", description: { text: expect.stringContaining("\n- svc") } } });
       expect(channel.sent).toEqual([
         { method: "UPSTREAM", params: { name: "svc", status: "connected", tools: [tool("svc_tool")] } },
       ]);
@@ -171,7 +171,7 @@ describe("InstanceHost", () => {
       expect(onIdle).toHaveBeenCalledTimes(1);
 
       configs.set(fileSource.path, { mcpServers: {} });
-      expect(await attach(fakeChannel())).toEqual({ id: "a1", result: { upstreams: [], logLevel: "info" } });
+      expect(await attach(fakeChannel())).toEqual({ id: "a1", result: { upstreams: [], logLevel: "info", description: { text: "" } } });
       expect(loads).toBe(2);
     });
 
@@ -195,7 +195,7 @@ describe("InstanceHost", () => {
       await attach(first);
       configs.set(fileSource.path, { mcpServers: { svc: { url: "https://svc.example.com/mcp" }, fresh: { url: "https://fresh.example.com/mcp" } } });
 
-      expect(await attach(fakeChannel())).toEqual({ id: "a1", result: { upstreams: ["svc", "fresh"], logLevel: "info" } });
+      expect(await attach(fakeChannel())).toEqual({ id: "a1", result: { upstreams: ["svc", "fresh"], logLevel: "info", description: { text: expect.stringMatching(/\n- svc[^\n]*\n- fresh/) } } });
       expect(loads).toBe(2);
       expect(first.sent).toContainEqual({ method: "UPSTREAM", params: expect.objectContaining({ name: "fresh" }) });
     });
@@ -249,7 +249,7 @@ describe("InstanceHost", () => {
       await vi.advanceTimersByTimeAsync(500);
       open();
 
-      expect((await attaching).result).toEqual({ upstreams: ["svc"], logLevel: "info" });
+      expect((await attaching).result).toEqual({ upstreams: ["svc"], logLevel: "info", description: { text: expect.stringContaining("\n- svc") } });
       expect(host.statusInstances()).toEqual([{ source: fileSource, bridges: 1, upstreams: ["svc"] }]);
       expect(clients[0]!.closed).toBe(false);
     });
@@ -285,7 +285,7 @@ describe("InstanceHost", () => {
       await vi.advanceTimersByTimeAsync(3_000);
       open();
 
-      expect((await attaching).result).toEqual({ upstreams: ["svc"], logLevel: "info" });
+      expect((await attaching).result).toEqual({ upstreams: ["svc"], logLevel: "info", description: { text: expect.stringContaining("\n- svc") } });
       expect(await host.handleRetry("r", { upstream: "svc" }, a)).toMatchObject({ result: { status: "connected" } });
       expect(clients[0]!.closed).toBe(false);
     });

@@ -13,6 +13,7 @@ import type { ConditionalChange, CredentialStore } from "../credentials/credenti
 import { isSendableHeaderValue } from "../credentials/resolve-templates.js";
 import type { OAuth2Credential } from "../credentials/types.js";
 import type { Logger } from "../logging/index.js";
+import { authCommand } from "../upstream/call-errors.js";
 import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "./client-secret.js";
 import { OAuthError, ReauthorizationRequiredError } from "./errors.js";
 import { RefreshTracker, type FetchLike } from "./refresh-tracker.js";
@@ -173,7 +174,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
           `Authorization server for "${this._opts.serverName}" is no longer ${recorded}. ` +
           `Refusing to send the configured client credentials to a different authorization server — ` +
           `if you did not expect this change, treat it as a possible mix-up attack and verify the server. ` +
-          `If the change is legitimate, run \`${APP_NAME} auth --remove ${this._opts.serverName}\` first.`,
+          `If the change is legitimate, run \`${authCommand(this._opts.serverName, { remove: true })}\` first.`,
         );
       }
       if (ctx?.issuer && !recorded && !this._retired) {
@@ -222,7 +223,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   private _runtimeRegistrationError(): Error {
     return new ReauthorizationRequiredError(
       `Dynamic client registration is not available at runtime for "${this._opts.serverName}" — ` +
-      `run \`${APP_NAME} auth ${this._opts.serverName}\` from a terminal to register and authorize.`,
+      `run \`${authCommand(this._opts.serverName)}\` from a terminal to register and authorize.`,
     );
   }
 
@@ -286,7 +287,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       if (!this._opts.runtime) return undefined;
       throw new ReauthorizationRequiredError(
         `The stored access token for "${this._opts.serverName}" can't be sent in a header. ` +
-        `Run: ${APP_NAME} auth ${this._opts.serverName}`,
+        `Run: ${authCommand(this._opts.serverName)}`,
       );
     }
 
@@ -370,7 +371,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       this._opts.logger?.warn(
         `refresh-on-401 circuit breaker tripped for "${this._opts.serverName}" — ` +
         `${this._recentSaves.length} refreshes within ${REFRESH_WINDOW_MS / 1000}s. ` +
-        `Run \`${APP_NAME} auth ${this._opts.serverName}\` to re-authorize.`,
+        `Run \`${authCommand(this._opts.serverName)}\` to re-authorize.`,
         { component: "oauth" },
       );
     }
@@ -390,7 +391,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       // circuit breaker tripped.
       throw new ReauthorizationRequiredError(
         `Authentication for "${this._opts.serverName}" expired. ` +
-        `Run: ${APP_NAME} auth ${this._opts.serverName}`,
+        `Run: ${authCommand(this._opts.serverName)}`,
       );
     }
     await this._opts.onRedirect(url);

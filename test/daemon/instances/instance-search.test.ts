@@ -77,16 +77,22 @@ describe("Searching an instance's tools", () => {
     expect(search(second, [{ tool: "tool", expand_tools: true }])).toEqual(search(first, [{ tool: "tool", expand_tools: true }]));
   });
 
-  it("finds a server's new tools once it reports them, keeps them while it is disconnected, and forgets them once it is removed", async () => {
+  it("finds a server's new tools once it reports them, says why once it is disconnected, finds them again once it is back, and forgets it once it is removed", async () => {
     const bridge = await attached();
     const linear = clients.get("linear")!;
+    const byProvider = () => search(bridge, [{ provider: "linear", expand_tools: true }]);
 
     linear.setTools([tool("create_issue")]);
+    expect(toolNames(byProvider())).toEqual(["linear__create_issue"]);
     linear.setStatus("disconnected", new Error("reset"));
-    expect(toolNames(search(bridge, [{ provider: "linear", expand_tools: true }]))).toEqual(["linear__create_issue"]);
+    expect(byProvider().results[0]!.providers).toEqual([
+      { name: "linear", category: "tracker", tool_count: 0, tools: [], status: "not_connected", message: '"linear" is not connected: reset' },
+    ]);
+    linear.setStatus("connected");
+    expect(toolNames(byProvider())).toEqual(["linear__create_issue"]);
 
     await reloadByCallingAMissingServer({ mcpServers: { docs: { url: "https://docs.example.com/mcp" } } });
-    expect(toolNames(search(bridge, [{ provider: "linear", expand_tools: true }]))).toEqual([]);
+    expect(byProvider().results[0]!.providers).toEqual([]);
   });
 
   it("follows a reload that changes a category or turns a tool off", async () => {

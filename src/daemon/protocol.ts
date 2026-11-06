@@ -8,8 +8,9 @@
  *   response:     { id, result | error }        reply to request
  *   notification: { method, params? }           no `id`, no reply expected
  *
- * Notification frames carry what needs no reply: upstream snapshots, logs
- * and settings to bridges, and cancellations to the daemon.
+ * Notification frames carry what needs no reply: upstream snapshots, logs,
+ * settings and the search description to bridges, and cancellations to the
+ * daemon.
  */
 
 import type { Tool } from "@modelcontextprotocol/client";
@@ -17,9 +18,9 @@ import type { LogLevel } from "../logging/index.js";
 import type { SearchToolsParams, SearchToolsResponse } from "../search/index.js";
 import type { ConnectionStatus } from "../upstream/types.js";
 
-export const PROTOCOL_VERSION = 6;
-export const MIN_BRIDGE_PROTOCOL_VERSION = 6;
-export const MIN_DAEMON_PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
+export const MIN_BRIDGE_PROTOCOL_VERSION = 7;
+export const MIN_DAEMON_PROTOCOL_VERSION = 7;
 
 // 16 MiB hard cap. Daemon ↔ bridge messages are small JSON; anything larger is
 // a protocol abuse and we want to fail fast rather than allocate.
@@ -58,7 +59,8 @@ export type DaemonMethod =
   | "UPSTREAM"
   | "UPSTREAM_REMOVED"
   | "LOG"
-  | "SETTINGS";
+  | "SETTINGS"
+  | "DESCRIPTION";
 
 export interface DaemonRequest {
   id: string;
@@ -126,6 +128,13 @@ export interface AttachResult {
   upstreams: string[];
   /** The log level the instance's config sets for its bridges. */
   logLevel: LogLevel;
+  /** What the bridge adds to the end of the `search_tools` description. */
+  description: DescriptionParams;
+}
+
+/** `DESCRIPTION.params`: what the bridge adds to the end of the `search_tools` description, sent whenever it changes. */
+export interface DescriptionParams {
+  text: string;
 }
 
 /** `SETTINGS.params`: what a reload changed in the settings the instance gives its bridges. */

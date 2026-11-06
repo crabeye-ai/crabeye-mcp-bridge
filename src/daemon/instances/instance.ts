@@ -9,11 +9,13 @@ import type { Logger } from "../../logging/index.js";
 import { PolicyEngine } from "../../policy/index.js";
 import type { SearchToolsParams, SearchToolsResponse } from "../../search/index.js";
 import { renderPassthrough } from "../../server/passthrough.js";
+import { listedStatus, renderServerList } from "../../server/server-list.js";
 import { defaultLimitReachedMessage, resolveRateLimitConfig } from "../../server/rate-limit-resolution.js";
 import { awaitConnectedClient } from "../../server/upstream-wait.js";
 import { ApprovalRequiredError, CallRefusedError } from "../../upstream/call-errors.js";
 import { resolveReconnectInputs } from "../../upstream/upstream-hash.js";
 import type {
+  DescriptionParams,
   InstanceSource,
   SettingsParams,
   StatusInstance,
@@ -52,7 +54,8 @@ export type InstanceNotification =
   | { method: "UPSTREAM"; params: UpstreamSnapshot }
   | { method: "UPSTREAM_REMOVED"; params: UpstreamRemovedParams }
   | { method: "LOG"; params: UpstreamLogParams }
-  | { method: "SETTINGS"; params: SettingsParams };
+  | { method: "SETTINGS"; params: SettingsParams }
+  | { method: "DESCRIPTION"; params: DescriptionParams };
 
 /** Where an instance sends what its bridges need to hear: one per attached socket. */
 export interface InstanceAttachment {
@@ -115,6 +118,9 @@ export class Instance {
   private _included = new Set<string>();
   private _applyFailed = false;
   private _closed = false;
+  /** The search description the bridges were last sent. */
+  private _description = "";
+  private _applying = false;
 
   private constructor(source: InstanceSource, { env, childEnv }: InstanceEnv, loaded: LoadedConfig, deps: InstanceDeps) {
     this.source = source;
@@ -197,6 +203,11 @@ export class Instance {
   /** The settings the config gives the instance's bridges. */
   settings(): SettingsParams {
     return { logLevel: this._config._bridge.logLevel };
+  }
+
+  /** What bridges add to the end of the `search_tools` description: each of its servers, in config order, with its category and the status of each that isn't connected. */
+  description(): string {
+    return this._description;
   }
 
   /** The `_bridge.passthrough` blocks for a bridge's instructions, from what the servers have reported so far. */
@@ -334,6 +345,16 @@ export class Instance {
   }
 
   private _apply(next: BridgeConfig): void {
+    this._applying = true;
+    try {
+      this._applyConfig(next);
+    } finally {
+      this._applying = false;
+      this._updateDescription();
+    }
+  }
+
+  private _applyConfig(next: BridgeConfig): void {
     const previous = this._config;
     this._config = next;
     const servers = resolveUpstreams(next);
@@ -392,6 +413,7 @@ export class Instance {
     const announce = (snapshot: UpstreamSnapshot): void => {
       this._index.follow(name, snapshot);
       this._broadcast({ method: "UPSTREAM", params: { ...snapshot, name } });
+      this._updateDescription();
     };
     const unsubscribe = upstream.subscribe({
       onSnapshot: announce,
@@ -412,6 +434,23 @@ export class Instance {
     this._index.remove(name);
     release(hosted);
     this._notifyHostedChanged();
+    this._updateDescription();
+  }
+
+  private _updateDescription(): void {
+    if (this._closed || this._applying) return;
+    const servers = Object.entries(resolveUpstreams(this._config)).flatMap(([name, config]) => {
+      const upstream = this._hosted.get(name)?.lease.upstream;
+      if (upstream === undefined) return [];
+      const { status } = upstream;
+      const shown = status === "connected" ? status : listedStatus(status, upstream.snapshot().error);
+      const category = config._bridge?.category;
+      return [{ name, status: shown, ...(category !== undefined && { category }) }];
+    });
+    const text = renderServerList(servers);
+    if (text === this._description) return;
+    this._description = text;
+    this._broadcast({ method: "DESCRIPTION", params: { text } });
   }
 
   private _defaultLimitReached(name: string, config: RateLimitConfig): void {

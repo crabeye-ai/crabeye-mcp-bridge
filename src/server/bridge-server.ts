@@ -22,7 +22,8 @@ import { ClientMetadata } from "./client-metadata.js";
 import { atMostRespawnWait, awaitConnectedClient, untilSettledOrCancelled } from "./upstream-wait.js";
 import { ApprovalRequiredError, CallRefusedError, cancelledError, reauthorizationError } from "../upstream/call-errors.js";
 import type { UpstreamClient } from "../upstream/types.js";
-import { searchToolDefinition, runToolDefinition } from "../search/tool-definitions.js";
+import { SEARCH_TOOL_NAME, searchToolDefinition, runToolDefinition } from "../search/tool-definitions.js";
+import { ListChangeAnnouncer } from "./list-change-announcer.js";
 import type { RunToolParams, SearchToolsParams, SearchToolsResponse } from "../search/index.js";
 import { searchQueriesProblem } from "../search/limits.js";
 import { SessionStats } from "./session-stats.js";
@@ -67,6 +68,14 @@ export interface BridgeServerOptions {
   onSearchStats?: (stats: SessionStatsSnapshot) => void;
   /** The `_bridge.passthrough` blocks to append to the base instructions when a client connects; empty means none. */
   buildPassthrough?: () => string;
+  /** What to add to the end of the `search_tools` description; the client is told when it changes. */
+  searchDescription?: SearchDescriptionSource;
+}
+
+export interface SearchDescriptionSource {
+  current(): string;
+  /** Returns an unsubscribe. */
+  onChanged(listener: () => void): () => void;
 }
 
 interface Connection {
@@ -105,6 +114,11 @@ function errorResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }], isError: true };
 }
 
+function withSearchDescription(tools: Tool[], description: string): Tool[] {
+  if (description === "") return tools;
+  return tools.map((tool) => (tool.name === SEARCH_TOOL_NAME ? { ...tool, description: `${tool.description}\n\n${description}` } : tool));
+}
+
 type ToolCallOutcome = CallToolResult | InputRequiredResult | Promise<CallToolResult | InputRequiredResult>;
 
 const BRIDGE_TOOLS = [searchToolDefinition, runToolDefinition];
@@ -118,6 +132,9 @@ export class BridgeServer {
   private options: BridgeServerOptions;
   private markSessionStarted!: () => void;
   private readonly sessionStart: Promise<void>;
+  private readonly mcpServers = new Set<McpServer>();
+  private listChanges: ListChangeAnnouncer | undefined;
+  private unfollowSearchDescription: (() => void) | undefined;
 
   constructor(options: BridgeServerOptions) {
     this.options = options;
@@ -133,7 +150,7 @@ export class BridgeServer {
     const mcp = new McpServer(
       { name: APP_NAME, version: APP_VERSION },
       {
-        capabilities: { tools: { listChanged: false } },
+        capabilities: { tools: { listChanged: true } },
         instructions: this.composeInstructions(),
         requestState: { verify: this.approval.verify },
       },
@@ -156,9 +173,12 @@ export class BridgeServer {
 
     mcp.server.setRequestHandler("tools/list", (_request, ctx) => {
       this.startSession(connection, ctx);
-      return { tools };
+      const description = this.options.searchDescription?.current() ?? "";
+      this.listChanges?.served(description);
+      return { tools: withSearchDescription(tools, description) };
     });
 
+    this.mcpServers.add(mcp);
     this.options.logger?.info("server instance built", { component: "bridge", era });
     return mcp;
   }
@@ -283,7 +303,6 @@ export class BridgeServer {
     }
 
     const { started, restoreStart } = interceptStart(transport, () => this.watchForSessionStart(transport));
-
     const handle = serveStdio((mcpCtx) => this.buildServer(mcpCtx.era), {
       transport,
       onerror: (error) => {
@@ -294,11 +313,13 @@ export class BridgeServer {
       },
     });
     this.handle = handle;
+    this.startAnnouncing();
 
     try {
       await started;
     } catch (err) {
       this.handle = undefined;
+      this.stopAnnouncing();
       await handle.close().catch(() => {});
       throw err;
     } finally {
@@ -331,8 +352,37 @@ export class BridgeServer {
   }
 
   async close(): Promise<void> {
+    this.stopAnnouncing();
     await this.handle?.close();
     this.handle = undefined;
+  }
+
+  private startAnnouncing(): void {
+    const source = this.options.searchDescription;
+    if (source === undefined) return;
+    const listChanges = new ListChangeAnnouncer({ current: () => source.current(), announce: () => this.announceListChanged() });
+    this.listChanges = listChanges;
+    this.unfollowSearchDescription = source.onChanged(() => listChanges.changed());
+  }
+
+  private announceListChanged(): void {
+    for (const mcp of this.mcpServers) {
+      if (!mcp.isConnected()) continue;
+      mcp.server.sendToolListChanged().catch((error: unknown) => {
+        this.options.logger?.debug("couldn't tell the client its tool list changed", {
+          component: "bridge",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }
+
+  private stopAnnouncing(): void {
+    this.unfollowSearchDescription?.();
+    this.unfollowSearchDescription = undefined;
+    this.listChanges?.close();
+    this.listChanges = undefined;
+    this.mcpServers.clear();
   }
 
   getToolRegistry(): ToolRegistry {

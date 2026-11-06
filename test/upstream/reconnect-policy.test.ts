@@ -450,4 +450,29 @@ describe("upstream reconnect policy", () => {
 
     expect(scripted.attemptsAt).toHaveLength(1);
   });
+
+  it("reports a connect that fails with something other than an Error as a failure, so the server shows as not connected rather than dropped", async () => {
+    const odd = new HttpUpstreamClient({
+      name: "odd",
+      config: { type: "streamable-http", url: "http://localhost:9999" },
+      reconnectBaseDelay: 60_000,
+      reconnectMaxDelay: 60_000,
+      _transportFactory: () => ({
+        async start() {
+          throw "boom";
+        },
+        async send() {},
+        async close() {},
+      }),
+    });
+    const errors: Array<Error | undefined> = [];
+    client = odd;
+    odd.onStatusChange((event) => {
+      if (event.current === "disconnected") errors.push(event.error);
+    });
+
+    await odd.connect().catch(() => {});
+
+    expect(errors.at(-1)?.message).toContain("boom");
+  });
 });

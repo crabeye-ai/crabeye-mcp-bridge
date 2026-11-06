@@ -141,11 +141,15 @@ describe("Instance", () => {
     expect(bridge.notifications.map((n) => n.method)).toEqual(["UPSTREAM", "UPSTREAM", "UPSTREAM", "UPSTREAM"]);
     const plain = clients.find((c) => c.name === "plain")!;
     plain.setStatus("disconnected", new Error("reset"));
-    expect(bridge.notifications.at(-1)).toEqual({ method: "UPSTREAM", params: { name: "plain", status: "disconnected", error: "reset", tools: [] } });
+    expect(bridge.notifications.slice(4)).toEqual([
+      { method: "UPSTREAM", params: { name: "plain", status: "disconnected", error: "reset", tools: [] } },
+      { method: "DESCRIPTION", params: { text: expect.stringContaining("\n- plain: not connected") } },
+    ]);
+    const heard = bridge.notifications.length;
 
     instance.detach(bridge);
     plain.setStatus("connected");
-    expect(bridge.notifications).toHaveLength(5);
+    expect(bridge.notifications).toHaveLength(heard);
     expect(instance.attachmentCount).toBe(0);
   });
 

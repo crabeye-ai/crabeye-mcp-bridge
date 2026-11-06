@@ -204,7 +204,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       if (retry) return this._doConnect();
       this._setStatus(
         this._isAuthFailure(err) ? "auth_required" : "disconnected",
-        err instanceof Error ? err : undefined,
+        err instanceof Error ? err : new Error(String(err)),
       );
       throw err;
     }
@@ -360,7 +360,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     this._currentTransport = undefined;
     void failedClient.close().catch(() => {});
     this._onTransportClosed();
-    this._setStatus("auth_required", err instanceof Error ? err : undefined);
+    this._setStatus("auth_required", err instanceof Error ? err : new Error(String(err)));
   }
 
   private _endConnection(): void {

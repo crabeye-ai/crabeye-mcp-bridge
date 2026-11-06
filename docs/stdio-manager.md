@@ -54,7 +54,8 @@ What `search_tools` and `run_tool` show doesn't change, except:
 
 * `search_tools` returns an error when the manager can't be reached, as `run_tool` does;
 * a regex the manager can't match in linear time is searched as plain text (see [Regex search](how-it-works.md#regex-search));
-* a search has limits on its size and running time (see [Multiple queries](how-it-works.md#multiple-queries)).
+* a search has limits on its size and running time (see [Multiple queries](how-it-works.md#multiple-queries));
+* the `search_tools` description lists the servers and their status, and a server's tools leave the search once it fails to connect or needs authorization (see [Servers and their status](how-it-works.md#servers-and-their-status)).
 
 The manager keeps one search index for each copy of a config, which every bridge using that copy searches, and enforces each server's rate limit once for every client (see [Rate limiting](policies.md#rate-limiting)). It also decides the tool policy for every client and renders the passthrough blocks; each bridge asks its own client to approve calls the policy marks `prompt`, and such a call takes no rate-limit slot before it is approved. Cancelling a call cancels it at the server, and each server's instructions reach every client.
 

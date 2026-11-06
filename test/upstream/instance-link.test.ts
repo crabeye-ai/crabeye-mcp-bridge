@@ -230,7 +230,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
     );
   });
 
-  it("fails calls in flight with the daemon error when the daemon goes away, then attaches to its replacement", async () => {
+  it("fails calls in flight with the daemon error when the daemon goes away, reports itself interrupted but not down, then attaches to its replacement", async () => {
     let replaced = false;
     const l = link({
       _ensureDaemon: async (opts) => {
@@ -243,6 +243,8 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
     const view = recordingView();
     l.watch("svc", view);
     await l.attach();
+    const states: Array<[boolean, boolean]> = [];
+    l.onStateChanged(() => states.push([l.isAttached, l.isDown]));
     clients[0]!.answer = () => new Promise(() => {});
     const inFlight = expect(l.callTool("svc", { name: "slow" })).rejects.toThrow(DAEMON_CONNECTION_CLOSED);
 
@@ -251,6 +253,10 @@ describe.skipIf(process.platform === "win32")("InstanceLink", { timeout: 30_000 
     await inFlight;
     await vi.waitFor(() => expect(l.isAttached).toBe(true));
     expect(view.events).toEqual(["snapshot:connected", "interrupted", "snapshot:connected"]);
+    expect(states).toEqual([
+      [false, false],
+      [true, false],
+    ]);
     expect(clients).toHaveLength(4);
     expect(await l.callTool("svc", { name: "search" })).toEqual({ content: [{ type: "text", text: "called search" }] });
   });

@@ -16,7 +16,7 @@ describe.skipIf(process.platform === "win32")("InstanceLink following what its i
   let dir: string;
   let server: Server;
   let socket: Socket | undefined;
-  let attachResult: { upstreams: string[]; logLevel: unknown };
+  let attachResult: { upstreams: string[]; logLevel: unknown; description?: unknown };
   let socketPath: string;
   let answerRetry: (sock: Socket, id: string, upstream: string) => void;
   let afterAttach: Array<{ method: string; params: unknown }>;
@@ -95,6 +95,29 @@ describe.skipIf(process.platform === "win32")("InstanceLink following what its i
     await vi.waitFor(() => expect(levels).toEqual(["error"]));
   });
 
+  it("takes the search description from the attach reply, and a later one from the instance, telling listeners each time", async () => {
+    attachResult = { upstreams: ["svc"], logLevel: "warn", description: { text: "first" } };
+    let changes = 0;
+    link.onStateChanged(() => changes++);
+    expect(link.description()).toBeUndefined();
+
+    await link.attach();
+    expect([link.description(), changes]).toEqual(["first", 1]);
+
+    notify("DESCRIPTION", { text: 3 });
+    notify("DESCRIPTION", { text: "second" });
+    await vi.waitFor(() => expect([link.description(), changes]).toEqual(["second", 2]));
+  });
+
+  it("keeps a search description sent just after the instance answered the attach", async () => {
+    attachResult = { upstreams: ["svc"], logLevel: "warn", description: { text: "from the reply" } };
+    afterAttach = [{ method: "DESCRIPTION", params: { text: "later" } }];
+
+    await link.attach();
+
+    await vi.waitFor(() => expect(link.description()).toBe("later"));
+  });
+
   it("writes a log line that isn't about one server under the config component", async () => {
     await link.attach();
 
@@ -153,11 +176,15 @@ describe.skipIf(process.platform === "win32")("InstanceLink following what its i
       },
     });
     following.onUpstreamsChanged(() => {});
+    const states: Array<[boolean, boolean]> = [];
+    following.onStateChanged(() => states.push([following.isAttached, following.isDown]));
 
     try {
       await following.attach().catch(() => {});
+      expect(states).toEqual([[false, true]]);
 
       await vi.waitFor(() => expect(following.isAttached).toBe(true));
+      expect(states).toEqual([[false, true], [true, false]]);
     } finally {
       await following.close();
     }

@@ -155,7 +155,9 @@ export class InstanceUpstreamClient implements UpstreamClient {
       this._tools = snapshot.tools;
       this._toolsText = toolsText;
     }
-    this._setStatus(snapshot.status, snapshot.error === undefined ? undefined : new Error(snapshot.error));
+    const error = snapshot.error === undefined ? undefined : new Error(snapshot.error);
+    this._lastError = error;
+    this._setStatus(snapshot.status, error);
     if (toolsChanged || becameConnected) this._notifyTools();
   }
 

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import { Client, InMemoryTransport, ProtocolErrorCode } from "@modelcontextprotocol/client";
-import type { Tool, CallToolResult } from "@modelcontextprotocol/client";
+import type { Tool, CallToolResult, JSONRPCMessage } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../src/constants.js";
 import { ToolRegistry } from "../src/server/tool-registry.js";
 import { BridgeServer } from "../src/server/bridge-server.js";
@@ -119,11 +119,11 @@ describe("BridgeServer initialize", () => {
     await cleanup();
   });
 
-  it.each([false, true])("advertises tools without declaring that the list can change (modern: %s)", async (modern) => {
+  it.each([false, true])("advertises tools and declares that the list can change (modern: %s)", async (modern) => {
     const { client, cleanup } = await createTestPair({ modern });
 
     expect(client.getProtocolEra()).toBe(modern ? "modern" : "legacy");
-    expect(client.getServerCapabilities()?.tools).toEqual({ listChanged: false });
+    expect(client.getServerCapabilities()?.tools).toEqual({ listChanged: true });
 
     await cleanup();
   });
@@ -232,7 +232,7 @@ describe("tools/list", () => {
     await cleanup();
   });
 
-  it("grants no tool-list subscription and sends no change as upstreams come and go and the assistant searches (modern era)", async () => {
+  it("grants a tool-list subscription and sends no change as upstreams come and go and the assistant searches (modern era)", async () => {
     const registry = new ToolRegistry();
     const { client, cleanup, notificationsFromServer } = await createTestPair({ registry, modern: true });
     const subscription = await client.listen({ toolsListChanged: true });
@@ -244,7 +244,7 @@ describe("tools/list", () => {
     registry.setToolsForSource("linear", [makeTool("linear__create_issue")]);
     registry.removeSource("linear");
 
-    expect(subscription.honoredFilter).toEqual({});
+    expect(subscription.honoredFilter).toEqual({ toolsListChanged: true });
     expect(acknowledgements.map((message) => "method" in message && message.method)).toEqual(["notifications/subscriptions/acknowledged"]);
     expect((await client.listTools()).tools).toEqual(BRIDGE_TOOLS);
     expect(notificationsFromServer()).toEqual(acknowledgements);
@@ -252,6 +252,99 @@ describe("tools/list", () => {
     await subscription.close();
     await cleanup();
   });
+});
+
+describe("the search_tools description", () => {
+  const LISTED = "Servers (search by provider name):\n- linear";
+
+  function changingDescription(initial: string) {
+    let text = initial;
+    const listeners = new Set<() => void>();
+    return {
+      source: {
+        current: () => text,
+        onChanged: (listener: () => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      listeners: () => listeners.size,
+      set(next: string) {
+        text = next;
+        for (const listener of [...listeners]) listener();
+      },
+    };
+  }
+
+  const listChanges = (messages: JSONRPCMessage[]) => messages.filter((message) => "method" in message && message.method === "notifications/tools/list_changed");
+
+  async function searchToolDescription(client: Client): Promise<string | undefined> {
+    return (await client.listTools()).tools.find((tool) => tool.name === "search_tools")?.description;
+  }
+
+  it.each([false, true])("ends with the search description, and tells the client once when it changes (modern: %s)", async (modern) => {
+    const description = changingDescription(LISTED);
+    const { client, cleanup, notificationsFromServer } = await createTestPair({ modern, searchDescription: description.source });
+    const subscription = modern ? await client.listen({ toolsListChanged: true }) : undefined;
+
+    expect(await searchToolDescription(client)).toBe(`${searchToolDefinition.description}\n\n${LISTED}`);
+    description.set(`${LISTED}\n- github: starting`);
+    description.set(`${LISTED}\n- github`);
+    await vi.waitFor(() => expect(listChanges(notificationsFromServer())).toHaveLength(1), { timeout: 3_000 });
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+    expect(listChanges(notificationsFromServer())).toHaveLength(1);
+    expect(await searchToolDescription(client)).toBe(`${searchToolDefinition.description}\n\n${LISTED}\n- github`);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(["search_tools", "run_tool"]);
+
+    await subscription?.close();
+    await cleanup();
+  }, 10_000);
+
+  it("leaves the description as it is when there is nothing to add", async () => {
+    const { client, cleanup } = await createTestPair({ searchDescription: changingDescription("").source });
+
+    expect(await searchToolDescription(client)).toBe(searchToolDefinition.description);
+
+    await cleanup();
+  });
+
+  it("stops following the search description once the server is closed", async () => {
+    const description = changingDescription(LISTED);
+    const { client, server } = await createTestPair({ searchDescription: description.source });
+    expect(description.listeners()).toBe(1);
+
+    await client.close();
+    await server.close();
+
+    expect(description.listeners()).toBe(0);
+  });
+
+  it("carries on when the client can't be told its tool list changed", async () => {
+    const description = changingDescription(LISTED);
+    const server = new BridgeServer({ search: localSearch(new ToolRegistry()), searchDescription: description.source });
+    const client = new Client({ name: "t", version: "0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const send = serverTransport.send.bind(serverTransport);
+    let refused = 0;
+    serverTransport.send = (message, options) => {
+      if ("method" in message && message.method === "notifications/tools/list_changed") {
+        refused++;
+        return Promise.reject(new Error("write EPIPE"));
+      }
+      return send(message, options);
+    };
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    description.set(`${LISTED}\n- github`);
+    await vi.waitFor(() => expect(refused).toBe(1), { timeout: 3_000 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(["search_tools", "run_tool"]);
+    await client.close();
+    await server.close();
+  }, 5_000);
 });
 
 // --- search_tools ---

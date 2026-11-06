@@ -77,7 +77,7 @@ describe("What an instance tells its bridges about its config", () => {
   it("answers an attach with the config's log level", async () => {
     config = { mcpServers: { linear: linear() }, _bridge: { logLevel: "debug" } };
 
-    expect((await attach()).result).toEqual({ upstreams: ["linear"], logLevel: "debug" });
+    expect((await attach()).result).toEqual({ upstreams: ["linear"], logLevel: "debug", description: { text: expect.stringContaining("\n- linear") } });
   });
 
   it("tells every attached bridge when a reload changes the log level, and says nothing when it doesn't", async () => {
@@ -300,5 +300,135 @@ describe("An instance's passthrough blocks", () => {
 
   it("renders nothing when no server asks for it", async () => {
     expect((await open({ linear: { url: "https://linear.example.com/mcp" } })).passthrough()).toBe("");
+  });
+});
+
+describe("An instance's search description", () => {
+  const HEADER = "Servers (search by provider name):";
+  const linear = (bridge: Record<string, unknown> = { category: "issues" }) => ({ url: "https://linear.example.com/mcp", _bridge: bridge });
+  const docs = { url: "https://docs.example.com/mcp" };
+  let config: Record<string, unknown>;
+  let clients: Map<string, ScriptedUpstreamClient>;
+  let host: InstanceHost;
+
+  beforeEach(() => {
+    config = { mcpServers: { linear: linear(), docs } };
+    clients = new Map();
+    host = new InstanceHost({
+      idleMs: 60_000,
+      logger: spyLogger(),
+      onIdle: () => {},
+      stdio: stdioPoolOptions(),
+      loadConfig: async () => ({ config: BridgeConfigSchema.parse(config), watchPaths: [] }),
+      createCredentialStore: () => ({}) as CredentialStore,
+      createHttpClient: (name) => {
+        const client = scriptedLinear(name);
+        clients.set(name, client);
+        return client;
+      },
+    });
+  });
+
+  afterEach(async () => {
+    await host.close(0);
+  });
+
+  async function attach(bridge = channel()): Promise<{ bridge: Bridge; result: AttachResult }> {
+    const reply = await host.handleAttach("a", { bridgeProtocolVersion: MIN_BRIDGE_PROTOCOL_VERSION, source: SOURCE, env: {}, childEnv: {} }, bridge);
+    return { bridge, result: reply.result as AttachResult };
+  }
+
+  const descriptions = (bridge: Bridge) => framesOf(bridge, "DESCRIPTION").map((frame) => (frame as { params: { text: string } }).params.text);
+
+  async function connected(...names: string[]): Promise<void> {
+    await vi.waitFor(() => expect(names.map((name) => clients.get(name)?.status)).toEqual(names.map(() => "connected")));
+  }
+
+  it("answers an attach with every server, in config order, with its category and the status of each that isn't connected", async () => {
+    const { bridge: first } = await attach();
+    await connected("linear", "docs");
+    clients.get("docs")!.setStatus("disconnected", new Error("reset"));
+
+    const { result } = await attach();
+
+    expect(result.description).toEqual({ text: `${HEADER}\n- linear [issues]\n- docs: not connected` });
+    expect(descriptions(first).at(-1)).toBe(result.description.text);
+  });
+
+  it("tells every attached bridge each time a server's status changes the text", async () => {
+    const { bridge: a } = await attach();
+    const { bridge: b } = await attach();
+    await connected("linear", "docs");
+    const docsClient = clients.get("docs")!;
+    const needsAuthorization = "- docs: needs authorization; the user runs: crabeye-mcp-bridge auth docs, or updates its credentials if it doesn't use OAuth";
+
+    for (const [status, error, shown] of [
+      ["auth_required", new Error("HTTP 401"), needsAuthorization],
+      ["connecting", undefined, "- docs: starting"],
+      ["connected", undefined, "- docs"],
+      ["disconnected", new Error("connect ECONNREFUSED"), "- docs: not connected"],
+      ["connected", undefined, "- docs"],
+      ["disconnected", undefined, "- docs: starting"],
+      ["connected", undefined, "- docs"],
+    ] as const) {
+      docsClient.setStatus(status, error);
+      for (const bridge of [a, b]) expect(descriptions(bridge).at(-1)).toBe(`${HEADER}\n- linear [issues]\n${shown}`);
+    }
+  });
+
+  it("keeps a server that failed to connect listed as not connected while it tries again, telling bridges nothing", async () => {
+    const { bridge } = await attach();
+    await connected("linear", "docs");
+    const docsClient = clients.get("docs")!;
+    docsClient.setStatus("disconnected", new Error("connect ECONNREFUSED"));
+    const heard = descriptions(bridge).length;
+
+    docsClient.setStatus("connecting");
+    docsClient.setStatus("disconnected", new Error("connect ETIMEDOUT"));
+    docsClient.setStatus("connecting");
+
+    expect(descriptions(bridge)).toHaveLength(heard);
+    expect(descriptions(bridge).at(-1)).toBe(`${HEADER}\n- linear [issues]\n- docs: not connected`);
+  });
+
+  it("tells bridges when a reload adds or removes a server or changes a category, and not when it changes neither", async () => {
+    const { bridge } = await attach();
+    await connected("linear", "docs");
+    const heard = descriptions(bridge).length;
+
+    for (const unannounced of [
+      { mcpServers: { linear: linear({ category: "issues", tools: { delete_issue: "never" } }), docs } },
+      { mcpServers: { linear: linear({ category: "issues", rateLimit: { maxCalls: 5, windowSeconds: 60 } }), docs } },
+      { mcpServers: { linear: linear({ category: "issues", rateLimit: { maxCalls: 5, windowSeconds: 60 } }), docs } },
+    ]) {
+      config = unannounced;
+      await attach();
+    }
+    expect(descriptions(bridge)).toHaveLength(heard);
+
+    config = { mcpServers: { linear: linear({ category: "tracker" }), docs } };
+    await attach();
+    expect(descriptions(bridge).at(-1)).toBe(`${HEADER}\n- linear [tracker]\n- docs`);
+
+    config = { mcpServers: { linear: linear({ category: "tracker" }), wiki: { url: "https://wiki.example.com/mcp" } } };
+    await attach();
+    await connected("wiki");
+    expect(descriptions(bridge).at(-1)).toBe(`${HEADER}\n- linear [tracker]\n- wiki`);
+  });
+
+  it("tells bridges nothing when a server changes its tools", async () => {
+    const { bridge } = await attach();
+    await connected("linear", "docs");
+    const heard = descriptions(bridge).length;
+
+    clients.get("linear")!.setTools([tool("other")]);
+
+    expect(descriptions(bridge)).toHaveLength(heard);
+  });
+
+  it("is empty with no servers", async () => {
+    config = { mcpServers: {} };
+
+    expect((await attach()).result.description).toEqual({ text: "" });
   });
 });

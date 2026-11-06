@@ -64,6 +64,19 @@ describe("InstanceUpstreamClient", () => {
       expect(client.status).toBe("auth_required");
     });
 
+    it("doesn't give an earlier authorization failure as the reason once the daemon has tried the upstream again", async () => {
+      const { link, client } = standIn();
+      link.snapshots.set("svc", { name: "svc", status: "auth_required", error: "invalid_grant", tools: [] });
+      link.retry.mockImplementation(async () => {
+        link.send({ name: "svc", status: "connecting", tools: [] });
+        const snapshot: UpstreamSnapshot = { name: "svc", status: "disconnected", tools: [] };
+        link.send(snapshot);
+        return snapshot;
+      });
+
+      await expect(client.connect()).rejects.toThrow('upstream "svc" is disconnected');
+    });
+
     it("waits for the outcome when the daemon reports the upstream still connecting", async () => {
       const { link, client } = standIn();
       link.retry.mockImplementation(async () => {

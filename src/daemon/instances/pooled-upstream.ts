@@ -226,6 +226,8 @@ export class PooledUpstream {
       this._pauseLogged = false;
     } else if (event.error !== undefined) {
       this._lastError = event.error.message;
+    } else if (event.previous === "auth_required") {
+      this._lastError = undefined;
     }
     if (event.current === "auth_required" && !this._pauseLogged) {
       this._pauseLogged = true;

@@ -153,7 +153,7 @@ export class InstanceHost {
     this._attachments.set(channel, attachment);
     await instance.admit(attachment, !fresh);
     this._log.info("bridge attached", { config: params.source.kind, bridges: instance.attachmentCount });
-    const result: AttachResult = { upstreams: instance.upstreamNames(), ...instance.settings() };
+    const result: AttachResult = { upstreams: instance.upstreamNames(), ...instance.settings(), description: { text: instance.description() } };
     return { id, result };
   }
 

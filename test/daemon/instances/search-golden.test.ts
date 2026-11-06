@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { BridgeConfigSchema, resolveUpstreams, serverBridgeConfigs } from "../../../src/config/schema.js";
 import type { SearchToolsResult, UpstreamSnapshot } from "../../../src/daemon/protocol.js";
 import { PolicyEngine } from "../../../src/policy/index.js";
-import { ToolSearchService, type SearchQuery } from "../../../src/search/index.js";
+import { ToolSearchService, type ProviderResult, type SearchQuery } from "../../../src/search/index.js";
 import { namespaceTool } from "../../../src/server/tool-namespacing.js";
 import { ToolRegistry } from "../../../src/server/tool-registry.js";
 import type { UpstreamLink, UpstreamView } from "../../../src/upstream/instance-link.js";
@@ -23,6 +23,11 @@ const QUERIES: SearchQuery[][] = [
   [{ tool: "plain" }, { category: "project" }, { provider: "figma", expand_tools: true, limit: 50, offset: 0 }],
   [{ provider: "missing", expand_tools: true }],
 ];
+
+function withoutStatuses({ results }: SearchToolsResult): SearchToolsResult {
+  const withoutStatus = (entry: ProviderResult) => Object.fromEntries(Object.entries(entry).filter(([key]) => key !== "status" && key !== "message")) as ProviderResult;
+  return { results: results.map((result) => ({ ...result, providers: result.providers.map(withoutStatus) })) };
+}
 
 /** The search a bridge answered before #230: stand-ins fed by the manager's snapshots, its registry and its policy. */
 function searchAsTheBridgeDid(updates: UpstreamSnapshot[], servers: Record<string, unknown>): (queries: SearchQuery[]) => unknown {
@@ -45,7 +50,7 @@ describe.skipIf(isWindows)("search_tools in the manager", { timeout: 30_000 }, (
 
   afterEach(() => h.cleanUp());
 
-  it("answers every query as the bridge did, with categories, a disabled tool, paging, regex, de-duplication and a disconnected server", async () => {
+  it("answers every query as the bridge did, with categories, a disabled tool, paging, regex, de-duplication and a crashed server that keeps its tools while it reconnects", async () => {
     const server = (stub: string, arg: string, extra: Record<string, unknown> = {}) => ({ command: process.execPath, args: [stub, arg], _bridge: { ...FAST_RECONNECT, ...extra } });
     await h.start((stub) => ({
       linear: server(stub, "--linear", { category: "project management" }),
@@ -62,8 +67,10 @@ describe.skipIf(isWindows)("search_tools in the manager", { timeout: 30_000 }, (
     const expected = searchAsTheBridgeDid(bridge.updates, servers);
     for (const queries of QUERIES) {
       const actual = (await bridge.client.call("SEARCH_TOOLS", { queries })) as SearchToolsResult;
-      expect(actual, JSON.stringify(queries)).toEqual(expected(queries));
+      expect(withoutStatuses(actual), JSON.stringify(queries)).toEqual(expected(queries));
     }
-    expect(((await bridge.client.call("SEARCH_TOOLS", { queries: [{ provider: "figma", expand_tools: true }] })) as SearchToolsResult).results[0]!.total).toBeGreaterThan(0);
+    const figma = (await bridge.client.call("SEARCH_TOOLS", { queries: [{ provider: "figma", expand_tools: true }] })) as SearchToolsResult;
+    expect(figma.results[0]!.total).toBeGreaterThan(0);
+    expect(figma.results[0]!.providers[0]).toMatchObject({ name: "figma", status: "starting", message: '"figma" is reconnecting; a call to its tools waits for it to be back.' });
   });
 });

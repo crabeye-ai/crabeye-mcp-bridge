@@ -9,6 +9,7 @@ import { BridgeServer } from "./server/index.js";
 import { ToolRegistry } from "./server/tool-registry.js";
 import { UpstreamManager } from "./upstream/index.js";
 import { InstanceLink, instanceSourceFor } from "./upstream/instance-link.js";
+import { currentSearchDescription } from "./upstream/search-description.js";
 import { childEnvFrom, FOLLOWED_NODE_OPTIONS, instanceEnvFrom, unfollowedNodeOptions } from "./daemon/instance-env.js";
 import { AWAIT_PREDECESSOR_FLAG, MAX_AWAIT_PREDECESSOR_MS, ensureDaemonRunning, tellManagerAuthChanged } from "./daemon/index.js";
 import { APP_NAME, APP_VERSION } from "./constants.js";
@@ -143,6 +144,10 @@ program
         getUpstreamClient: (name) => upstreamManager!.getClient(name),
         upstreamsKnown: () => upstreamManager!.upstreamsKnown(),
         onClientsChanged: (listener) => upstreamManager!.onClientsChanged(listener),
+        searchDescription: {
+          current: () => currentSearchDescription(instanceLink, names),
+          onChanged: (listener) => instanceLink.onStateChanged(listener),
+        },
         showStats: options.stats === true,
         onSearchStats: (stats) => {
           logger.info(

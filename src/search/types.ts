@@ -24,11 +24,18 @@ export interface SearchToolResult {
   disabled?: true;
 }
 
+/** Why a server a search matched isn't connected. */
+export type ProviderStatus = "starting" | "not_connected" | "needs_authorization";
+
 export interface ProviderResult {
   name: string;
   category?: string;
   tool_count: number;
   tools: SearchToolResult[];
+  /** Set when the server isn't connected. */
+  status?: ProviderStatus;
+  /** What the status means for the model, set with `status`. */
+  message?: string;
 }
 
 export interface QueryResult {
