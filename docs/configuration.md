@@ -38,6 +38,8 @@ Remote servers accessible via HTTP:
 
 `type` defaults to `"streamable-http"`. Use `"sse"` for servers that use the legacy HTTP+SSE transport.
 
+The bridge follows a redirect only to the same scheme, host and port as `url`. A server that redirects anywhere else fails with an error naming the address it redirected to. Set that address as its `url` if it is the server you meant.
+
 `headers` are sent with every request to the server. The bridge ignores `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`, `Mcp-Protocol-Version` and `Mcp-Session-Id` here, because it sets those itself, and logs a warning naming any it ignored.
 
 > **Deprecation.** The HTTP+SSE transport was superseded by Streamable HTTP in the MCP 2025-03-26 spec, and the MCP SDK now marks it deprecated. The bridge plans to remove `"sse"` support on **2027-07-28** (tracked in #201). If your server offers both, prefer `"streamable-http"` now.

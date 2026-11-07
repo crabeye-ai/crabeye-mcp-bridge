@@ -212,6 +212,17 @@ describe.skipIf(process.platform === "win32" || !HAS_OPENSSL)("networkFetch", ()
     expect(response.url).toBe(`${plainUrl}landed`);
   });
 
+  it.each([
+    ["directly", (): Record<string, string> => ({})],
+    ["through the client's proxy", (): Record<string, string> => ({ NODE_USE_ENV_PROXY: "1", HTTP_PROXY: proxyUrl })],
+  ])("hands a redirect back unfollowed when asked to, %s", async (_case, env) => {
+    const response = await connect(env())(`${plainUrl}redirect`, { redirect: "manual" });
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/landed");
+    expect(response.redirected).toBe(false);
+  });
+
   it("refuses a Request, whose method and body it would otherwise drop", async () => {
     await expect(connect({})(new Request(plainUrl))).rejects.toThrow("takes a URL");
   });

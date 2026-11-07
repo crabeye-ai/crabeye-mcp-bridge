@@ -24,6 +24,8 @@ export interface CountingUpstreamOptions {
   oauth?: boolean;
   /** Serve HTTPS with this key and certificate. */
   tls?: { key: string; cert: string };
+  /** Paths answered with a 307 to another path on this server. */
+  redirects?: Record<string, string>;
 }
 
 /** What a token request carried. */
@@ -65,6 +67,8 @@ export interface CountingUpstream {
   setReachable: (reachable: boolean) => void;
   /** Connections from clients that are still open. */
   openSockets: () => number;
+  /** The path of every request, in order. */
+  paths: () => string[];
   close: () => Promise<void>;
 }
 
@@ -105,7 +109,8 @@ function messagesOf(body: Buffer): Inbound[] {
   }
 }
 
-export async function startCountingUpstream({ era = "modern", instructions, oauth = false, tls }: CountingUpstreamOptions = {}): Promise<CountingUpstream> {
+export async function startCountingUpstream({ era = "modern", instructions, oauth = false, tls, redirects = {} }: CountingUpstreamOptions = {}): Promise<CountingUpstream> {
+  const paths: string[] = [];
   const counts = new Map<string, number>();
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
   const authorizations: Array<string | undefined> = [];
@@ -152,6 +157,12 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
   const handle = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const base = `${scheme}://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const url = new URL(req.url!, base);
+    paths.push(url.pathname);
+    const redirectTo = redirects[url.pathname];
+    if (redirectTo !== undefined) {
+      res.writeHead(307, { location: redirectTo });
+      return res.end();
+    }
     const body = await readBody(req);
     const json = (status: number, payload: unknown) => {
       res.writeHead(status, { "content-type": "application/json" });
@@ -259,6 +270,7 @@ export async function startCountingUpstream({ era = "modern", instructions, oaut
       accessTokens.clear();
     },
     openSockets: () => openSockets,
+    paths: () => [...paths],
     setReachable: (value) => {
       reachable = value;
       if (!reachable) server.closeAllConnections();

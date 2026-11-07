@@ -14,6 +14,8 @@ import { makeOriginPinningFetch } from "../oauth/origin-pinning.js";
 import { BaseUpstreamClient } from "./base-client.js";
 import type { BaseUpstreamClientOptions } from "./base-client.js";
 
+const REDIRECT_POLICY_NOTE = " (redirectPolicy: 'same-origin')";
+
 const TRANSPORT_OWNED_HEADERS = new Set(["mcp-method", "mcp-name", "mcp-protocol-version", "mcp-session-id"]);
 
 function isTransportOwnedHeader(name: string): boolean {
@@ -192,7 +194,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
     };
 
     if (this._config.type !== "sse") {
-      return new StreamableHTTPClientTransport(url, transportOpts);
+      return rewordRefusedRedirects(new StreamableHTTPClientTransport(url, transportOpts));
     }
     if (!this._warnedSseDeprecated) {
       this._warnedSseDeprecated = true;
@@ -200,7 +202,7 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
         'transport type "sse" is deprecated and will be removed on 2027-07-28 — switch to "streamable-http" if the server supports it',
       );
     }
-    return new SSEClientTransport(url, transportOpts);
+    return rewordRefusedRedirects(new SSEClientTransport(url, transportOpts));
   }
 
   private _configuredRequestHeaders(
@@ -253,4 +255,24 @@ function rejectUnsendableHeaders(headers: Record<string, string> | undefined): v
       throw new Error(`the value of header "${header}" contains a line break, a NUL or a character a header can't carry`);
     }
   }
+}
+
+/**
+ * Rewords the SDK's error for a redirect it didn't follow to another origin,
+ * which names a transport option crabeye doesn't offer, so that it points at
+ * the server's `url` instead. The error keeps its class and status.
+ */
+function rewordRefusedRedirects<T extends Transport>(transport: T): T {
+  const start = transport.start.bind(transport);
+  const send = transport.send.bind(transport);
+  transport.start = () => start().catch(rethrowReworded);
+  transport.send = (message, options) => send(message, options).catch(rethrowReworded);
+  return transport;
+}
+
+function rethrowReworded(err: unknown): never {
+  if (err instanceof Error && err.message.includes(REDIRECT_POLICY_NOTE)) {
+    err.message = err.message.replace(REDIRECT_POLICY_NOTE, "").replace("as the endpoint", 'as this server\'s "url"');
+  }
+  throw err;
 }

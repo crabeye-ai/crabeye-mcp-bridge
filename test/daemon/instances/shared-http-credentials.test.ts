@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { CredentialStore } from "../../../src/credentials/credential-store.js";
 import { oauthCredentialKey } from "../../../src/oauth/client-secret.js";
@@ -22,6 +24,19 @@ describe.skipIf(process.platform === "win32")("credentials and network settings 
   function connectFailure(client: TestBridge): string | undefined {
     return client.lines.find((line) => line.message.startsWith("failed to connect"))?.message;
   }
+
+  it("reports an upstream that refuses the connection with the network error underneath", async () => {
+    await daemon();
+    const closed = http.createServer();
+    await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));
+    const { port } = closed.address() as AddressInfo;
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    const config = await writeJson("bridge.json", { mcpServers: { svc: { url: `http://127.0.0.1:${port}/mcp` } } });
+
+    const client = await bridge(config);
+
+    await vi.waitFor(() => expect(connectFailure(client)).toMatch(/fetch failed \(connect ECONNREFUSED 127\.0\.0\.1:\d+\)/), { timeout: 10_000 });
+  });
 
   it("gives a client with another master key its own instance and connection", async () => {
     await daemon();

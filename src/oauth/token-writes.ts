@@ -1,6 +1,6 @@
 import type { ConditionalChange, CredentialStore } from "../credentials/credential-store.js";
 import type { Credential, OAuth2Credential } from "../credentials/types.js";
-import type { Logger } from "../logging/index.js";
+import { describeError, type Logger } from "../logging/index.js";
 import { oauthCredentialKey } from "./client-secret.js";
 import { issuerAllows } from "./issuer-binding.js";
 import { sameTokens, type TokenPair } from "./repeated-saves.js";
@@ -45,8 +45,22 @@ export class TokenWrites {
     if (this._recentReads.length > RECENT_READS_KEPT) this._recentReads.shift();
   }
 
-  /** Resolves false only when a refresh's tokens were dropped. */
-  async write(credential: OAuth2Credential, { redeemed, addIfMissing }: TokenOrigin): Promise<boolean> {
+  /**
+   * Resolves false only when a refresh's tokens were dropped. When the store
+   * can't save the tokens, logs and fails with an error naming the server
+   * and the cause.
+   */
+  async write(credential: OAuth2Credential, origin: TokenOrigin): Promise<boolean> {
+    try {
+      return await this._write(credential, origin);
+    } catch (err) {
+      const message = `could not save the tokens for "${this._opts.serverName}": ${describeError(err)}`;
+      this._opts.logger?.warn(message, { component: "oauth" });
+      throw new Error(message, { cause: err });
+    }
+  }
+
+  private async _write(credential: OAuth2Credential, { redeemed, addIfMissing }: TokenOrigin): Promise<boolean> {
     if (this._recentReads.some((read) => sameTokens(read, credential))) {
       await this._opts.store.replaceIf(
         this._key,

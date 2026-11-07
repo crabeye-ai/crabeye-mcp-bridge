@@ -1,6 +1,7 @@
 import { escapeControlCharacters } from "./escape.js";
 
 export { escapeControlCharacters } from "./escape.js";
+export { describeError } from "./describe-error.js";
 export { escapeLabel, methodLabel } from "./labels.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";

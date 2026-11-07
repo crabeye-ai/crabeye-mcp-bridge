@@ -1,5 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/client";
-import type { Logger, LogLevel } from "../../logging/index.js";
+import { describeError, type Logger, type LogLevel } from "../../logging/index.js";
 import { HealthChecks } from "../../upstream/health-checks.js";
 import { canonicalize } from "../../upstream/upstream-hash.js";
 import { authorizationPausedMessage, ConnectionSupersededError, type ConnectionStatus, type StatusChangeEvent, type UpstreamClient } from "../../upstream/types.js";
@@ -221,7 +221,7 @@ export class PooledUpstream {
   }
 
   private _logConnectFailure(err: unknown): void {
-    if (!(err instanceof ConnectionSupersededError)) this._log.warn(`failed to connect: ${err instanceof Error ? err.message : String(err)}`);
+    if (!(err instanceof ConnectionSupersededError)) this._log.warn(`failed to connect: ${describeError(err)}`);
   }
 
   private _onStatusChange(event: StatusChangeEvent): void {
@@ -229,7 +229,7 @@ export class PooledUpstream {
       this._lastError = undefined;
       this._pauseLogged = false;
     } else if (event.error !== undefined) {
-      this._lastError = event.error.message;
+      this._lastError = describeError(event.error);
     } else if (event.previous === "auth_required") {
       this._lastError = undefined;
     }

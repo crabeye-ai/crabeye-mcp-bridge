@@ -29,8 +29,8 @@
   "dependencies": {
     "@inquirer/checkbox": "^4.1.5",
     "@inquirer/confirm": "^5.1.9",
-    "@modelcontextprotocol/client": "^2.0.0",
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@modelcontextprotocol/server": "^2.4.0",
     "commander": "^14.0.3",
     "cross-spawn": "7.0.6",
     "jsonc-parser": "^3.3.1",

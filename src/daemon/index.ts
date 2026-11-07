@@ -52,7 +52,7 @@ export {
   getDaemonLogPath,
   processTrackerPathFor,
 } from "./paths.js";
-export { createDaemonLogger } from "./daemon-log.js";
+export { createDaemonLogger, routeConsoleTo } from "./daemon-log.js";
 export { daemonStopBudgetMs, installCrashHandlers, installSignalHandlers } from "./process-handlers.js";
 export {
   ProcessTracker,

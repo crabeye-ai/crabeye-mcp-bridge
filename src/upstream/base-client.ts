@@ -9,7 +9,7 @@ import type {
 } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { Logger } from "../logging/index.js";
-import { createNoopLogger } from "../logging/index.js";
+import { createNoopLogger, describeError } from "../logging/index.js";
 import {
   ConnectionSupersededError,
   type UpstreamClient,
@@ -19,6 +19,7 @@ import {
   type ToolsChangedCallback,
 } from "./types.js";
 import { unsupportedInputRequest } from "./call-errors.js";
+import { keepListening } from "./change-subscription.js";
 import { InFlightRequests } from "./in-flight-requests.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
@@ -148,8 +149,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
               autoRefresh: true,
               onChanged: (error, tools) => {
                 if (error || !tools || this._epoch !== myEpoch) return;
-                this._tools = tools;
-                this._notifyToolsChanged();
+                this._replaceTools(tools);
               },
             },
           },
@@ -182,11 +182,10 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._logger.info("connected", { era: client.getProtocolEra() });
       this._setStatus("connected");
       this._afterConnect(transport);
+      keepListening(client, { logger: this._logger, isCurrent: () => this._client === client, onTools: (tools) => this._replaceTools(tools) });
       this._notifyToolsChanged();
     } catch (err) {
-      this._logger.debug("connection failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      this._logger.debug("connection failed", { error: describeError(err) });
       // Close the transport so we don't leak a spawned subprocess. SDK
       // Client.connect handles the case where initialize itself failed, but
       // if listTools() (or any other post-init step) throws, the transport
@@ -450,6 +449,11 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         // Listeners must not throw
       }
     }
+  }
+
+  private _replaceTools(tools: Tool[]): void {
+    this._tools = tools;
+    this._notifyToolsChanged();
   }
 
   private _notifyToolsChanged(): void {

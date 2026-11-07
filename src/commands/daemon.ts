@@ -22,6 +22,7 @@ import {
   waitForExit,
   isUnusableAddressError,
   createDaemonLogger,
+  routeConsoleTo,
   getDaemonLogPath,
   daemonStopBudgetMs,
   installCrashHandlers,
@@ -102,6 +103,7 @@ export async function runDaemonInternal(awaitPredecessorMs = 0): Promise<number>
   const settings = await loadDaemonSettings();
   const cfg = settings.daemon;
   const logger = createDaemonLogger({ level: settings.logLevel });
+  routeConsoleTo(logger.child({ component: "console" }));
   const log = logger.child({ component: "daemon" });
 
   const socketPath = getDaemonSocketPath();

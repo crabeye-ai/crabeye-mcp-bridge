@@ -1,4 +1,4 @@
-import type { Logger } from "../logging/index.js";
+import { describeError, type Logger } from "../logging/index.js";
 import { ConnectionSupersededError, type HealthState, type UpstreamClient } from "./types.js";
 
 export interface HealthChecksOptions {
@@ -112,7 +112,7 @@ export class HealthChecks {
     tracking.health = "unhealthy";
     this._logger.warn("ping failed", {
       server: member.server,
-      error: errorMessage(err),
+      error: describeError(err),
       failures: tracking.consecutiveFailures,
     });
     if (tracking.consecutiveFailures < this._unhealthyThreshold || client.status !== "connected") return;
@@ -121,11 +121,7 @@ export class HealthChecks {
     tracking.health = "unknown";
     this._onUnhealthy(client).catch((reconnectErr: unknown) => {
       if (reconnectErr instanceof ConnectionSupersededError) return;
-      this._logger.error("failed to recover from failed pings", { server: member.server, error: errorMessage(reconnectErr) });
+      this._logger.error("failed to recover from failed pings", { server: member.server, error: describeError(reconnectErr) });
     });
   }
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
