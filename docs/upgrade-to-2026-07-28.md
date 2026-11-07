@@ -42,6 +42,10 @@ Log messages that upstream servers send through the protocol are no longer passe
 
 A tool call that fails, for example because a policy denies it, the server is unavailable or needs authorization again, or the rate-limit queue is full, now returns its message as a tool result the assistant can read instead of as a protocol error. Arguments to `search_tools` and `run_tool` are checked against the tool's input schema, and arguments that don't match get a result saying what's wrong.
 
+### Redirects to another address
+
+A server whose `url` redirects to another scheme, host or port no longer connects. The error names the address it redirected to; set that address as the server's `url` if it is the server you meant. Redirects on the same host keep working.
+
 ### The manager does the work for every client
 
 The manager now connects every upstream, STDIO and HTTP, once for all your AI clients. It also runs search, rate limits, tool policy and OAuth token refreshes for all of them, and follows config edits:
