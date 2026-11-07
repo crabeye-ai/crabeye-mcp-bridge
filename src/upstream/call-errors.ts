@@ -1,4 +1,13 @@
+import { MissingRequiredClientCapabilityError, SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import { APP_NAME } from "../constants.js";
+import { methodLabel } from "../logging/index.js";
+
+const CLIENT_INPUT_CAPABILITY_BY_METHOD = new Map([
+  ["elicitation/create", "elicitation"],
+  ["sampling/createMessage", "sampling"],
+  ["roots/list", "roots"],
+]);
+const CLIENT_INPUT_CAPABILITIES = new Set(CLIENT_INPUT_CAPABILITY_BY_METHOD.values());
 
 /** A call that wasn't made; the message is what the client should be told, as is. */
 export class CallRefusedError extends Error {
@@ -54,4 +63,24 @@ export function removedError(source: string): CallRefusedError {
 
 export function unavailableError(source: string): CallRefusedError {
   return new CallRefusedError(`Upstream server "${source}" is unavailable; reconnecting in the background. Please retry shortly.`);
+}
+
+/** What a client is told when a server asks it for input mid-call, which the bridge can't pass on; null for any other error. */
+export function unsupportedInputRequest(err: unknown): Error | null {
+  const requested = requestedClientInput(err);
+  if (requested.length === 0) return null;
+  const names = requested.map((name) => `"${name}"`).join(", ");
+  return new Error(`asked the client for input (${names}), which ${APP_NAME} doesn't support`);
+}
+
+function requestedClientInput(err: unknown): string[] {
+  if (err instanceof MissingRequiredClientCapabilityError) {
+    const required = Object.keys(err.requiredCapabilities ?? {});
+    return required.length > 0 && required.every((name) => CLIENT_INPUT_CAPABILITIES.has(name)) ? required : [];
+  }
+  if (err instanceof SdkError && err.code === SdkErrorCode.CapabilityNotSupported) {
+    const method = (err.data as { method?: unknown } | undefined)?.method;
+    return typeof method === "string" ? [CLIENT_INPUT_CAPABILITY_BY_METHOD.get(method) ?? methodLabel(method)] : [];
+  }
+  return [];
 }

@@ -75,7 +75,7 @@ The manager runs without `NODE_OPTIONS`. A bridge whose Node options would chang
 
 The manager's own `OPENSSL_CONF`, from the client whose bridge started it, applies to every client. Its `SSL_CERT_DIR`, on Node builds that read it, applies only to clients whose certificate settings are the same as its own and that set no `SSL_CERT_FILE`. On Linux, the system's certificates are read with the manager's own `SSL_CERT_FILE` and `SSL_CERT_DIR`.
 
-Each upstream gets one connection for all of these bridges. Two entries share a connection, even across configs, if they have the same server name, transport, URL, headers (as written, before `${credential:…}` is filled in), `_bridge.auth` settings, master key, value of the variable their `clientSecret` names, and network settings. A server on the 2026-07-28 protocol sees one client, and a server on an earlier protocol sees one session. When a server ends that session, the manager starts one new session for everyone once the connection closes or three health checks in a row fail.
+Each upstream gets one connection for all of these bridges. Two entries share a connection, even across configs, if they have the same server name, transport, URL, headers (as written, before `${credential:…}` is filled in), `_bridge.auth` settings, master key, value of the variable their `clientSecret` names, and network settings. A server on the 2026-07-28 protocol sees one client, and a server on an earlier protocol sees one session. When a server ends that session, the next call or health check finds it ended. The manager then starts one new session for everyone and sends the call or check again on it. If no new session starts, the call fails and the manager keeps reconnecting as before.
 
 The manager:
 

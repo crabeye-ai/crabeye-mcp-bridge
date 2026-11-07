@@ -42,19 +42,17 @@ describe.skipIf(process.platform === "win32")("HTTP upstreams shared through dae
     expect(server.streams()).toBe(1);
   });
 
-  it("starts one new legacy session for both clients after the server ends the shared one", async () => {
+  it("sends both clients' calls again on one new legacy session after the server ends the shared one", async () => {
     await daemon();
     const server = await upstream({ era: "legacy" });
-    const config = await writeJson("bridge.json", { mcpServers: { svc: { url: server.url } }, _bridge: { healthCheckInterval: 1 } });
+    const config = await writeJson("bridge.json", { mcpServers: { svc: { url: server.url } } });
     const [a, b] = [await bridge(config), await bridge(config)];
 
     await server.endSessions();
 
-    await vi.waitFor(() => expect(server.sessions()).toBe(2), { timeout: 15_000 });
-    await vi.waitFor(() => expect([a.client("svc").status, b.client("svc").status]).toEqual(["connected", "connected"]), { timeout: 5_000 });
-    expect(await a.call("svc")).toEqual(ECHOED);
-    expect(await b.call("svc")).toEqual(ECHOED);
+    expect(await Promise.all([a.call("svc"), b.call("svc")])).toEqual([ECHOED, ECHOED]);
     expect(server.sessions()).toBe(2);
+    expect(server.count("initialize")).toBe(2);
   });
 
   it("shares a server named the same way in another config file, and connects a different URL on its own", async () => {

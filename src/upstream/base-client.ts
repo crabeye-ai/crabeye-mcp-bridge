@@ -1,4 +1,4 @@
-import { Client, MissingRequiredClientCapabilityError, SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
+import { Client } from "@modelcontextprotocol/client";
 import type {
   Transport,
   Tool,
@@ -9,7 +9,7 @@ import type {
 } from "@modelcontextprotocol/client";
 import { APP_NAME, APP_VERSION } from "../constants.js";
 import type { Logger } from "../logging/index.js";
-import { createNoopLogger, methodLabel } from "../logging/index.js";
+import { createNoopLogger } from "../logging/index.js";
 import {
   ConnectionSupersededError,
   type UpstreamClient,
@@ -18,15 +18,11 @@ import {
   type StatusChangeCallback,
   type ToolsChangedCallback,
 } from "./types.js";
+import { unsupportedInputRequest } from "./call-errors.js";
+import { InFlightRequests } from "./in-flight-requests.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
 const STABLE_CONNECTION_MS = 60_000;
-const CLIENT_INPUT_CAPABILITY_BY_METHOD = new Map([
-  ["elicitation/create", "elicitation"],
-  ["sampling/createMessage", "sampling"],
-  ["roots/list", "roots"],
-]);
-const CLIENT_INPUT_CAPABILITIES = new Set(CLIENT_INPUT_CAPABILITY_BY_METHOD.values());
 
 export const DEFAULT_RECONNECT_BASE_DELAY_MS = 1000;
 export const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
@@ -64,6 +60,8 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   protected _currentTransport: Transport | undefined;
   private _statusListeners = new Set<StatusChangeCallback>();
   private _toolsListeners = new Set<ToolsChangedCallback>();
+  private _sessionRenewal: Promise<void> | undefined;
+  private readonly _inFlight = new InFlightRequests();
 
   constructor(options: BaseUpstreamClientOptions) {
     this.name = options.name;
@@ -219,11 +217,9 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
         `Cannot call tool "${params.name}": client "${this.name}" is not connected`,
       );
     }
-    const client = this._client;
     try {
-      return (await client.callTool(params, options)) as CallToolResult;
+      return await this._sendRenewingEndedSession(this._client, async (client) => (await client.callTool(params, options)) as CallToolResult);
     } catch (err) {
-      this._pauseIfAuthFailure(client, err);
       throw unsupportedInputRequest(err) ?? err;
     }
   }
@@ -246,6 +242,7 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._currentTransport = undefined;
       await transport.close().catch(() => {});
     }
+    await this._inFlight.closeRetired();
 
     await this._onClose();
 
@@ -257,18 +254,62 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
     if (!this._client || this._status !== "connected") {
       throw new Error(`Cannot ping: client "${this.name}" is not connected`);
     }
-    const signal = AbortSignal.timeout(timeoutMs);
-    const client = this._client;
+    await this._sendRenewingEndedSession(this._client, async (client) => {
+      const signal = AbortSignal.timeout(timeoutMs);
+      if (client.getProtocolEra() === "modern") await client.discover({ signal });
+      else await client.ping({ signal });
+    });
+  }
+
+  /**
+   * Sends `request` on `client`. If the server had ended that session, sends
+   * it once more on the current session, once the latest session renewal has
+   * settled. Fails with the first error when there is no session to send it
+   * on, and with the second when the request fails again.
+   */
+  private async _sendRenewingEndedSession<T>(client: Client, request: (client: Client) => Promise<T>): Promise<T> {
+    const transport = client.transport;
     try {
-      if (client.getProtocolEra() === "modern") {
-        await client.discover({ signal });
-        return;
-      }
-      await client.ping({ signal });
+      return await this._sendTracked(client, request);
+    } catch (err) {
+      if (!this._isSessionEndedError(transport, err)) throw err;
+      await this._renewSession(client);
+      if (!this._client) throw err;
+      return this._sendTracked(this._client, request);
+    }
+  }
+
+  private async _sendTracked<T>(client: Client, request: (client: Client) => Promise<T>): Promise<T> {
+    try {
+      return await this._inFlight.send(client, request);
     } catch (err) {
       this._pauseIfAuthFailure(client, err);
       throw err;
     }
+  }
+
+  /**
+   * Connects a new session in place of `ended`'s when `ended` is still the
+   * current client; either way, resolves once the latest session renewal has
+   * connected or failed to.
+   */
+  private _renewSession(ended: Client): Promise<void> {
+    if (this._client === ended) this._sessionRenewal = this._replaceEndedSession(ended);
+    return this._sessionRenewal ?? Promise.resolve();
+  }
+
+  /**
+   * Drops `ended` and connects a new session; never rejects. Retires `ended`
+   * rather than closing it, since the server may still be handling its other
+   * requests.
+   */
+  private _replaceEndedSession(ended: Client): Promise<void> {
+    this._logger.info("server ended the session; starting a new one");
+    this._client = undefined;
+    this._currentTransport = undefined;
+    this._onTransportClosed();
+    this._inFlight.retire(ended);
+    return this.reconnect().catch(() => {});
   }
 
   /**
@@ -348,6 +389,13 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
   protected async _onClose(): Promise<void> {}
 
   protected _isAuthFailure(err: unknown): boolean {
+    void err;
+    return false;
+  }
+
+  /** Whether `err` says the server ended the session of `transport`, so it never handled the request. */
+  protected _isSessionEndedError(transport: Transport | undefined, err: unknown): boolean {
+    void transport;
     void err;
     return false;
   }
@@ -443,23 +491,4 @@ export abstract class BaseUpstreamClient implements UpstreamClient {
       this._reconnectTimer = undefined;
     }
   }
-}
-
-function unsupportedInputRequest(err: unknown): Error | null {
-  const requested = requestedClientInput(err);
-  if (requested.length === 0) return null;
-  const names = requested.map((name) => `"${name}"`).join(", ");
-  return new Error(`asked the client for input (${names}), which ${APP_NAME} doesn't support`);
-}
-
-function requestedClientInput(err: unknown): string[] {
-  if (err instanceof MissingRequiredClientCapabilityError) {
-    const required = Object.keys(err.requiredCapabilities ?? {});
-    return required.length > 0 && required.every((name) => CLIENT_INPUT_CAPABILITIES.has(name)) ? required : [];
-  }
-  if (err instanceof SdkError && err.code === SdkErrorCode.CapabilityNotSupported) {
-    const method = (err.data as { method?: unknown } | undefined)?.method;
-    return typeof method === "string" ? [CLIENT_INPUT_CAPABILITY_BY_METHOD.get(method) ?? methodLabel(method)] : [];
-  }
-  return [];
 }

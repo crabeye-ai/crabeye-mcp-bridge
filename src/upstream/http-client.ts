@@ -1,4 +1,4 @@
-import { StreamableHTTPClientTransport, SSEClientTransport } from "@modelcontextprotocol/client";
+import { SdkHttpError, StreamableHTTPClientTransport, SSEClientTransport } from "@modelcontextprotocol/client";
 import type { Transport } from "@modelcontextprotocol/client";
 import type { HttpServerConfig } from "../config/schema.js";
 import type { CredentialStore } from "../credentials/credential-store.js";
@@ -121,6 +121,11 @@ export class HttpUpstreamClient extends BaseUpstreamClient {
     if (isDefinitiveAuthFailure(err)) return true;
     if (this._authProvider?.refreshFailedTransiently) return false;
     return isReauthorizationRequired(err);
+  }
+
+  protected override _isSessionEndedError(transport: Transport | undefined, err: unknown): boolean {
+    if (!(err instanceof SdkHttpError) || err.status !== 404) return false;
+    return transport instanceof StreamableHTTPClientTransport && transport.sessionId !== undefined;
   }
 
   protected _buildTransport(): Transport {
