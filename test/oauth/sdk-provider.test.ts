@@ -877,6 +877,17 @@ describe("BridgeOAuthClientProvider", () => {
       });
     });
 
+    it("doesn't keep a refresh token for a later save once a save from another authorization server stored none", async () => {
+      await store.set(KEY, { type: "oauth2", access_token: "at-0", refresh_token: "rt-0", issuer: "https://a.example.com" });
+      const provider = makeProvider();
+      await provider.tokens();
+
+      await provider.saveTokens({ access_token: "at-1", token_type: "Bearer", issuer: "https://b.example.com" });
+      await provider.saveTokens({ access_token: "at-2", token_type: "Bearer", issuer: "https://a.example.com" });
+
+      expect(refreshTokenOf(await store.get(KEY))).toBeUndefined();
+    });
+
     it("saveTokens with a rotated refresh_token updates the cache to the rotated value", async () => {
       await store.set(KEY, {
         type: "oauth2",

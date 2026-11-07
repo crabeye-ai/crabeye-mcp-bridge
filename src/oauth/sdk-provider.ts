@@ -25,6 +25,7 @@ import {
   isIssuerStampOnly,
   issuersMatch,
   parseStoredClientInfo,
+  sameIssuer,
 } from "./issuer-binding.js";
 
 export interface BridgeOAuthProviderOptions {
@@ -101,10 +102,11 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
   private _refreshExhausted = false;
   private readonly _refreshTracker: RefreshTracker;
   private readonly _tokenWrites: TokenWrites;
-  // Sync mirror of the stored credential's refresh_token. Lets `saveTokens`
-  // preserve it on non-rotating IdPs without an async re-read, closing the
-  // saveTokens-vs-invalidateCredentials TOCTOU.
-  private _lastRefreshToken: string | undefined;
+  // Sync mirror of the stored credential's refresh_token and the issuer it
+  // belongs to. Lets `saveTokens` keep it for a login at the same
+  // authorization server that returns none, without an async re-read,
+  // closing the saveTokens-vs-invalidateCredentials TOCTOU.
+  private _knownRefreshToken: { token: string; issuer: string | undefined } | undefined;
   // Monotonic counter bumped by `invalidateCredentials` for token-clearing
   // scopes. `tokens()` snapshots it before its `await store.get(...)` and
   // refuses to write the cache from a stale read whose result predates a
@@ -269,7 +271,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
 
     this._tokenWrites.rememberRead({ access_token: cred.access_token, refresh_token: cred.refresh_token });
     if (this._invalidateEpoch === epoch) {
-      this._lastRefreshToken = cred.refresh_token;
+      this._knownRefreshToken = cred.refresh_token ? { token: cred.refresh_token, issuer: cred.issuer } : undefined;
     }
 
     // If the token is already expired and we have no refresh token, return
@@ -327,15 +329,15 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
         ? Math.floor(Date.now() / 1000) + tokens.expires_in
         : undefined;
 
-    // Preserve refresh_token when the SDK's refresh response omits it.
-    // Most IdPs (Google, Slack, …) don't rotate by default and return only
-    // `access_token` on refresh. Fallback reads the cache as a sync field
-    // access, so no await can interleave with the write below.
-    const refreshToken = tokens.refresh_token ?? this._lastRefreshToken;
+    // Preserve refresh_token when a login at the same authorization server
+    // omits it, as Google does on re-consent; the SDK already keeps it on
+    // refreshes. Fallback reads the cache as a sync field access, so no await
+    // can interleave with the write below.
+    const refreshToken = tokens.refresh_token ?? this._keptRefreshToken(issuer);
     // Update the cache BEFORE the await. invalidateCredentials also mutates
     // synchronously, so whichever ran first wins consistently — and the
     // file-level mutex serialises this write against any racing delete.
-    if (refreshToken) this._lastRefreshToken = refreshToken;
+    this._knownRefreshToken = refreshToken ? { token: refreshToken, issuer } : undefined;
 
     const credential: OAuth2Credential = {
       type: "oauth2",
@@ -348,6 +350,12 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
     };
     const origin: TokenOrigin = { redeemed: this._refreshTracker.redeemedFor(tokens.access_token), addIfMissing: !this._retired };
     if (await this._repeatedSaves.saveOnce(credential, () => this._write(credential, origin))) this._countRefresh();
+  }
+
+  /** The last refresh token read or saved, for a save without one, if it belongs to `issuer`. */
+  private _keptRefreshToken(issuer: string | undefined): string | undefined {
+    const last = this._knownRefreshToken;
+    return last !== undefined && sameIssuer(last.issuer, issuer) ? last.token : undefined;
   }
 
   private async _write(credential: OAuth2Credential, origin: TokenOrigin): Promise<void> {
@@ -465,7 +473,7 @@ export class BridgeOAuthClientProvider implements OAuthClientProvider {
       // any in-flight `tokens()` whose `store.get` resolves after this point
       // from writing the stale read back into the just-cleared cache.
       this._invalidateEpoch++;
-      this._lastRefreshToken = undefined;
+      this._knownRefreshToken = undefined;
       this._refreshTracker.clearTransientFailure();
       const outcome = await this._deleteTokens({ keepTokensRefreshedElsewhere: scope === "tokens" });
       if (outcome !== "kept") {

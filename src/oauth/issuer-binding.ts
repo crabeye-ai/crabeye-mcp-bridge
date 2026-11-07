@@ -30,6 +30,12 @@ export function issuersMatch(a: string, b: string): boolean {
   return false;
 }
 
+/** Whether two possibly missing issuers name the same authorization server: both missing, or both present and matching. */
+export function sameIssuer(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return issuersMatch(a, b);
+}
+
 /**
  * Whether tokens stamped with `storedIssuer` may be overwritten by tokens
  * stamped with `newIssuer`: an unstamped entry accepts any issuer, a stamped

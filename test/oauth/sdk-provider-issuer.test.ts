@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { CredentialStore } from "../../src/credentials/credential-store.js";
 import { BridgeOAuthClientProvider } from "../../src/oauth/sdk-provider.js";
 import { clientInfoKey, clientIssuerKey, oauthCredentialKey } from "../../src/oauth/client-secret.js";
+import { sameIssuer } from "../../src/oauth/issuer-binding.js";
 import { makeTestStore } from "../_helpers/credential-store.js";
 
 const REDIRECT = "http://127.0.0.1:54321/callback";
@@ -351,5 +352,18 @@ describe("BridgeOAuthClientProvider issuer binding", () => {
     provider.saveDiscoveryState(state);
     await provider.invalidateCredentials("all");
     expect(provider.discoveryState()).toBeUndefined();
+  });
+});
+
+describe("sameIssuer", () => {
+  it.each([
+    [undefined, undefined, true],
+    ["https://as.example.com", undefined, false],
+    [undefined, "https://as.example.com", false],
+    ["https://as.example.com", "https://as.example.com", true],
+    ["https://as.example.com/", "https://as.example.com", true],
+    ["https://as.example.com", "https://other.example.com", false],
+  ])("sameIssuer(%j, %j) is %j", (a, b, same) => {
+    expect(sameIssuer(a, b)).toBe(same);
   });
 });
