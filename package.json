@@ -23,6 +23,7 @@
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:e2e": "node scripts/e2e.js",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit"
   },
