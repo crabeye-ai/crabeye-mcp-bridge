@@ -10,7 +10,7 @@
   },
   "type": "module",
   "bin": {
-    "crabeye-mcp-bridge": "./bin/crabeye-mcp-bridge"
+    "crabeye-mcp-bridge": "bin/crabeye-mcp-bridge"
   },
   "files": [
     "bin/",
